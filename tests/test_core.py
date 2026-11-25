@@ -1312,6 +1312,154 @@ def test_delete_source_returns_immediately_without_blocking_on_llm(
     test_db.close()
 
 
+def test_chat_prompt_requires_filename_in_multi_audio_citations() -> None:
+    recs = [
+        {
+            "id": "r1",
+            "filename": "Voz 028 W 20261124 220426.m4a",
+            "status": "ready",
+            "enabled": True,
+            "duration_sec": 300.0,
+            "transcript_text": "Explicación del tema A.",
+            "segments": [{"start": 158.0, "end": 165.0, "text": "Explicación del tema A."}],
+        },
+        {
+            "id": "r2",
+            "filename": "Voz 029 W 20261124 220510.m4a",
+            "status": "ready",
+            "enabled": True,
+            "duration_sec": 240.0,
+            "transcript_text": "Explicación del tema B.",
+            "segments": [{"start": 45.0, "end": 52.0, "text": "Explicación del tema B."}],
+        },
+    ]
+    msgs, _mode = build_chat_messages(
+        recordings=recs,
+        combined_summary="",
+        chat_history=[],
+        user_question="¿Qué dice la grabación 1?",
+        num_ctx=8192,
+    )
+    assert "[nombre_audio · MM:SS]" in msgs[0]["content"]
+    assert "Voz 028 W 20261124 220426.m4a" in msgs[0]["content"]
+
+
+def test_true_false_prompt_blueprint_and_inverted_options_parsing() -> None:
+    from backend.context_manager import build_quiz_generation_messages, shuffle_quiz_mcq_options
+
+    msgs = build_quiz_generation_messages(
+        recordings=[
+            {
+                "id": "r1",
+                "filename": "clase.m4a",
+                "status": "ready",
+                "transcript_text": "La fotosíntesis ocurre en los cloroplastos.",
+                "segments": [{"start": 10.0, "end": 15.0, "text": "La fotosíntesis ocurre en los cloroplastos."}],
+            }
+        ],
+        num_questions=6,
+        mode="true_false",
+    )
+    prompt_txt = msgs[1]["content"]
+    assert "Verdadero (correct_index: 0)" in prompt_txt
+    assert "Falso (correct_index: 1)" in prompt_txt
+    assert "NUNCA hagas que todas sean Falsas ni todas Verdaderas" in prompt_txt
+
+    # Inverted ["Falso", "Verdadero"] options with correct_index=1 must resolve to canonical index 0 (Verdadero)
+    inverted = parse_quiz_json(
+        '[{"type": "true_false", "question": "La fotosíntesis ocurre en los cloroplastos.", "options": ["Falso", "Verdadero"], "correct_index": 1}]',
+        mode="true_false",
+    )
+    assert len(inverted) == 1
+    assert inverted[0]["options"] == ["Verdadero", "Falso"]
+    assert inverted[0]["correct_index"] == 0
+
+    # MCQ shuffle keeps positional options intact and updates correct_index cleanly
+    mcq = [
+        {
+            "id": 1,
+            "type": "mcq",
+            "question": "¿Capital?",
+            "options": ["Madrid", "París", "Roma", "Lisboa"],
+            "correct_index": 0,
+        },
+        {
+            "id": 2,
+            "type": "mcq",
+            "question": "¿Cuál aplica?",
+            "options": ["A", "B", "C", "Todas las anteriores"],
+            "correct_index": 3,
+        },
+    ]
+    shuffled = shuffle_quiz_mcq_options(mcq)
+    assert shuffled[0]["options"][shuffled[0]["correct_index"]] == "Madrid"
+    assert shuffled[1]["options"] == ["A", "B", "C", "Todas las anteriores"]
+    assert shuffled[1]["correct_index"] == 3
+
+
+def test_quiz_generate_auto_rebalances_all_false_true_false_exam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_db = Database(db_path=tmp_path / "tf.db", audio_dir=tmp_path / "audio")
+    test_db.init_db()
+    monkeypatch.setattr(app_module, "db", test_db)
+    monkeypatch.setattr("backend.resource_manager.db", test_db)
+    monkeypatch.setattr(app_module.pipeline, "start", lambda: None)
+    monkeypatch.setattr(app_module.resource_manager, "start_idle_watchdog", lambda: None)
+    monkeypatch.setattr(app_module.ollama_service, "shutdown", AsyncMock())
+    monkeypatch.setattr(app_module.ollama_service, "resolve_default_model", AsyncMock(return_value="demo"))
+
+    sess = test_db.create_session("Biología")
+    rec = test_db.create_recording(sess["id"], "bio.m4a", "bio.m4a", "bio.m4a")
+    test_db.update_recording_transcript(
+        rec["id"],
+        "Las mitocondrias producen ATP y tienen su propio ADN.",
+        [{"start": 5.0, "end": 12.0, "text": "Las mitocondrias producen ATP y tienen su propio ADN."}],
+        "es",
+        60.0,
+        "small",
+    )
+    test_db.update_recording_summary(rec["id"], "Resumen mitocondrias.")
+
+    all_false_raw = (
+        '['
+        '{"id": 1, "type": "true_false", "question": "Las mitocondrias no producen ATP.", "options": ["Verdadero", "Falso"], "correct_index": 1, "explanation": "Sí producen."},'
+        '{"id": 2, "type": "true_false", "question": "Las mitocondrias carecen de ADN.", "options": ["Verdadero", "Falso"], "correct_index": 1, "explanation": "Sí tienen."},'
+        '{"id": 3, "type": "true_false", "question": "El ATP se produce solo en el núcleo.", "options": ["Verdadero", "Falso"], "correct_index": 1, "explanation": "En mitocondrias."},'
+        '{"id": 4, "type": "true_false", "question": "Las mitocondrias no están en eucariotas.", "options": ["Verdadero", "Falso"], "correct_index": 1, "explanation": "Sí están."}'
+        ']'
+    )
+    balanced_raw = (
+        '['
+        '{"id": 1, "type": "true_false", "question": "Las mitocondrias producen ATP.", "options": ["Verdadero", "Falso"], "correct_index": 0, "explanation": "Correcto."},'
+        '{"id": 2, "type": "true_false", "question": "Las mitocondrias tienen su propio ADN.", "options": ["Verdadero", "Falso"], "correct_index": 0, "explanation": "Correcto."},'
+        '{"id": 3, "type": "true_false", "question": "El ATP se produce solo en el núcleo.", "options": ["Verdadero", "Falso"], "correct_index": 1, "explanation": "En mitocondrias."},'
+        '{"id": 4, "type": "true_false", "question": "Las mitocondrias no están en eucariotas.", "options": ["Verdadero", "Falso"], "correct_index": 1, "explanation": "Sí están."}'
+        ']'
+    )
+    call_count = 0
+
+    async def fake_summarize(messages, **_kwargs):
+        nonlocal call_count
+        call_count += 1
+        return all_false_raw if call_count == 1 else balanced_raw
+
+    monkeypatch.setattr(app_module.resource_manager, "summarize_exclusive", fake_summarize)
+
+    with TestClient(app_module.app) as client:
+        resp = client.post(
+            f"/api/sessions/{sess['id']}/quiz/generate",
+            json={"num_questions": 4, "mode": "true_false", "difficulty": "hard", "question_style": "tricky"},
+        )
+        assert resp.status_code == 200
+        qs = resp.json()["questions"]
+        assert call_count == 2
+        assert sum(1 for q in qs if q["correct_index"] == 0) == 2
+        assert sum(1 for q in qs if q["correct_index"] == 1) == 2
+
+    test_db.close()
+
+
 def test_whisper_transcribe_cancel_event_stops_immediately(tmp_path: Path) -> None:
     import threading
     from types import SimpleNamespace

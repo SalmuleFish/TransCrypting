@@ -32,7 +32,7 @@ const state = {
   podcastStartedAt: null,
   podcastElapsedTimer: null,
   cancellingPodcastId: null,
-  transcriptRecFilter: "all",
+  transcriptRecFilter: null,
 };
 
 const audioPlayers = new Map();
@@ -122,10 +122,97 @@ function parseTimestampToSeconds(tsStr) {
   return 0;
 }
 
-function makeTimestampPillHtml(tsStr) {
+function normalizeRefTokens(str) {
+  return String(str || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\.(?:mp3|wav|m4a|ogg|flac|webm|aac|wma|mp4|mkv|mov|opus|pdf|pptx|docx|txt|md|png|jpg|jpeg|webp|bmp)\b/gi, "")
+    .replace(/([a-z])([A-Z0-9])/g, "$1 $2")
+    .replace(/([a-zA-Z])([0-9])/g, "$1 $2")
+    .replace(/[_\-./]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function findMatchingRecordingByRef(refText) {
+  const recordings = (state.activeSession?.recordings || []).filter(
+    (r) => r.status === "ready" || r.duration_sec > 0 || r.transcript_text
+  );
+  if (!recordings.length) return null;
+
+  const raw = String(refText || "").trim().replace(/^\[|\]$/g, "");
+  if (!raw) return null;
+
+  const rawLower = raw.toLowerCase();
+  const exactFile = recordings.find((r) => (r.filename || "").toLowerCase() === rawLower);
+  if (exactFile) return exactFile;
+
+  const normRef = normalizeRefTokens(raw);
+  if (!normRef) return null;
+
+  // Match "audio 1", "grabacion 2", etc.
+  const idxMatch = normRef.match(/^(?:audio|grabacion|recording|pista)\s*(\d+)$/i);
+  if (idxMatch) {
+    const idx = Number(idxMatch[1]) - 1;
+    if (idx >= 0 && idx < recordings.length) return recordings[idx];
+  }
+
+  for (const r of recordings) {
+    if (normalizeRefTokens(r.filename) === normRef) return r;
+  }
+
+  // Substring containment when name fragment is reasonably specific (>= 4 chars)
+  if (normRef.length >= 4) {
+    const subMatch = recordings.find((r) => {
+      const nr = normalizeRefTokens(r.filename);
+      return nr && (nr.includes(normRef) || normRef.includes(nr));
+    });
+    if (subMatch) return subMatch;
+  }
+
+  // Token overlap match (handles slight rewording or dropped suffixes)
+  const refTokens = normRef.split(" ").filter((t) => t.length >= 2);
+  if (refTokens.length >= 2) {
+    let bestRec = null;
+    let bestScore = 0;
+    for (const r of recordings) {
+      const recTokens = new Set(normalizeRefTokens(r.filename).split(" ").filter((t) => t.length >= 2));
+      if (recTokens.size === 0) continue;
+      let hits = 0;
+      for (const t of refTokens) {
+        if (recTokens.has(t)) hits += 1;
+      }
+      const ratio = hits / Math.min(refTokens.length, recTokens.size);
+      if (hits >= 2 && ratio >= 0.6 && hits > bestScore) {
+        bestScore = hits;
+        bestRec = r;
+      }
+    }
+    if (bestRec) return bestRec;
+  }
+
+  return null;
+}
+
+function makeTimestampPillHtml(tsStr, rec = null) {
   const clean = tsStr.trim();
   const seconds = parseTimestampToSeconds(clean);
-  return `<button type="button" class="chat-ts-pill" data-seconds="${seconds}" data-label="${escapeHtml(clean)}" title="Ir al momento ${escapeHtml(clean)}"><span class="ts-play-tri">▶</span>${escapeHtml(clean)}</button>`;
+  const readyCount = (state.activeSession?.recordings || []).filter(
+    (r) => r.status === "ready" || r.duration_sec > 0 || r.transcript_text
+  ).length;
+  let displayText = clean;
+  let titleText = `Ir al momento ${clean}`;
+  const recAttr = rec?.id ? ` data-rec-id="${escapeHtml(rec.id)}"` : "";
+  if (rec?.filename) {
+    titleText = `Ir a ${rec.filename} en ${clean}`;
+    if (readyCount >= 2) {
+      const stem = String(rec.filename).replace(/\.[^.]+$/, "");
+      const shortStem = stem.length > 22 ? `${stem.slice(0, 20).trim()}…` : stem;
+      displayText = `${shortStem} · ${clean}`;
+    }
+  }
+  return `<button type="button" class="chat-ts-pill"${recAttr} data-seconds="${seconds}" data-label="${escapeHtml(clean)}" title="${escapeHtml(titleText)}"><span class="ts-play-tri">▶</span>${escapeHtml(displayText)}</button>`;
 }
 
 function findMatchingSourceByRef(refText) {
@@ -135,9 +222,16 @@ function findMatchingSourceByRef(refText) {
   const parts = raw.split(/\s*[·|]\s*/);
   const namePart = (parts[0] || "").trim().toLowerCase();
   const locator = (parts[1] || "").trim();
+  const normName = normalizeRefTokens(namePart);
   const matched =
     sources.find((s) => (s.filename || "").toLowerCase() === namePart) ||
-    sources.find((s) => namePart && (s.filename || "").toLowerCase().includes(namePart));
+    sources.find((s) => namePart && (s.filename || "").toLowerCase().includes(namePart)) ||
+    (normName.length >= 4
+      ? sources.find((s) => {
+          const ns = normalizeRefTokens(s.filename);
+          return ns === normName || ns.includes(normName) || normName.includes(ns);
+        })
+      : null);
   if (matched) return { source: matched, locator };
   return { source: null, locator };
 }
@@ -147,11 +241,48 @@ function makeSourcePillHtml(source, label, locator = "") {
   return `<button type="button" class="chat-src-pill" data-source-id="${escapeHtml(source?.id || "")}" data-locator="${escapeHtml(locator)}" title="Abrir fuente: ${escapeHtml(label)}"><span>${icon}</span><span>${escapeHtml(label)}</span></button>`;
 }
 
+function parseAudioCitationInner(inner) {
+  const text = String(inner || "").trim();
+  if (!text) return null;
+  if (/(?:^|[\s·|])(?:p\.|diap\.|sec\.|p[aá]gina)\s*\d+/i.test(text)) return null;
+  if (/^https?:\/\//i.test(text)) return null;
+
+  const tsRe = /\b\d{1,2}:\d{2}(?::\d{2})?\b/g;
+  const timestamps = text.match(tsRe);
+  if (!timestamps || timestamps.length === 0) return null;
+
+  const stripped = text
+    .replace(tsRe, " ")
+    .replace(/[·|@—–\-,]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!stripped) {
+    return { rec: null, timestamps };
+  }
+
+  const matchedRec = findMatchingRecordingByRef(stripped);
+  if (matchedRec) {
+    return { rec: matchedRec, timestamps };
+  }
+
+  // Fallback for slight LLM spelling differences if it isn't a doc source and looks like a compact ref
+  const hasDocExt = /\.(?:pdf|pptx|docx|txt|md|png|jpg|jpeg|webp|bmp)\b/i.test(stripped);
+  if (!hasDocExt && !/[?!]/.test(stripped) && stripped.split(/\s+/).length <= 8) {
+    const srcCheck = findMatchingSourceByRef(stripped);
+    if (!srcCheck.source) {
+      return { rec: null, timestamps };
+    }
+  }
+  return null;
+}
+
 function makeCitationPillHtml(refValue) {
   const clean = String(refValue || "").trim();
   if (!clean) return "";
-  if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(clean)) {
-    return makeTimestampPillHtml(clean);
+  const audioParsed = parseAudioCitationInner(clean.replace(/^\[|\]$/g, ""));
+  if (audioParsed) {
+    return audioParsed.timestamps.map((t) => makeTimestampPillHtml(t, audioParsed.rec)).join(" ");
   }
   const { source, locator } = findMatchingSourceByRef(clean);
   if (source) {
@@ -168,20 +299,25 @@ function enhanceTimestampsInHtml(html) {
     return `@@PROTECTED_CODE_${idx}@@`;
   });
 
-  const tsSingle = "\\d{1,2}:\\d{2}(?::\\d{2})?";
-  const bracketRe = new RegExp(`\\[(${tsSingle}(?:\\s*[-–,]\\s*${tsSingle})*)\\]`, "g");
+  const bracketAnyRe = /\[([^\[\]\n]{3,140})\]/g;
   const sources = state.activeSession?.sources || [];
   const docRefRe = /\[([^\[\]\n]{3,90}?\.(?:pdf|pptx|docx|txt|md|png|jpg|jpeg|webp|bmp)(?:\s*[·|]\s*(?:p\.|diap\.|sec\.)\s*\d+)?)\]/gi;
+  const docAliasWithLocRe = /\[([^\[\]\n]{3,90}?\s*[·|]\s*(?:p\.|diap\.|sec\.)\s*\d+)\]/gi;
 
   const parts = masked.split(/(<[^>]+>)/g);
   for (let i = 0; i < parts.length; i += 2) {
-    parts[i] = parts[i].replace(bracketRe, (_, inner) => {
-      const matches = inner.match(new RegExp(tsSingle, "g"));
-      if (!matches || matches.length === 0) return `[${inner}]`;
-      return matches.map(makeTimestampPillHtml).join(" ");
+    parts[i] = parts[i].replace(bracketAnyRe, (full, inner) => {
+      const parsed = parseAudioCitationInner(inner);
+      if (!parsed) return full;
+      return parsed.timestamps.map((t) => makeTimestampPillHtml(t, parsed.rec)).join(" ");
     });
     if (sources.length > 0) {
       parts[i] = parts[i].replace(docRefRe, (full, inner) => {
+        const { source, locator } = findMatchingSourceByRef(inner);
+        if (!source) return full;
+        return makeSourcePillHtml(source, inner.trim(), locator);
+      });
+      parts[i] = parts[i].replace(docAliasWithLocRe, (full, inner) => {
         const { source, locator } = findMatchingSourceByRef(inner);
         if (!source) return full;
         return makeSourcePillHtml(source, inner.trim(), locator);
@@ -1037,7 +1173,7 @@ async function selectSession(sessionId) {
     }
     stopAllOtherAudio(null);
     state.activeRecordingId = null;
-    state.transcriptRecFilter = "all";
+    state.transcriptRecFilter = null;
   }
   state.activeSessionId = sessionId;
   renderSessionList();
@@ -1858,19 +1994,28 @@ function seekRecording(recId, seconds, options = {}) {
 
 function resolveRecordingForTimestamp(triggerEl, seconds) {
   const recordings = (state.activeSession?.recordings || []).filter(
-    (r) => r.status === "ready" || r.duration_sec > 0
+    (r) => r.status === "ready" || r.duration_sec > 0 || r.transcript_text
   );
   if (recordings.length === 0) return null;
+
+  const explicitRecId = triggerEl?.dataset?.recId;
+  if (explicitRecId && recordings.some((r) => r.id === explicitRecId)) {
+    return explicitRecId;
+  }
   if (recordings.length === 1) return recordings[0].id;
 
   const contextContainer = triggerEl.closest("p, li, .msg-bubble, .content-card");
   const contextText = (contextContainer?.textContent || "").toLowerCase();
+  const contextNorm = normalizeRefTokens(contextText);
 
   for (let i = 0; i < recordings.length; i += 1) {
     const rec = recordings[i];
+    const recNorm = normalizeRefTokens(rec.filename);
     if (
       contextText.includes((rec.filename || "").toLowerCase()) ||
-      contextText.includes(`grabación ${i + 1}`)
+      (recNorm && recNorm.length >= 4 && contextNorm.includes(recNorm)) ||
+      contextText.includes(`grabación ${i + 1}`) ||
+      contextText.includes(`audio ${i + 1}`)
     ) {
       return rec.id;
     }
@@ -2012,14 +2157,19 @@ function renderTranscriptTab(session) {
   const recordings = (session.recordings || []).filter((r) => r.transcript_text && r.enabled !== false);
   const sources = (session.sources || []).filter((s) => s.extracted_text && s.enabled !== false);
 
-  if (state.transcriptRecFilter !== "all" && !recordings.some((r) => r.id === state.transcriptRecFilter)) {
-    state.transcriptRecFilter = "all";
+  if (state.transcriptRecFilter && !recordings.some((r) => r.id === state.transcriptRecFilter)) {
+    state.transcriptRecFilter = null;
+  }
+
+  const copyBtn = document.getElementById("btn-copy-transcript");
+  if (copyBtn && !copyBtn.classList.contains("is-confirmed")) {
+    copyBtn.textContent = state.transcriptRecFilter ? "Copiar audio" : "Copiar todo";
   }
 
   const contentSig = [
     session.id,
     query,
-    state.transcriptRecFilter,
+    state.transcriptRecFilter || "grid",
     recordings.map((r) => `${r.id}:${(r.transcript_text || "").length}:${(r.segments || []).length}`).join(","),
     sources.map((s) => s.id).join(","),
   ].join("|");
@@ -2048,38 +2198,6 @@ function renderTranscriptTab(session) {
 
   pane.innerHTML = "";
 
-  if (recordings.length >= 2) {
-    const filterBar = document.createElement("div");
-    filterBar.className = "transcript-filter-bar";
-
-    const allBtn = document.createElement("button");
-    allBtn.type = "button";
-    allBtn.className = `quiz-choice-pill ${state.transcriptRecFilter === "all" ? "active" : ""}`;
-    allBtn.textContent = `Todos los audios (${recordings.length})`;
-    allBtn.onclick = () => {
-      state.transcriptRecFilter = "all";
-      renderTranscriptTab(session);
-    };
-    filterBar.appendChild(allBtn);
-
-    for (const r of recordings) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = `quiz-choice-pill ${state.transcriptRecFilter === r.id ? "active" : ""}`;
-      btn.textContent = `🎙 ${r.filename}`;
-      btn.onclick = () => {
-        state.transcriptRecFilter = r.id;
-        renderTranscriptTab(session);
-      };
-      filterBar.appendChild(btn);
-    }
-    pane.appendChild(filterBar);
-  }
-
-  const visibleRecordings = state.transcriptRecFilter === "all"
-    ? recordings
-    : recordings.filter((r) => r.id === state.transcriptRecFilter);
-
   const highlightMatch = (el, text) => {
     if (query) {
       const safe = escapeHtml(text);
@@ -2090,56 +2208,230 @@ function renderTranscriptTab(session) {
     }
   };
 
-  for (const rec of visibleRecordings) {
-    const card = document.createElement("div");
-    card.className = "content-card";
+  // --- Cards Grid Overview (select an audio to read its full transcript) ---
+  if (!state.transcriptRecFilter) {
+    const galleryHead = document.createElement("div");
+    galleryHead.className = "transcript-gallery-head";
+    galleryHead.innerHTML = `
+      <span class="transcript-gallery-title">Audios transcritos (${recordings.length})</span>
+      <span class="transcript-gallery-hint">Haz clic en un audio para leer su transcripción completa</span>
+    `;
+    pane.appendChild(galleryHead);
 
-    const header = document.createElement("div");
-    header.className = "content-card-header";
-    header.innerHTML = `<span>🎙 ${escapeHtml(rec.filename)}</span><span class="card-badge">${formatDuration(rec.duration_sec)} · Clic en tiempo para reproducir</span>`;
-    card.appendChild(header);
+    const grid = document.createElement("div");
+    grid.className = "transcript-cards-grid";
+    let visibleCards = 0;
 
-    const segs = rec.segments || [];
-    let matchedAny = false;
-    if (segs.length > 0) {
-      for (const seg of segs) {
-        const text = seg.text || "";
-        if (query && !text.toLowerCase().includes(query)) continue;
-        matchedAny = true;
+    for (const rec of recordings) {
+      const segs = rec.segments || [];
+      const rawText = String(rec.transcript_text || "").trim();
+      const matchingSegs = query
+        ? segs.filter((s) => (s.text || "").toLowerCase().includes(query))
+        : segs;
+      const textMatched = query ? rawText.toLowerCase().includes(query) : true;
+      const matchCount = query ? (segs.length > 0 ? matchingSegs.length : (textMatched ? 1 : 0)) : 0;
 
-        const row = document.createElement("div");
-        row.className = "segment-row";
+      if (query && matchCount === 0) continue;
+      visibleCards += 1;
 
-        const tsBtn = document.createElement("button");
-        tsBtn.className = "timestamp-btn";
-        tsBtn.textContent = formatDuration(seg.start);
-        tsBtn.onclick = () => seekRecording(rec.id, seg.start, { pulse: true });
+      const wordCount = rawText ? rawText.split(/\s+/).length : 0;
+      const snippetSource =
+        (query && matchingSegs[0]?.text) ||
+        (segs[0]?.text && segs.map((s) => s.text).slice(0, 3).join(" ")) ||
+        rawText;
+      const snippet = snippetSource.length > 175
+        ? `${snippetSource.slice(0, 175).trim()}…`
+        : snippetSource;
 
-        const textEl = document.createElement("div");
-        textEl.className = "segment-text";
-        highlightMatch(textEl, text);
+      const card = document.createElement("div");
+      card.className = "transcript-audio-card";
+      card.tabIndex = 0;
+      card.setAttribute("role", "button");
+      card.setAttribute("aria-label", `Abrir transcripción de ${rec.filename}`);
 
-        row.appendChild(tsBtn);
-        row.appendChild(textEl);
-        card.appendChild(row);
+      const top = document.createElement("div");
+      top.className = "transcript-card-top";
+
+      const titleWrap = document.createElement("div");
+      titleWrap.className = "transcript-card-title-wrap";
+      const ico = document.createElement("span");
+      ico.className = "transcript-card-icon";
+      ico.textContent = "🎙";
+      const titleEl = document.createElement("span");
+      titleEl.className = "transcript-card-title";
+      titleEl.title = rec.filename;
+      titleEl.textContent = rec.filename;
+      titleWrap.appendChild(ico);
+      titleWrap.appendChild(titleEl);
+
+      const playBtn = document.createElement("button");
+      playBtn.type = "button";
+      playBtn.className = "transcript-card-play";
+      playBtn.title = "Reproducir audio desde el inicio";
+      playBtn.innerHTML = ICON_PLAY;
+      playBtn.onclick = (e) => {
+        e.stopPropagation();
+        seekRecording(rec.id, 0, { pulse: true });
+      };
+
+      top.appendChild(titleWrap);
+      top.appendChild(playBtn);
+      card.appendChild(top);
+
+      const meta = document.createElement("div");
+      meta.className = "transcript-card-meta";
+      const durBadge = document.createElement("span");
+      durBadge.className = "card-badge";
+      durBadge.textContent = formatDuration(rec.duration_sec);
+      meta.appendChild(durBadge);
+
+      if (rec.language) {
+        const langBadge = document.createElement("span");
+        langBadge.className = "card-badge";
+        langBadge.textContent = String(rec.language).toUpperCase();
+        meta.appendChild(langBadge);
       }
-    } else if (!query || rec.transcript_text.toLowerCase().includes(query)) {
-      matchedAny = true;
-      const p = document.createElement("div");
-      p.className = "segment-text";
-      highlightMatch(p, rec.transcript_text);
-      card.appendChild(p);
+
+      const segInfo = document.createElement("span");
+      segInfo.textContent = segs.length > 0
+        ? `${segs.length} fragm. · ${wordCount} pal.`
+        : `${wordCount} palabras`;
+      meta.appendChild(segInfo);
+
+      if (query && matchCount > 0) {
+        const matchBadge = document.createElement("span");
+        matchBadge.className = "transcript-match-badge";
+        matchBadge.textContent = `${matchCount} coinc.`;
+        meta.appendChild(matchBadge);
+      }
+      card.appendChild(meta);
+
+      const preview = document.createElement("div");
+      preview.className = "transcript-card-preview";
+      highlightMatch(preview, snippet || "Sin texto disponible.");
+      card.appendChild(preview);
+
+      const foot = document.createElement("div");
+      foot.className = "transcript-card-foot";
+      foot.innerHTML = `<span>Abrir transcripción completa</span><span>→</span>`;
+      card.appendChild(foot);
+
+      const openDetail = () => {
+        state.transcriptRecFilter = rec.id;
+        renderTranscriptTab(session);
+        const scroll = document.getElementById("center-scroll");
+        if (scroll) scroll.scrollTop = 0;
+      };
+      card.onclick = openDetail;
+      card.onkeydown = (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          openDetail();
+        }
+      };
+
+      grid.appendChild(card);
     }
 
-    if (!matchedAny) {
-      const emptyMatch = document.createElement("div");
-      emptyMatch.className = "rec-empty";
-      emptyMatch.textContent = "Sin coincidencias en este audio para la búsqueda actual.";
-      card.appendChild(emptyMatch);
+    if (visibleCards === 0) {
+      pane.innerHTML = `<div class="chat-placeholder"><h3>Sin coincidencias</h3><p>Ninguna transcripción contiene "${escapeHtml(query)}".</p></div>`;
+    } else {
+      pane.appendChild(grid);
     }
-
-    pane.appendChild(card);
+    return;
   }
+
+  // --- Focused Audio Transcript Detail View ---
+  const activeRec = recordings.find((r) => r.id === state.transcriptRecFilter) || recordings[0];
+
+  const navBar = document.createElement("div");
+  navBar.className = "transcript-detail-nav";
+
+  const backBtn = document.createElement("button");
+  backBtn.type = "button";
+  backBtn.className = "pill-btn outline sm transcript-back-btn";
+  backBtn.textContent = "← Todos los audios";
+  backBtn.onclick = () => {
+    state.transcriptRecFilter = null;
+    renderTranscriptTab(session);
+  };
+  navBar.appendChild(backBtn);
+
+  if (recordings.length >= 2) {
+    const switcher = document.createElement("div");
+    switcher.className = "transcript-filter-bar";
+    for (const r of recordings) {
+      const pillBtn = document.createElement("button");
+      pillBtn.type = "button";
+      pillBtn.className = `quiz-choice-pill ${r.id === activeRec.id ? "active" : ""}`;
+      pillBtn.textContent = `🎙 ${r.filename}`;
+      pillBtn.onclick = () => {
+        state.transcriptRecFilter = r.id;
+        renderTranscriptTab(session);
+      };
+      switcher.appendChild(pillBtn);
+    }
+    navBar.appendChild(switcher);
+  }
+  pane.appendChild(navBar);
+
+  const card = document.createElement("div");
+  card.className = "content-card";
+
+  const header = document.createElement("div");
+  header.className = "content-card-header";
+  header.innerHTML = `
+    <span>🎙 ${escapeHtml(activeRec.filename)}</span>
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      <button type="button" class="pill-btn outline xs transcript-detail-play-btn" title="Reproducir este audio">▶ Escuchar</button>
+      <span class="card-badge">${formatDuration(activeRec.duration_sec)} · Clic en tiempo para reproducir</span>
+    </div>
+  `;
+  header.querySelector(".transcript-detail-play-btn").onclick = () => {
+    seekRecording(activeRec.id, 0, { pulse: true });
+  };
+  card.appendChild(header);
+
+  const segs = activeRec.segments || [];
+  let matchedAny = false;
+  if (segs.length > 0) {
+    for (const seg of segs) {
+      const text = seg.text || "";
+      if (query && !text.toLowerCase().includes(query)) continue;
+      matchedAny = true;
+
+      const row = document.createElement("div");
+      row.className = "segment-row";
+
+      const tsBtn = document.createElement("button");
+      tsBtn.className = "timestamp-btn";
+      tsBtn.textContent = formatDuration(seg.start);
+      tsBtn.onclick = () => seekRecording(activeRec.id, seg.start, { pulse: true });
+
+      const textEl = document.createElement("div");
+      textEl.className = "segment-text";
+      highlightMatch(textEl, text);
+
+      row.appendChild(tsBtn);
+      row.appendChild(textEl);
+      card.appendChild(row);
+    }
+  } else if (!query || activeRec.transcript_text.toLowerCase().includes(query)) {
+    matchedAny = true;
+    const p = document.createElement("div");
+    p.className = "segment-text";
+    highlightMatch(p, activeRec.transcript_text);
+    card.appendChild(p);
+  }
+
+  if (!matchedAny) {
+    const emptyMatch = document.createElement("div");
+    emptyMatch.className = "rec-empty";
+    emptyMatch.textContent = "Sin coincidencias en este audio para la búsqueda actual.";
+    card.appendChild(emptyMatch);
+  }
+
+  pane.appendChild(card);
 }
 
 // --- Interactive Customizable Exam Studio ---
@@ -4425,9 +4717,9 @@ function initEvents() {
     const recs = (state.activeSession.recordings || []).filter(
       (r) => r.transcript_text && r.enabled !== false
     );
-    const selected = state.transcriptRecFilter === "all"
-      ? recs
-      : recs.filter((r) => r.id === state.transcriptRecFilter);
+    const selected = state.transcriptRecFilter
+      ? recs.filter((r) => r.id === state.transcriptRecFilter)
+      : recs;
     const blocks = selected.map((r) => `=== ${r.filename} ===\n${r.transcript_text}`);
     const text = blocks.join("\n\n");
     if (!text) return;

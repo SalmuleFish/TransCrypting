@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import re
 import unicodedata
 from collections import Counter
@@ -592,6 +593,7 @@ def build_chat_messages(
             + "\n\n".join(chunk_blocks)
         )
 
+    audio_cite_fmt = "[nombre_audio · MM:SS]" if len(ready_recs) > 1 else "[MM:SS]"
     total_sources = len(ready_recs) + len(ready_srcs)
     catalog_text = _build_source_catalog(ready_recs, ready_srcs)
     system_prompt = (
@@ -602,7 +604,7 @@ def build_chat_messages(
         "3. Basa tus respuestas ÚNICAMENTE en las fuentes activas proporcionadas abajo.\n"
         "4. Identificación flexible de nombres de fuente: si el usuario menciona una fuente de forma abreviada, sin guiones bajos o traducida (por ejemplo \"chapter 11\" o \"capítulo 11\" para referirse a \"Chapter_11_Persuasive_Messages_Summary.pdf\"), relaciónala automáticamente con su archivo correspondiente del catálogo antes de responder.\n"
         "5. Cita siempre de forma precisa usando estos formatos exactos entre corchetes:\n"
-        "   - Para audios: [MM:SS]\n"
+        f"   - Para audios: {audio_cite_fmt}\n"
         "   - Para documentos/diapositivas: [nombre_archivo.pdf · p. 4] o [presentacion.pptx · diap. 2]\n"
         "   - Para imágenes: [nombre_imagen.png]\n"
         "6. Si tras revisar todo el contexto el dato realmente no aparece, dilo claramente sin inventar.\n\n"
@@ -863,15 +865,33 @@ def build_quiz_generation_messages(
 
     clean_count = max(2, min(15, int(num_questions)))
     if mode == "mcq":
-        mode_rule = f"TODAS las {clean_count} preguntas deben ser de tipo \"mcq\" (opción múltiple con 4 opciones)."
+        mode_rule = (
+            f"TODAS las {clean_count} preguntas deben ser de tipo \"mcq\" (opción múltiple con 4 opciones).\n"
+            "- Distribuye el índice correcto (`correct_index`) entre 0, 1, 2 y 3 (NUNCA pongas todas las respuestas correctas en el mismo índice)."
+        )
     elif mode == "true_false":
-        mode_rule = f"TODAS las {clean_count} preguntas deben ser de tipo \"true_false\" (afirmación para responder Verdadero o Falso)."
+        half_low = clean_count // 2
+        true_target = half_low if (clean_count % 2 == 0 or random.choice([True, False])) else half_low + 1
+        false_target = clean_count - true_target
+        tf_plan = [0] * true_target + [1] * false_target
+        random.shuffle(tf_plan)
+        plan_desc = ", ".join(
+            f"P{idx}: {'Verdadero (correct_index: 0)' if val == 0 else 'Falso (correct_index: 1)'}"
+            for idx, val in enumerate(tf_plan, start=1)
+        )
+        mode_rule = (
+            f"TODAS las {clean_count} preguntas deben ser de tipo \"true_false\" (afirmación para responder Verdadero o Falso).\n"
+            f"- VARIACIÓN OBLIGATORIA ({true_target} Verdaderas y {false_target} Falsas): NUNCA hagas que todas sean Falsas ni todas Verdaderas.\n"
+            f"- Sigue exactamente esta distribución mezclada: {plan_desc}.\n"
+            "- Las afirmaciones marcadas como Verdadero DEBEN ser 100% fieles a las fuentes (sin alterar hechos); las marcadas como Falso DEBEN introducir una contradicción clara pero sutil frente a las fuentes."
+        )
     elif mode == "open":
         mode_rule = f"TODAS las {clean_count} preguntas deben ser de tipo \"open\" (respuesta abierta para redactar)."
     else:
         mode_rule = (
             f"Combina de forma variada preguntas \"mcq\" (4 opciones), \"true_false\" (Verdadero/Falso) y \"open\" (respuesta abierta) "
-            f"hasta completar exactamente {clean_count} preguntas."
+            f"hasta completar exactamente {clean_count} preguntas.\n"
+            "- En las preguntas \"true_false\" alterna entre Verdadero (correct_index: 0) y Falso (correct_index: 1) (nunca todas iguales), y en las \"mcq\" varía `correct_index` entre 0, 1, 2 y 3."
         )
 
     diff_map = {
@@ -908,8 +928,8 @@ def build_quiz_generation_messages(
         f"{style_rule}\n"
         f"{focus_rule}"
         "Reglas de formato JSON estricto:\n"
-        "- Para \"mcq\": {\"id\": 1, \"type\": \"mcq\", \"question\": \"...\", \"options\": [\"op1\", \"op2\", \"op3\", \"op4\"], \"correct_index\": 0, \"explanation\": \"breve explicación\", \"hint\": \"pista corta\", \"timestamp\": \"MM:SS o fuente.pdf · p. X\"}\n"
-        "- Para \"true_false\": {\"id\": 2, \"type\": \"true_false\", \"question\": \"Afirmación clara...\", \"options\": [\"Verdadero\", \"Falso\"], \"correct_index\": 0, \"explanation\": \"breve explicación\", \"hint\": \"pista corta\", \"timestamp\": \"MM:SS o fuente.pdf · p. X\"} (correct_index 0 = Verdadero, 1 = Falso)\n"
+        "- Para \"mcq\": {\"id\": 1, \"type\": \"mcq\", \"question\": \"...\", \"options\": [\"op1\", \"op2\", \"op3\", \"op4\"], \"correct_index\": 2, \"explanation\": \"breve explicación\", \"hint\": \"pista corta\", \"timestamp\": \"MM:SS o fuente.pdf · p. X\"}\n"
+        "- Para \"true_false\": {\"id\": 2, \"type\": \"true_false\", \"question\": \"Afirmación clara...\", \"options\": [\"Verdadero\", \"Falso\"], \"correct_index\": 0 o 1, \"explanation\": \"breve explicación\", \"hint\": \"pista corta\", \"timestamp\": \"MM:SS o fuente.pdf · p. X\"} (usa 0 cuando la afirmación sea Verdadera y 1 cuando sea Falsa)\n"
         "- Para \"open\": {\"id\": 3, \"type\": \"open\", \"question\": \"...\", \"expected_answer\": \"respuesta modelo breve\", \"hint\": \"pista corta\", \"timestamp\": \"MM:SS o fuente.pdf · p. X\"}\n"
         "- No pongas la letra A/B/C/D dentro de los strings de options.\n"
         f"{hint_rule}"
@@ -979,19 +999,35 @@ def parse_quiz_json(raw_text: str, mode: str = "mixed") -> list[dict[str, Any]]:
 
             if q_type == "true_false":
                 c_idx = 0
-                if isinstance(item.get("correct_answer"), bool):
-                    c_idx = 0 if item["correct_answer"] else 1
+                raw_bool = item.get("correct_answer")
+                if raw_bool is None and "is_true" in item:
+                    raw_bool = item.get("is_true")
+                if raw_bool is None and "answer" in item:
+                    raw_bool = item.get("answer")
+
+                if isinstance(raw_bool, bool):
+                    c_idx = 0 if raw_bool else 1
                 else:
-                    raw_ca = str(item.get("correct_answer") or "").strip().lower()
-                    if raw_ca in ("false", "falso", "f", "1"):
+                    raw_ca = str(raw_bool if raw_bool is not None else "").strip().lower()
+                    if raw_ca in ("false", "falso", "f", "no", "incorrecto"):
                         c_idx = 1
-                    elif raw_ca in ("true", "verdadero", "v", "0"):
+                    elif raw_ca in ("true", "verdadero", "v", "si", "sí", "correcto"):
                         c_idx = 0
                     else:
                         try:
-                            c_idx = 1 if int(item.get("correct_index", 0)) == 1 else 0
+                            parsed_idx = int(item.get("correct_index", 0))
                         except (TypeError, ValueError):
-                            c_idx = 0
+                            parsed_idx = 0
+                        if len(raw_opts) >= 2 and 0 <= parsed_idx < len(raw_opts):
+                            opt_text = str(raw_opts[parsed_idx]).strip().lower()
+                            if "falso" in opt_text or "false" in opt_text:
+                                c_idx = 1
+                            elif "verdadero" in opt_text or "true" in opt_text:
+                                c_idx = 0
+                            else:
+                                c_idx = 1 if parsed_idx == 1 else 0
+                        else:
+                            c_idx = 1 if parsed_idx == 1 else 0
                 questions.append(
                     {
                         "id": len(questions) + 1,
@@ -1047,6 +1083,86 @@ def parse_quiz_json(raw_text: str, mode: str = "mixed") -> list[dict[str, Any]]:
             )
 
     return questions
+
+
+def is_true_false_unbalanced(questions: list[dict[str, Any]]) -> bool:
+    """Return True if a quiz's True/False items collapsed into all-True, all-False, or extreme skew."""
+    tf_items = [q for q in questions if q.get("type") == "true_false"]
+    total = len(tf_items)
+    if total < 2:
+        return False
+    true_count = sum(1 for q in tf_items if int(q.get("correct_index", 0)) == 0)
+    false_count = total - true_count
+    if true_count == 0 or false_count == 0:
+        return True
+    if total >= 5:
+        min_side = min(true_count, false_count)
+        if min_side < max(2, total // 4):
+            return True
+    return False
+
+
+def build_quiz_rebalance_messages(
+    original_messages: list[dict[str, str]],
+    raw_json_response: str,
+    questions: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Build a corrective follow-up prompt so skewed True/False exams contain balanced Verdadero & Falso items."""
+    tf_items = [q for q in questions if q.get("type") == "true_false"]
+    total_tf = len(tf_items)
+    true_items = [q for q in tf_items if int(q.get("correct_index", 0)) == 0]
+    false_items = [q for q in tf_items if int(q.get("correct_index", 0)) == 1]
+
+    desired_true = max(1, total_tf // 2)
+    need_more_true = len(true_items) < len(false_items)
+
+    if need_more_true:
+        flip_needed = max(1, desired_true - len(true_items))
+        candidates = [q["id"] for q in false_items[:flip_needed]]
+        instruction = (
+            f"ATENCIÓN: Tu examen de Verdadero/Falso quedó desbalanceado ({len(true_items)} Verdaderas y {len(false_items)} Falsas).\n"
+            f"Reescribe ÚNICAMENTE las preguntas con id {candidates} para convertirlas en afirmaciones GENUINAMENTE VERDADERAS "
+            "según el CONTENIDO DE ESTUDIO original (cambiando su `question` para que sea fiel a las fuentes, "
+            "poniendo `correct_index`: 0 y actualizando `explanation`). Mantén todas las demás preguntas tal como están y devuelve "
+            "el arreglo JSON completo con exactamente las mismas claves."
+        )
+    else:
+        desired_false = max(1, total_tf - desired_true)
+        flip_needed = max(1, desired_false - len(false_items))
+        candidates = [q["id"] for q in true_items[:flip_needed]]
+        instruction = (
+            f"ATENCIÓN: Tu examen de Verdadero/Falso quedó desbalanceado ({len(true_items)} Verdaderas y {len(false_items)} Falsas).\n"
+            f"Reescribe ÚNICAMENTE las preguntas con id {candidates} para convertirlas en afirmaciones GENUINAMENTE FALSAS "
+            "mediante una contradicción sutil frente al CONTENIDO DE ESTUDIO original (cambiando su `question`, "
+            "poniendo `correct_index`: 1 y actualizando `explanation`). Mantén todas las demás preguntas tal como están y devuelve "
+            "el arreglo JSON completo con exactamente las mismas claves."
+        )
+
+    return [
+        *original_messages,
+        {"role": "assistant", "content": raw_json_response},
+        {"role": "user", "content": instruction},
+    ]
+
+
+def shuffle_quiz_mcq_options(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Randomize MCQ option order so the correct option isn't stuck at index 0, keeping positional options intact."""
+    out: list[dict[str, Any]] = []
+    positional_re = re.compile(r"\b(?:todas|ninguna)\s+las\s+anteriores\b|\ball\s+of\s+the\s+above\b|\bnone\s+of\s+the\s+above\b", re.IGNORECASE)
+    for q in questions:
+        item = dict(q)
+        if item.get("type") == "mcq" and isinstance(item.get("options"), list) and len(item["options"]) >= 2:
+            opts = list(item["options"])
+            c_idx = int(item.get("correct_index", 0))
+            if 0 <= c_idx < len(opts) and not any(positional_re.search(str(o)) for o in opts):
+                indexed = list(enumerate(opts))
+                random.shuffle(indexed)
+                new_opts = [opt for _old_i, opt in indexed]
+                new_c_idx = next(new_i for new_i, (old_i, _opt) in enumerate(indexed) if old_i == c_idx)
+                item["options"] = new_opts
+                item["correct_index"] = new_c_idx
+        out.append(item)
+    return out
 
 
 def extract_relevant_excerpt(

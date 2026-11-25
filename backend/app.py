@@ -33,15 +33,18 @@ from backend.context_manager import (
     build_combined_summary_messages,
     build_open_answer_grading_messages,
     build_quiz_generation_messages,
+    build_quiz_rebalance_messages,
     build_recording_summary_messages,
     build_source_summary_messages,
     build_suggestions_messages,
     estimate_session_context_usage,
     extract_relevant_excerpt,
     format_transcript_with_timestamps,
+    is_true_false_unbalanced,
     parse_grade_json,
     parse_quiz_json,
     parse_suggestions_json,
+    shuffle_quiz_mcq_options,
 )
 from backend.database import db
 from backend.hardware import get_system_stats
@@ -1023,6 +1026,40 @@ async def generate_session_quiz(
             detail="Generación detenida por el usuario.",
         ) from exc
     questions = parse_quiz_json(raw, mode=mode)
+    if questions and is_true_false_unbalanced(questions):
+        try:
+            rebalance_msgs = build_quiz_rebalance_messages(msgs, raw, questions)
+            rebalanced_raw = await resource_manager.summarize_exclusive(
+                messages=rebalance_msgs,
+                model_name=ollama_model,
+                num_ctx=num_ctx,
+                idle_unload_sec=idle_unload_sec,
+            )
+            rebalanced_questions = parse_quiz_json(rebalanced_raw, mode=mode)
+            if rebalanced_questions and len(rebalanced_questions) >= len(questions) // 2:
+                orig_tf = [q for q in questions if q.get("type") == "true_false"]
+                new_tf = [q for q in rebalanced_questions if q.get("type") == "true_false"]
+                orig_min = min(
+                    sum(1 for q in orig_tf if q.get("correct_index") == 0),
+                    sum(1 for q in orig_tf if q.get("correct_index") == 1),
+                ) if orig_tf else 0
+                new_min = min(
+                    sum(1 for q in new_tf if q.get("correct_index") == 0),
+                    sum(1 for q in new_tf if q.get("correct_index") == 1),
+                ) if new_tf else 0
+                if new_min > orig_min:
+                    questions = rebalanced_questions
+        except (asyncio.CancelledError, GenerationAbortedError) as exc:
+            raise HTTPException(
+                status_code=499,
+                detail="Generación detenida por el usuario.",
+            ) from exc
+        except Exception:
+            pass
+
+    if questions:
+        questions = shuffle_quiz_mcq_options(questions)
+
     if not questions:
         raise HTTPException(
             status_code=502,
