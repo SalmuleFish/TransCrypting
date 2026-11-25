@@ -144,6 +144,7 @@ def test_resource_manager_unloads_ollama_before_whisper_and_frees_whisper() -> N
         language: str = "auto",
         progress_callback=None,
         classroom_enhance: bool = True,
+        cancel_event=None,
     ):
         events.append("whisper_transcribed")
         return {"text": "hola", "segments": [], "language": "es", "duration_sec": 1.0}
@@ -1021,4 +1022,402 @@ def test_eco_mode_skips_auto_summarization(tmp_path: Path, monkeypatch) -> None:
     assert updated["summary_text"] == ""
     assert summarize_mock.await_count == 0
     assert test_db.search_session_chunks(sess["id"], "FTS5")
+    test_db.close()
+
+
+def test_desktop_default_settings_save_and_no_eco_throttle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify desktop defaults keep eco_mode off, PUT /api/settings succeeds, and Ollama runs unthrottled."""
+    import asyncio
+    from backend.ollama_service import OllamaService
+
+    test_db = Database(
+        db_path=tmp_path / "desktop.db",
+        audio_dir=tmp_path / "audio",
+        sources_dir=tmp_path / "sources",
+        podcasts_dir=tmp_path / "podcasts",
+    )
+    test_db.init_db()
+    defaults = test_db.get_settings()
+    assert defaults["eco_mode"] is False
+
+    monkeypatch.setattr(app_module, "db", test_db)
+    monkeypatch.setattr("backend.resource_manager.db", test_db)
+    monkeypatch.setattr(app_module.pipeline, "start", lambda: None)
+    monkeypatch.setattr(app_module.resource_manager, "start_idle_watchdog", lambda: None)
+    monkeypatch.setattr(app_module.ollama_service, "shutdown", AsyncMock())
+
+    with TestClient(app_module.app) as client:
+        resp = client.put(
+            "/api/settings",
+            json={
+                "ollama_model": "Gemma-4-E4B-it:latest",
+                "whisper_model": "large-v3-turbo",
+                "whisper_device": "auto",
+                "whisper_language": "es",
+                "num_ctx": 8192,
+                "idle_unload_sec": 180,
+                "classroom_audio_enhance": True,
+                "enable_thinking": False,
+                "eco_mode": False,
+                "eco_cpu_threads": 2,
+            },
+        )
+        assert resp.status_code == 200
+        saved = resp.json()
+        assert saved["eco_mode"] is False
+        assert saved["num_ctx"] == 8192
+
+    # Confirm OllamaService.stream_chat_events does not inject num_thread/num_predict when eco_mode=False
+    captured_payloads: list[dict] = []
+
+    class FakeStreamResp:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def aiter_lines(self):
+            yield '{"message": {"content": "ok"}}'
+
+    class FakeAsyncClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def stream(self, _method, _url, json=None):
+            captured_payloads.append(json or {})
+            return FakeStreamResp()
+
+    svc = OllamaService()
+    monkeypatch.setattr(svc, "ensure_running", AsyncMock())
+    monkeypatch.setattr("backend.ollama_service.httpx.AsyncClient", FakeAsyncClient)
+
+    async def _collect():
+        return [evt async for evt in svc.stream_chat_events("demo", [{"role": "user", "content": "hi"}], eco_mode=False)]
+
+    evts = asyncio.run(_collect())
+    assert evts == [("token", "ok")]
+    opts = captured_payloads[0]["options"]
+    assert opts == {"num_ctx": 8192, "temperature": 0.3}
+    assert "num_thread" not in opts
+    assert "num_predict" not in opts
+    test_db.close()
+
+
+def test_filename_matching_and_source_catalog_in_chat(tmp_path: Path) -> None:
+    test_db = Database(
+        db_path=tmp_path / "catalog.db",
+        audio_dir=tmp_path / "audio",
+        sources_dir=tmp_path / "sources",
+        podcasts_dir=tmp_path / "podcasts",
+    )
+    test_db.init_db()
+    sess = test_db.create_session("Comunicación")
+    sid = sess["id"]
+
+    files_and_bodies = [
+        ("Chapter_10_Intro_Messages.pdf", "Principios generales de redacción rutinaria."),
+        (
+            "Chapter_11_Persuasive_Messages_Summary.pdf",
+            "El modelo AIDA organiza la persuasión en Atención, Interés, Deseo y Acción.",
+        ),
+        ("Chapter_12_Reports.pdf", "Estructuras formales para informes ejecutivos."),
+    ]
+    created_srcs = []
+    for idx, (fname, body) in enumerate(files_and_bodies):
+        s = test_db.create_source(sid, fname, "pdf", str(tmp_path / fname))
+        pages = [{"locator": "p. 1", "label": "Página 1", "text": body}]
+        test_db.update_source_content(s["id"], body, pages, page_count=1)
+        test_db.replace_item_chunks(sid, "source", s["id"], fname, "pdf", [{"locator": "p. 1", "content": body}])
+        test_db.update_source_summary(s["id"], f"Resumen de archivo {idx + 10}.")
+        created_srcs.append(test_db.get_source(s["id"]))
+
+    # "chapter 11" must match Chapter_11_Persuasive_Messages_Summary.pdf even though "chapter 11" isn't in body text
+    hits_en = test_db.search_session_chunks(
+        sid,
+        "de que trata el chapter 11?",
+        limit=6,
+        enabled_only=True,
+        primary_query="de que trata el chapter 11?",
+    )
+    assert hits_en
+    assert hits_en[0]["filename"] == "Chapter_11_Persuasive_Messages_Summary.pdf"
+    assert "AIDA" in hits_en[0]["content"]
+
+    # Spanish translated reference ("capítulo 11") must also match Chapter_11_Persuasive_Messages_Summary.pdf
+    hits_es = test_db.search_session_chunks(
+        sid,
+        "¿qué explica el capítulo 11?",
+        limit=6,
+        enabled_only=True,
+        primary_query="¿qué explica el capítulo 11?",
+    )
+    assert hits_es
+    assert hits_es[0]["filename"] == "Chapter_11_Persuasive_Messages_Summary.pdf"
+
+    # Source catalog must appear verbatim in chat system prompt even when total content is large (retrieval mode)
+    big_srcs = []
+    for s in created_srcs:
+        assert s is not None
+        copy = dict(s)
+        copy["extracted_text"] = ("Contenido extenso de prueba. " * 220)
+        copy["pages"] = [{"locator": "p. 1", "text": copy["extracted_text"]}]
+        big_srcs.append(copy)
+
+    msgs, mode = build_chat_messages(
+        recordings=[],
+        combined_summary="Resumen combinado.",
+        chat_history=[],
+        user_question="¿de qué trata el chapter 11?",
+        num_ctx=4096,
+        sources=big_srcs,
+        indexed_chunks=hits_en,
+    )
+    assert mode == "retrieval"
+    assert "CATÁLOGO COMPLETO DE FUENTES ACTIVAS" in msgs[0]["content"]
+    assert "Chapter_11_Persuasive_Messages_Summary.pdf" in msgs[0]["content"]
+    assert "Chapter 11 Persuasive Messages Summary" in msgs[0]["content"]
+    assert "AIDA" in msgs[0]["content"]
+    test_db.close()
+
+
+def test_empty_scanned_pdf_rejected_without_junk_chunks_and_legacy_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    from pypdf import PdfWriter
+    import backend.app as app_module
+    from backend.source_service import chunk_pages, pages_to_full_text
+
+    # 1. Placeholder strings never produce chunks or full text
+    fake_pages = [
+        {"locator": "p. 1", "text": "[Página sin texto seleccionable o escaneada]"},
+        {"locator": "p. 2", "text": "   "},
+    ]
+    assert chunk_pages(fake_pages) == []
+    assert pages_to_full_text(fake_pages) == ""
+
+    # 2. Blank scanned PDF submitted to _process_source ends in error with 0 chunks & 0 LLM calls
+    test_db = Database(
+        db_path=tmp_path / "junk.db",
+        audio_dir=tmp_path / "audio",
+        sources_dir=tmp_path / "sources",
+        podcasts_dir=tmp_path / "podcasts",
+    )
+    test_db.init_db()
+    test_db.update_settings({"eco_mode": False})
+    monkeypatch.setattr(app_module, "db", test_db)
+    summarize_mock = AsyncMock(return_value="should never run")
+    monkeypatch.setattr(app_module.resource_manager, "summarize_exclusive", summarize_mock)
+    monkeypatch.setattr(app_module.ollama_service, "resolve_default_model", AsyncMock(return_value="demo"))
+
+    sess = test_db.create_session("PDF Escaneado")
+    pdf_path = tmp_path / "escaneado.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.add_blank_page(width=200, height=200)
+    with pdf_path.open("wb") as fh:
+        writer.write(fh)
+
+    src = test_db.create_source(sess["id"], "escaneado.pdf", "pdf", str(pdf_path))
+    asyncio.run(app_module.pipeline._process_source(src["id"]))
+
+    updated = test_db.get_source(src["id"])
+    assert updated is not None
+    assert updated["status"] == "error"
+    assert test_db.count_session_chunks(sess["id"], enabled_only=False) == 0
+    assert summarize_mock.await_count == 0
+
+    # 3. Legacy DB cleanup on init_db purges pre-existing placeholder chunks & placeholder-only sources
+    legacy = test_db.create_source(sess["id"], "viejo_escaneo.pdf", "pdf", str(pdf_path))
+    legacy_text = "[p. 1]\n[Página sin texto seleccionable o escaneada]\n\n[p. 2]\n[Página sin texto seleccionable o escaneada]"
+    test_db.update_source_content(legacy["id"], legacy_text, fake_pages, page_count=2)
+    test_db.update_source_summary(legacy["id"], "Resumen inventado")
+    test_db.replace_item_chunks(
+        sess["id"],
+        "source",
+        legacy["id"],
+        "viejo_escaneo.pdf",
+        "pdf",
+        [{"locator": "p. 1", "content": "[Página sin texto seleccionable o escaneada]"}],
+    )
+    assert test_db.count_session_chunks(sess["id"], enabled_only=True) == 1
+
+    test_db.init_db()
+    cleaned_legacy = test_db.get_source(legacy["id"])
+    assert cleaned_legacy is not None
+    assert cleaned_legacy["status"] == "error"
+    assert cleaned_legacy["extracted_text"] == ""
+    assert test_db.count_session_chunks(sess["id"], enabled_only=False) == 0
+    test_db.close()
+
+
+def test_delete_source_returns_immediately_without_blocking_on_llm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import time
+
+    test_db = Database(
+        db_path=tmp_path / "fastdel.db",
+        audio_dir=tmp_path / "audio",
+        sources_dir=tmp_path / "sources",
+        podcasts_dir=tmp_path / "podcasts",
+    )
+    test_db.init_db()
+    test_db.update_settings({"eco_mode": False})
+    monkeypatch.setattr(app_module, "db", test_db)
+    monkeypatch.setattr("backend.resource_manager.db", test_db)
+    monkeypatch.setattr(app_module.pipeline, "start", lambda: None)
+    monkeypatch.setattr(app_module.resource_manager, "start_idle_watchdog", lambda: None)
+    monkeypatch.setattr(app_module.ollama_service, "shutdown", AsyncMock())
+
+    async def slow_summarize(*_args, **_kwargs):
+        await asyncio.sleep(5.0)
+        return "delayed combined summary"
+
+    monkeypatch.setattr(app_module.resource_manager, "summarize_exclusive", slow_summarize)
+    monkeypatch.setattr(app_module.ollama_service, "resolve_default_model", AsyncMock(return_value="demo"))
+
+    sess = test_db.create_session("Sesión Rápida")
+    sid = sess["id"]
+    src_ids = []
+    for name in ("a.txt", "b.txt", "c.txt"):
+        s = test_db.create_source(sid, name, "text", str(tmp_path / name))
+        test_db.update_source_content(s["id"], f"Contenido {name}", [{"locator": "sec. 1", "text": f"Contenido {name}"}], 1)
+        test_db.update_source_summary(s["id"], f"Resumen {name}")
+        test_db.replace_item_chunks(sid, "source", s["id"], name, "text", [{"locator": "sec. 1", "content": f"Contenido {name}"}])
+        src_ids.append(s["id"])
+
+    with TestClient(app_module.app) as client:
+        t0 = time.monotonic()
+        resp = client.delete(f"/api/sessions/{sid}/sources/{src_ids[0]}")
+        elapsed = time.monotonic() - t0
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+        assert elapsed < 1.5
+        assert len(client.get(f"/api/sessions/{sid}").json()["sources"]) == 2
+
+    assert test_db.count_session_chunks(sid, enabled_only=False) == 2
+    test_db.close()
+
+
+def test_whisper_transcribe_cancel_event_stops_immediately(tmp_path: Path) -> None:
+    import threading
+    from types import SimpleNamespace
+
+    from backend.whisper_service import WhisperCancelledError, WhisperService
+
+    audio_file = tmp_path / "clase.wav"
+    audio_file.write_bytes(b"RIFFdemo")
+
+    cancel_ev = threading.Event()
+    called_segments: list[str] = []
+
+    class FakeWhisperModel:
+        def transcribe(self, *_args, **_kwargs):
+            def _gen():
+                yield SimpleNamespace(start=0.0, end=1.0, text="Primer segmento")
+                cancel_ev.set()
+                yield SimpleNamespace(start=1.0, end=2.0, text="Segundo segmento")
+
+            return _gen(), SimpleNamespace(duration=4.0, language="es")
+
+    svc = WhisperService()
+    svc._model = FakeWhisperModel()
+
+    def _on_progress(_ratio: float, _lang: str) -> None:
+        called_segments.append("progress")
+
+    with pytest.raises(WhisperCancelledError):
+        svc.transcribe(
+            audio_file,
+            language="es",
+            progress_callback=_on_progress,
+            classroom_enhance=False,
+            cancel_event=cancel_ev,
+        )
+    assert len(called_segments) == 1
+
+
+def test_ollama_abort_active_closes_streams() -> None:
+    from backend.ollama_service import OllamaService
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    svc = OllamaService()
+    c1 = FakeClient()
+    c2 = FakeClient()
+    svc._active_clients.add(c1)  # type: ignore[arg-type]
+    svc._active_clients.add(c2)  # type: ignore[arg-type]
+
+    closed = asyncio.run(svc.abort_active())
+    assert closed == 2
+    assert c1.closed and c2.closed
+    assert c1 in svc._aborted_clients and c2 in svc._aborted_clients
+
+
+def test_system_stop_endpoint_cancels_active_jobs_and_resets_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_db = Database(
+        db_path=tmp_path / "stop.db",
+        audio_dir=tmp_path / "audio",
+        sources_dir=tmp_path / "sources",
+        podcasts_dir=tmp_path / "podcasts",
+    )
+    test_db.init_db()
+    monkeypatch.setattr(app_module, "db", test_db)
+    monkeypatch.setattr("backend.resource_manager.db", test_db)
+    monkeypatch.setattr(app_module.pipeline, "start", lambda: None)
+    monkeypatch.setattr(app_module.resource_manager, "start_idle_watchdog", lambda: None)
+    monkeypatch.setattr(app_module.ollama_service, "shutdown", AsyncMock())
+    monkeypatch.setattr(app_module.ollama_service, "abort_active", AsyncMock(return_value=1))
+
+    async def _sleep_forever():
+        await asyncio.sleep(30)
+
+    with TestClient(app_module.app) as client:
+        # Simulate an active background task inside resource_manager & _combined_summary_tasks
+        async def _trigger_and_stop():
+            dummy_task = asyncio.create_task(_sleep_forever())
+            combined_task = asyncio.create_task(_sleep_forever())
+            app_module.resource_manager._active_tasks.add(dummy_task)
+            app_module._combined_summary_tasks["sess1"] = combined_task
+            await asyncio.sleep(0)
+            res = await app_module.system_stop()
+            assert res["stopped"] is True
+            assert res["aborted_streams"] == 1
+            assert res["cancelled_tasks"] >= 1
+            assert res["cancelled_combined"] >= 1
+            assert dummy_task.cancelled()
+            assert combined_task.cancelled()
+            assert res["resources"]["phase"] == "idle"
+            app_module.resource_manager._active_tasks.discard(dummy_task)
+            app_module._combined_summary_tasks.pop("sess1", None)
+
+        asyncio.run(_trigger_and_stop())
+
+        # Also exercise the HTTP route directly via TestClient
+        resp = client.post("/api/system/stop")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["stopped"] is True
+        assert body["resources"]["phase"] == "idle"
+
     test_db.close()

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,32 @@ from backend.config import (
 )
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+EMPTY_PAGE_PLACEHOLDERS = {
+    "[Página sin texto seleccionable o escaneada]",
+    "[Diapositiva sin texto]",
+    "[Documento sin texto]",
+    "[Archivo vacío]",
+}
+
+
+def is_meaningful_page_text(text: str) -> bool:
+    """Return False when extracted text is blank, punctuation-only, or an empty placeholder."""
+    clean = (text or "").strip()
+    if not clean or clean in EMPTY_PAGE_PLACEHOLDERS:
+        return False
+    filtered_lines = []
+    for line in clean.splitlines():
+        s = line.strip()
+        if not s or s in EMPTY_PAGE_PLACEHOLDERS:
+            continue
+        if re.fullmatch(r"\[(?:p\.|diap\.|sec\.)\s*\d+\]", s, flags=re.IGNORECASE):
+            continue
+        filtered_lines.append(s)
+    joined = " ".join(filtered_lines).strip()
+    if not joined:
+        return False
+    return len(re.findall(r"[A-Za-z0-9ÁÉÍÓÚÜáéíóúüñÑ]", joined)) >= 6
 
 
 def _format_ts(seconds: float) -> str:
@@ -64,6 +92,9 @@ def extract_document_pages(file_path: Path, source_type: str) -> list[dict[str, 
         from pypdf import PdfReader
 
         reader = PdfReader(str(file_path))
+        raw_pages: list[dict[str, str]] = []
+        pending_ocr_pages: list[tuple[int, Any]] = []
+
         for idx, page in enumerate(reader.pages, start=1):
             raw_text = ""
             try:
@@ -71,16 +102,63 @@ def extract_document_pages(file_path: Path, source_type: str) -> list[dict[str, 
             except Exception:
                 raw_text = ""
             cleaned = _clean_text_block(raw_text)
-            if not cleaned:
-                cleaned = "[Página sin texto seleccionable o escaneada]"
-            pages.append(
-                {
-                    "locator": f"p. {idx}",
-                    "label": f"Página {idx}",
-                    "text": cleaned,
-                }
-            )
-        return pages
+            if is_meaningful_page_text(cleaned):
+                raw_pages.append(
+                    {
+                        "locator": f"p. {idx}",
+                        "label": f"Página {idx}",
+                        "text": cleaned,
+                    }
+                )
+            else:
+                raw_pages.append(
+                    {
+                        "locator": f"p. {idx}",
+                        "label": f"Página {idx}",
+                        "text": "",
+                    }
+                )
+                if len(pending_ocr_pages) < 25:
+                    pending_ocr_pages.append((len(raw_pages) - 1, page))
+
+        # Automatic CPU WinRT OCR pass for scanned/image-only PDF pages
+        if pending_ocr_pages:
+            try:
+                with tempfile.TemporaryDirectory(prefix="pdf_ocr_") as tmp_dir:
+                    tmp_root = Path(tmp_dir)
+                    img_tasks: list[tuple[int, Path]] = []
+                    for page_idx, page_obj in pending_ocr_pages:
+                        try:
+                            imgs = getattr(page_obj, "images", None) or []
+                        except Exception:
+                            imgs = []
+                        for img_i, img_file in enumerate(imgs[:3]):
+                            data = getattr(img_file, "data", None)
+                            if not data or len(data) < 4096:
+                                continue
+                            ext = Path(getattr(img_file, "name", "") or "img.png").suffix.lower()
+                            if ext not in {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}:
+                                ext = ".png"
+                            out_img = tmp_root / f"p{page_idx}_{img_i}{ext}"
+                            out_img.write_bytes(data)
+                            img_tasks.append((page_idx, out_img))
+
+                    if img_tasks:
+                        ocr_texts = extract_images_text_windows_ocr_batch(
+                            [p for _, p in img_tasks], timeout_sec=45
+                        )
+                        by_page: dict[int, list[str]] = {}
+                        for (p_idx, _), ocr_txt in zip(img_tasks, ocr_texts):
+                            if is_meaningful_page_text(ocr_txt):
+                                by_page.setdefault(p_idx, []).append(ocr_txt)
+                        for p_idx, parts_list in by_page.items():
+                            merged = _clean_text_block("\n\n".join(parts_list))
+                            if is_meaningful_page_text(merged):
+                                raw_pages[p_idx]["text"] = merged
+            except Exception:
+                pass
+
+        return raw_pages
 
     if src_type == "pptx":
         from pptx import Presentation
@@ -109,12 +187,12 @@ def extract_document_pages(file_path: Path, source_type: str) -> list[dict[str, 
                         parts.append(f"Notas del presentador: {notes}")
             except Exception:
                 pass
-            cleaned = _clean_text_block("\n".join(parts)) or "[Diapositiva sin texto]"
+            cleaned = _clean_text_block("\n".join(parts))
             pages.append(
                 {
                     "locator": f"diap. {idx}",
                     "label": f"Diapositiva {idx}",
-                    "text": cleaned,
+                    "text": cleaned if is_meaningful_page_text(cleaned) else "",
                 }
             )
         return pages
@@ -152,8 +230,8 @@ def extract_document_pages(file_path: Path, source_type: str) -> list[dict[str, 
         decoded = raw_bytes.decode("utf-8", errors="replace")
 
     cleaned = _clean_text_block(decoded)
-    if not cleaned:
-        return [{"locator": "sec. 1", "label": "Sección 1", "text": "[Archivo vacío]"}]
+    if not is_meaningful_page_text(cleaned):
+        return [{"locator": "sec. 1", "label": "Sección 1", "text": ""}]
 
     paragraphs = [p.strip() for p in re.split(r"\n{2,}", cleaned) if p.strip()]
     return _group_blocks_into_sections(paragraphs, max_chars=1800)
@@ -163,7 +241,7 @@ def _group_blocks_into_sections(
     blocks: list[str], max_chars: int = 1800
 ) -> list[dict[str, str]]:
     if not blocks:
-        return [{"locator": "sec. 1", "label": "Sección 1", "text": "[Documento sin texto]"}]
+        return [{"locator": "sec. 1", "label": "Sección 1", "text": ""}]
 
     sections: list[dict[str, str]] = []
     cur: list[str] = []
@@ -198,12 +276,12 @@ def _group_blocks_into_sections(
 
 
 def pages_to_full_text(pages: list[dict[str, str]]) -> str:
-    """Render extracted pages into a single structured text document with locators."""
+    """Render extracted pages into a single structured text document, omitting empty/placeholder pages."""
     parts = []
     for page in pages:
         loc = (page.get("locator") or "").strip()
         txt = (page.get("text") or "").strip()
-        if not txt:
+        if not is_meaningful_page_text(txt):
             continue
         if loc:
             parts.append(f"[{loc}]\n{txt}")
@@ -217,12 +295,12 @@ def chunk_pages(
     max_chars: int = 1100,
     overlap_chars: int = 140,
 ) -> list[dict[str, str]]:
-    """Split extracted document pages into overlapping search chunks for FTS5."""
+    """Split meaningful extracted document pages into overlapping search chunks for FTS5."""
     chunks: list[dict[str, str]] = []
     for page in pages:
         locator = (page.get("locator") or "").strip() or "p. 1"
         text = (page.get("text") or "").strip()
-        if not text:
+        if not is_meaningful_page_text(text):
             continue
         if len(text) <= max_chars:
             chunks.append({"locator": locator, "content": text})
@@ -336,10 +414,15 @@ def build_image_analysis_messages(filename: str, image_b64: str) -> list[dict[st
     ]
 
 
-def extract_image_text_windows_ocr(image_path: Path) -> str:
-    """Safe CPU OCR fallback using built-in Windows WinRT OcrEngine via PowerShell."""
+def extract_images_text_windows_ocr_batch(
+    image_paths: list[Path],
+    timeout_sec: int = 45,
+) -> list[str]:
+    """Run Windows WinRT OcrEngine once across multiple images on CPU and return one string per image."""
+    if not image_paths:
+        return []
     ps_script = r"""
-param([string]$ImgPath)
+param([string]$ManifestPath)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 [void][Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
@@ -351,41 +434,70 @@ function Await($WinRtTask, $ResultType) {
     $netTask.Wait(-1) | Out-Null
     return $netTask.Result
 }
-$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($ImgPath)) ([Windows.Storage.StorageFile])
-$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
-$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
 $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
 if ($null -eq $engine) {
     $lang = New-Object Windows.Globalization.Language("en-US")
     $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($lang)
 }
-if ($null -ne $engine) {
-    $ocrResult = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    Write-Output $ocrResult.Text
+$paths = Get-Content -Raw -Encoding UTF8 $ManifestPath | ConvertFrom-Json
+$results = @()
+foreach ($p in $paths) {
+    $txt = ""
+    try {
+        if ($null -ne $engine -and (Test-Path $p)) {
+            $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($p)) ([Windows.Storage.StorageFile])
+            $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+            $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+            $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+            $ocrResult = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+            if ($null -ne $ocrResult) { $txt = $ocrResult.Text }
+        }
+    } catch {
+        $txt = ""
+    }
+    $results += $txt
 }
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Write-Output (ConvertTo-Json -InputObject $results -Compress)
 """
     try:
-        completed = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                ps_script,
-                "-ImgPath",
-                str(image_path.resolve()),
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            creationflags=_NO_WINDOW,
-        )
-        if completed.returncode == 0:
-            return _clean_text_block(completed.stdout or "")
+        with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8", delete=False) as tf:
+            manifest_path = Path(tf.name)
+            json.dump([str(p.resolve()) for p in image_paths], tf, ensure_ascii=False)
+        try:
+            completed = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    ps_script,
+                    "-ManifestPath",
+                    str(manifest_path),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_sec,
+                creationflags=_NO_WINDOW,
+            )
+            if completed.returncode == 0 and (completed.stdout or "").strip():
+                parsed = json.loads(completed.stdout.strip())
+                if isinstance(parsed, str):
+                    parsed = [parsed]
+                if isinstance(parsed, list):
+                    return [_clean_text_block(str(x or "")) for x in parsed] + [""] * max(
+                        0, len(image_paths) - len(parsed)
+                    )
+        finally:
+            manifest_path.unlink(missing_ok=True)
     except Exception:
         pass
-    return ""
+    return [""] * len(image_paths)
+
+
+def extract_image_text_windows_ocr(image_path: Path) -> str:
+    """Safe CPU OCR fallback using built-in Windows WinRT OcrEngine via PowerShell."""
+    res = extract_images_text_windows_ocr_batch([image_path], timeout_sec=15)
+    return res[0] if res else ""

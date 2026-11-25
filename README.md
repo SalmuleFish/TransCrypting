@@ -37,9 +37,13 @@ Flexible compatibility with any Ollama LLM, Whisper / CTranslate2 model, and Kok
 
 - **Multi-Source Local Context (`SQLite FTS5`)**:
   - Combine **Audio recordings** (`.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`, `.mp4`, etc.), **Documents** (`.pdf`, `.pptx` slides + speaker notes, `.docx`, `.txt`, `.md`), and **Images** (`.png`, `.jpg`, `.webp`, `.bmp`) inside the same conversation.
-  - CPU document extraction (`pypdf`, `python-pptx`, `python-docx`) consumes **0 MB of VRAM** and preserves page/slide locators (`p. 4`, `diap. 2`, `sec. 1`).
+  - CPU document extraction (`pypdf`, `python-pptx`, `python-docx`) consumes **0 MB of VRAM**, preserves page/slide locators (`p. 4`, `diap. 2`, `sec. 1`), runs automatic local **Windows CPU OCR** on embedded PDF images when text is not selectable, and rejects unreadable/empty scanned PDFs instead of polluting the index with placeholder pages or wasting LLM calls.
+  - **Filename-Aware Retrieval & Source Catalog**: the LLM always receives an explicit catalog of active sources, and queries referencing natural or translated filenames (e.g. `"chapter 11"` or `"capítulo 11"` for `Chapter_11_Persuasive_Messages_Summary.pdf`) automatically boost matching sources even in FTS5 retrieval mode.
   - Images are analyzed **once on upload** using local Ollama vision (or automatic local Windows CPU OCR fallback) and stored in the persistent `SQLite FTS5` index so follow-up chats never reload raw images into VRAM.
-  - Every item in the **Sources** panel has a checkbox to enable or exclude it from context at any time.
+  - Every item in the **Sources** panel can be toggled or deleted **instantly** (combined-summary refreshes run asynchronously in the background without blocking UI actions).
+- **Universal AI Force-Stop (`■ Detener IA`)**:
+  - Stop any active AI generation immediately from anywhere in the workspace: a global **`■ Detener IA`** pill in the top bar plus contextual **`■ Detener`** controls in **Chat** streaming (preserving partial answers), **Summary** regeneration, **Exam** generation & open-answer grading (preserving drafts), **Podcast Studio**, and processing **Source/Recording** cards.
+  - Backed by `POST /api/system/stop`, which immediately closes active Ollama streaming sockets (`httpx`), interrupts Whisper transcription between segments, cancels running background pipeline/podcast jobs without stopping the queue worker, and frees resources cleanly.
 - **100% Local Podcast Studio (Exclusive Performance Mode)**:
   - Turn selected sources into a two-host **study podcast** (`Conversación`, `Repaso de examen`, `Debate`, or `Paso a paso`, in Spanish or English) with custom topic/focus instructions.
   - Synthesizes expressive speech **100% locally** using **Kokoro-82M ONNX** neural voices (with automatic **Piper ONNX** and Windows `System.Speech` offline fallbacks) and saves replayable `.wav` episodes + full dialogue scripts.

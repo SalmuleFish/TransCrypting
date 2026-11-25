@@ -7,7 +7,10 @@ import math
 import re
 import unicodedata
 from collections import Counter
+from pathlib import Path
 from typing import Any
+
+from backend.source_service import is_meaningful_page_text
 
 _STOPWORDS_ES_EN = {
     "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "al",
@@ -246,11 +249,40 @@ def _format_source_for_llm(src: dict[str, Any]) -> str:
         for p in pages:
             loc = (p.get("locator") or "").strip()
             txt = (p.get("text") or "").strip()
-            if txt:
+            if is_meaningful_page_text(txt):
                 blocks.append(f"[{loc}]\n{txt}" if loc else txt)
         if blocks:
             return "\n\n".join(blocks)
-    return (src.get("extracted_text") or "").strip()
+    raw = (src.get("extracted_text") or "").strip()
+    return raw if is_meaningful_page_text(raw) else ""
+
+
+def _humanize_filename(filename: str) -> str:
+    stem = Path(filename or "fuente").stem
+    stem = re.sub(r"([a-z])([A-Z0-9])", r"\1 \2", stem)
+    stem = re.sub(r"([A-Za-z])([0-9])", r"\1 \2", stem)
+    stem = re.sub(r"[_\-\./]+", " ", stem)
+    return re.sub(r"\s+", " ", stem).strip()
+
+
+def _build_source_catalog(
+    ready_recs: list[dict[str, Any]],
+    ready_srcs: list[dict[str, Any]],
+) -> str:
+    lines: list[str] = []
+    for idx, rec in enumerate(ready_recs, start=1):
+        fname = rec.get("filename", f"grabacion_{idx}.m4a")
+        alias = _humanize_filename(fname)
+        dur = format_timestamp(float(rec.get("duration_sec") or 0.0))
+        lines.append(f'- Audio {idx}: "{fname}" (alias: "{alias}") · duración {dur}')
+    for idx, src in enumerate(ready_srcs, start=1):
+        fname = src.get("filename", f"fuente_{idx}")
+        alias = _humanize_filename(fname)
+        kind = str(src.get("source_type") or "doc").upper()
+        cnt = int(src.get("page_count") or 0)
+        unit = "imagen" if kind == "IMAGE" else f"{cnt or 1} pág./secc."
+        lines.append(f'- Fuente {idx} ({kind}): "{fname}" (alias: "{alias}") · {unit}')
+    return "\n".join(lines)
 
 
 def _format_indexed_chunk_header(chunk: dict[str, Any]) -> str:
@@ -561,18 +593,22 @@ def build_chat_messages(
         )
 
     total_sources = len(ready_recs) + len(ready_srcs)
+    catalog_text = _build_source_catalog(ready_recs, ready_srcs)
     system_prompt = (
         "Eres TransCrypting, un asistente local estilo cuaderno de investigación que responde preguntas sobre grabaciones, PDFs, diapositivas, apuntes e imágenes.\n"
         "Reglas estrictas:\n"
         "1. Responde siempre en español claro y directo.\n"
         "2. Si hay transcripciones de audio real (clases con ruido o mezcla español/inglés), busca equivalencias fonéticas o conceptuales antes de descartar un dato.\n"
         "3. Basa tus respuestas ÚNICAMENTE en las fuentes activas proporcionadas abajo.\n"
-        "4. Cita siempre de forma precisa usando estos formatos exactos entre corchetes:\n"
+        "4. Identificación flexible de nombres de fuente: si el usuario menciona una fuente de forma abreviada, sin guiones bajos o traducida (por ejemplo \"chapter 11\" o \"capítulo 11\" para referirse a \"Chapter_11_Persuasive_Messages_Summary.pdf\"), relaciónala automáticamente con su archivo correspondiente del catálogo antes de responder.\n"
+        "5. Cita siempre de forma precisa usando estos formatos exactos entre corchetes:\n"
         "   - Para audios: [MM:SS]\n"
         "   - Para documentos/diapositivas: [nombre_archivo.pdf · p. 4] o [presentacion.pptx · diap. 2]\n"
         "   - Para imágenes: [nombre_imagen.png]\n"
-        "5. Si tras revisar todo el contexto el dato realmente no aparece, dilo claramente sin inventar.\n\n"
-        f"FUENTES ACTIVAS DE LA CONVERSACIÓN ({total_sources} total: {len(ready_recs)} audio(s), {len(ready_srcs)} documento(s)/imagen(es)):\n"
+        "6. Si tras revisar todo el contexto el dato realmente no aparece, dilo claramente sin inventar.\n\n"
+        f"CATÁLOGO COMPLETO DE FUENTES ACTIVAS ({total_sources} total: {len(ready_recs)} audio(s), {len(ready_srcs)} documento(s)/imagen(es)):\n"
+        f"{catalog_text}\n\n"
+        f"CONTENIDO DE LAS FUENTES ACTIVAS:\n"
         f"{context_body}"
     )
 

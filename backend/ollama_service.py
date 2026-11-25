@@ -22,6 +22,10 @@ class VisionUnsupportedError(RuntimeError):
     """Raised when the selected Ollama model does not support multimodal image input."""
 
 
+class GenerationAbortedError(RuntimeError):
+    """Raised when an active Ollama generation stream is forcibly stopped by the user."""
+
+
 def _find_ollama_exe() -> str | None:
     found = shutil.which("ollama")
     if found:
@@ -41,6 +45,21 @@ class OllamaService:
         self._last_model: str | None = None
         self._models_cache: list[dict[str, Any]] | None = None
         self._models_cache_ts: float = 0.0
+        self._active_clients: set[httpx.AsyncClient] = set()
+        self._aborted_clients: set[httpx.AsyncClient] = set()
+
+    async def abort_active(self) -> int:
+        """Close any active Ollama streaming HTTP clients so token generation stops immediately."""
+        clients = list(self._active_clients)
+        closed = 0
+        for client in clients:
+            self._aborted_clients.add(client)
+            try:
+                await client.aclose()
+                closed += 1
+            except Exception:
+                pass
+        return closed
 
     async def is_running(self) -> bool:
         try:
@@ -224,27 +243,37 @@ class OllamaService:
         }
 
         timeout = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("POST", f"{self.base_url}/api/chat", json=payload) as resp:
-                if resp.status_code >= 400:
-                    err_body = (await resp.aread()).decode("utf-8", errors="ignore")
-                    if resp.status_code == 400 and "think" in payload and not has_images:
-                        payload.pop("think", None)
-                        async with client.stream(
-                            "POST", f"{self.base_url}/api/chat", json=payload
-                        ) as retry_resp:
-                            retry_resp.raise_for_status()
-                            async for evt in self._iter_chat_events(retry_resp, has_images=has_images):
-                                yield evt
-                        return
-                    if has_images:
-                        raise VisionUnsupportedError(
-                            f"El modelo '{model}' no soporta análisis visual de imágenes ({err_body or resp.status_code})."
-                        )
-                    resp.raise_for_status()
+        client = httpx.AsyncClient(timeout=timeout)
+        self._active_clients.add(client)
+        try:
+            async with client:
+                async with client.stream("POST", f"{self.base_url}/api/chat", json=payload) as resp:
+                    if resp.status_code >= 400:
+                        err_body = (await resp.aread()).decode("utf-8", errors="ignore")
+                        if resp.status_code == 400 and "think" in payload and not has_images:
+                            payload.pop("think", None)
+                            async with client.stream(
+                                "POST", f"{self.base_url}/api/chat", json=payload
+                            ) as retry_resp:
+                                retry_resp.raise_for_status()
+                                async for evt in self._iter_chat_events(retry_resp, has_images=has_images):
+                                    yield evt
+                            return
+                        if has_images:
+                            raise VisionUnsupportedError(
+                                f"El modelo '{model}' no soporta análisis visual de imágenes ({err_body or resp.status_code})."
+                            )
+                        resp.raise_for_status()
 
-                async for evt in self._iter_chat_events(resp, has_images=has_images):
-                    yield evt
+                    async for evt in self._iter_chat_events(resp, has_images=has_images):
+                        yield evt
+        except Exception as exc:
+            if client in self._aborted_clients:
+                raise GenerationAbortedError("Generación detenida por el usuario.") from exc
+            raise
+        finally:
+            self._active_clients.discard(client)
+            self._aborted_clients.discard(client)
 
     async def stream_chat(
         self,

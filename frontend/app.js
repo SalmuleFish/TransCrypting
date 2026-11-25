@@ -17,6 +17,11 @@ const state = {
   activeTab: "summary",
   isStreaming: false,
   isResummarizing: false,
+  chatAbortController: null,
+  resummarizeAbortController: null,
+  quizAbortController: null,
+  quizGradeAbortController: null,
+  stoppingAI: false,
   lastContextMode: "full",
   theme: "light",
   confirmCallback: null,
@@ -275,6 +280,8 @@ const ICON_RETRANSCRIBE = `<svg viewBox="0 0 24 24" width="12" height="12" fill=
 const ICON_CHEVRON = `<svg class="bento-select-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`;
 const ICON_CHECK = `<svg class="bento-select-check" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
 const ICON_SPARKLE = `<svg class="chip-sparkle" viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M12 2.5L14.4 9.6L21.5 12L14.4 14.4L12 21.5L9.6 14.4L2.5 12L9.6 9.6Z"/></svg>`;
+const ICON_SEND_ARROW = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>`;
+const ICON_STOP_SQUARE = `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2.5"/></svg>`;
 
 // --- Theme (Light / Soft Graphite Dark) ---
 
@@ -469,6 +476,139 @@ function closeRenameModal() {
   closeModal("rename-modal");
 }
 
+function isAbortError(err) {
+  if (!err) return false;
+  if (err.name === "AbortError") return true;
+  const msg = String(err.message || "");
+  return /abort|detenid|cancel/i.test(msg);
+}
+
+function isAnyAIWorkActive() {
+  if (state.isStreaming || state.isResummarizing || state.podcastBusy) return true;
+  const phase = state.systemStatus?.resources?.phase;
+  if (phase && ["llm", "whisper", "podcast"].includes(phase)) return true;
+
+  if (state.activeSessionId) {
+    const qs = sessionQuizzes.get(state.activeSessionId);
+    if (qs) {
+      if (qs.loading || qs.submittingExam) return true;
+      if (Object.values(qs.answers || {}).some((a) => a && a.grading)) return true;
+    }
+  }
+
+  const sess = state.activeSession;
+  if (sess) {
+    const workingRec = (sess.recordings || []).some((r) =>
+      ["queued", "preparing", "transcribing", "summarizing"].includes(r.status)
+    );
+    const workingSrc = (sess.sources || []).some((s) =>
+      ["queued", "extracting", "indexing", "summarizing"].includes(s.status)
+    );
+    if (workingRec || workingSrc) return true;
+  }
+  return false;
+}
+
+function syncGlobalStopButton() {
+  const btn = document.getElementById("btn-stop-ai");
+  if (!btn) return;
+  const active = isAnyAIWorkActive();
+  btn.classList.toggle("hidden", !active);
+  btn.disabled = Boolean(state.stoppingAI);
+}
+
+async function stopBackendAIGeneration() {
+  try {
+    await fetch("/api/system/stop", { method: "POST" });
+  } catch (_) {}
+}
+
+async function forceStopAllAI(options = {}) {
+  if (state.stoppingAI) return;
+  state.stoppingAI = true;
+  syncGlobalStopButton();
+
+  try {
+    if (state.chatAbortController) {
+      state.chatAbortController.abort();
+    }
+    if (state.resummarizeAbortController) {
+      state.resummarizeAbortController.abort();
+    }
+    if (state.quizAbortController) {
+      state.quizAbortController.abort();
+    }
+    if (state.quizGradeAbortController) {
+      state.quizGradeAbortController.abort();
+    }
+
+    await stopBackendAIGeneration();
+    await refreshSystemStatus();
+    if (state.activeSessionId) {
+      invalidateMemo("sources-structure");
+      invalidateMemo("summary-pane");
+      invalidateMemo("podcast-pane");
+      try {
+        const fresh = await api(`/api/sessions/${state.activeSessionId}`);
+        state.activeSession = fresh;
+        renderActiveSession(fresh);
+      } catch (_) {}
+    }
+    if (!options.silentToast) {
+      showToast("Generación de IA detenida.");
+    }
+  } finally {
+    state.stoppingAI = false;
+    syncGlobalStopButton();
+  }
+}
+
+async function stopActiveChatGeneration() {
+  if (state.chatAbortController) {
+    state.chatAbortController.abort();
+  }
+  await stopBackendAIGeneration();
+}
+
+async function stopResummarizeGeneration() {
+  if (state.resummarizeAbortController) {
+    state.resummarizeAbortController.abort();
+  }
+  await stopBackendAIGeneration();
+}
+
+async function stopQuizGeneration() {
+  if (state.quizAbortController) {
+    state.quizAbortController.abort();
+  }
+  await stopBackendAIGeneration();
+}
+
+async function stopQuizGrading() {
+  if (state.quizGradeAbortController) {
+    state.quizGradeAbortController.abort();
+  }
+  await stopBackendAIGeneration();
+}
+
+function setChatSendButtonMode(streaming) {
+  const btn = document.getElementById("btn-send-chat");
+  if (!btn) return;
+  if (streaming) {
+    btn.type = "button";
+    btn.disabled = false;
+    btn.classList.add("is-stop-btn");
+    btn.innerHTML = ICON_STOP_SQUARE;
+    btn.title = "Detener respuesta (forzar paro)";
+  } else {
+    btn.type = "submit";
+    btn.classList.remove("is-stop-btn");
+    btn.innerHTML = ICON_SEND_ARROW;
+    btn.title = "Enviar pregunta (Enter)";
+    btn.disabled = Boolean(state.podcastBusy);
+  }
+}
+
 // --- Telemetry, Context Health & Hero Status ---
 
 async function refreshSystemStatus(options = {}) {
@@ -549,6 +689,7 @@ function renderTelemetry(data) {
   }
 
   syncPodcastBusyUI(Boolean(res.podcast_active || res.phase === "podcast"));
+  syncGlobalStopButton();
 }
 
 function formatElapsedClock(ms) {
@@ -997,6 +1138,7 @@ function renderActiveSession(session) {
   renderWorkspaceSubtitle(session);
   renderChatMessages(session.messages || []);
   updateChatControls(session);
+  syncGlobalStopButton();
   requestAnimationFrame(updateTabIndicator);
 }
 
@@ -1341,6 +1483,19 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     const rightBtns = document.createElement("div");
     rightBtns.className = "rec-controls-right";
 
+    if (isWorking) {
+      const stopBtn = document.createElement("button");
+      stopBtn.type = "button";
+      stopBtn.className = "rec-stop-btn";
+      stopBtn.title = "Detener procesamiento de IA";
+      stopBtn.innerHTML = `<span class="stop-sq" aria-hidden="true"></span>`;
+      stopBtn.onclick = (e) => {
+        e.stopPropagation();
+        forceStopAllAI();
+      };
+      rightBtns.appendChild(stopBtn);
+    }
+
     const speedBtn = document.createElement("button");
     speedBtn.type = "button";
     speedBtn.className = "speed-btn";
@@ -1389,14 +1544,28 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
         "Eliminar grabación",
         `¿Quitar "${rec.filename}" de esta conversación?`,
         async () => {
-          audio.pause();
-          audioPlayers.delete(rec.id);
-          await api(`/api/sessions/${rec.session_id}/recordings/${rec.id}`, {
-            method: "DELETE",
-          });
-          await selectSession(rec.session_id);
-          await loadSessions(false);
-          showToast("Grabación eliminada.");
+          card.style.opacity = "0.35";
+          card.style.pointerEvents = "none";
+          try {
+            audio.pause();
+            audioPlayers.delete(rec.id);
+            await api(`/api/sessions/${rec.session_id}/recordings/${rec.id}`, {
+              method: "DELETE",
+            });
+            podcastFormState.get(rec.session_id)?.selectedRecIds.delete(rec.id);
+            sessionQuizzes.get(rec.session_id)?.selectedRecIds.delete(rec.id);
+            invalidateMemo("sources-structure");
+            invalidateMemo("summary-pane");
+            invalidateMemo("quiz-pane");
+            invalidateMemo("podcast-pane");
+            await selectSession(rec.session_id);
+            await loadSessions(false);
+            showToast("Grabación eliminada.");
+          } catch (err) {
+            card.style.opacity = "";
+            card.style.pointerEvents = "";
+            throw err;
+          }
         }
       );
     };
@@ -1540,6 +1709,19 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     const rightBtns = document.createElement("div");
     rightBtns.className = "rec-controls-right";
 
+    if (isWorking) {
+      const stopBtn = document.createElement("button");
+      stopBtn.type = "button";
+      stopBtn.className = "rec-stop-btn";
+      stopBtn.title = "Detener procesamiento de IA";
+      stopBtn.innerHTML = `<span class="stop-sq" aria-hidden="true"></span>`;
+      stopBtn.onclick = (e) => {
+        e.stopPropagation();
+        forceStopAllAI();
+      };
+      rightBtns.appendChild(stopBtn);
+    }
+
     if (!isWorking) {
       const reprocessBtn = document.createElement("button");
       reprocessBtn.type = "button";
@@ -1574,12 +1756,26 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
         "Eliminar fuente",
         `¿Quitar "${src.filename}" de esta conversación y de su índice local?`,
         async () => {
-          await api(`/api/sessions/${src.session_id}/sources/${src.id}`, {
-            method: "DELETE",
-          });
-          await selectSession(src.session_id);
-          await loadSessions(false);
-          showToast("Fuente eliminada.");
+          card.style.opacity = "0.35";
+          card.style.pointerEvents = "none";
+          try {
+            await api(`/api/sessions/${src.session_id}/sources/${src.id}`, {
+              method: "DELETE",
+            });
+            podcastFormState.get(src.session_id)?.selectedSrcIds.delete(src.id);
+            sessionQuizzes.get(src.session_id)?.selectedSrcIds.delete(src.id);
+            invalidateMemo("sources-structure");
+            invalidateMemo("summary-pane");
+            invalidateMemo("quiz-pane");
+            invalidateMemo("podcast-pane");
+            await selectSession(src.session_id);
+            await loadSessions(false);
+            showToast("Fuente eliminada.");
+          } catch (err) {
+            card.style.opacity = "";
+            card.style.pointerEvents = "";
+            throw err;
+          }
         }
       );
     };
@@ -1691,12 +1887,16 @@ function resolveRecordingForTimestamp(triggerEl, seconds) {
 
 // --- Summary Skeleton & Content Panes ---
 
-function buildSkeletonHtml(statusLabel) {
+function buildSkeletonHtml(statusLabel, showStopBtn = true, stopScope = "") {
+  const stopBtnHtml = showStopBtn
+    ? `<button type="button" class="skeleton-stop-btn"${stopScope ? ` data-stop-scope="${escapeHtml(stopScope)}"` : ""} title="Detener generación de IA"><span class="stop-sq" aria-hidden="true"></span> Detener</button>`
+    : "";
   return `
     <div class="summary-skeleton-card">
       <div class="skeleton-banner">
         <div class="think-dots" aria-hidden="true"><span></span><span></span><span></span></div>
         <span class="think-label">${escapeHtml(statusLabel)}</span>
+        ${stopBtnHtml}
       </div>
       <div class="skel-group">
         <div class="skel-line title"></div>
@@ -1786,7 +1986,7 @@ function renderSummaryTab(session, animateReveal = false) {
     : `<div class="chat-placeholder">
         <h3>Fuentes indexadas y listas</h3>
         <p>El chat y la búsqueda FTS5 ya están disponibles. Puedes generar el resumen general bajo demanda cuando lo necesites.</p>
-        <button type="button" id="btn-eco-generate-summary" class="pill-btn dark sm">Generar resumen ahora</button>
+        <button type="button" class="pill-btn dark sm eco-generate-summary-btn">Generar resumen ahora</button>
       </div>`;
 
   pane.innerHTML = `
@@ -1800,7 +2000,7 @@ function renderSummaryTab(session, animateReveal = false) {
     </div>
   `;
 
-  const ecoBtn = document.getElementById("btn-eco-generate-summary");
+  const ecoBtn = pane.querySelector(".eco-generate-summary-btn");
   if (ecoBtn) {
     ecoBtn.onclick = () => document.getElementById("btn-resummarize")?.click();
   }
@@ -2043,6 +2243,8 @@ async function generateQuizForSession(session) {
   }
 
   stopQuizTimer(qs);
+  const controller = new AbortController();
+  state.quizAbortController = controller;
   qs.loading = true;
   qs.questions = null;
   qs.answers = {};
@@ -2052,12 +2254,14 @@ async function generateQuizForSession(session) {
   qs.submittingExam = false;
   qs.elapsedSec = 0;
   qs.startedAt = null;
+  syncGlobalStopButton();
   renderQuizTab(session);
 
   try {
     const res = await api(`/api/sessions/${session.id}/quiz/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
       body: JSON.stringify({
         num_questions: qs.count,
         mode: qs.mode,
@@ -2078,9 +2282,17 @@ async function generateQuizForSession(session) {
       startQuizTimer(session, qs);
     }
   } catch (err) {
-    showToast(err.message, true);
+    if (controller.signal.aborted || isAbortError(err)) {
+      showToast("Generación de examen detenida.");
+    } else {
+      showToast(err.message, true);
+    }
   } finally {
+    if (state.quizAbortController === controller) {
+      state.quizAbortController = null;
+    }
     qs.loading = false;
+    syncGlobalStopButton();
     if (state.activeSession && state.activeSession.id === session.id) {
       renderQuizTab(state.activeSession);
     }
@@ -2264,6 +2476,7 @@ function buildQuizQuestionCard(session, q, idx, total, animate = true) {
         <div class="thinking-indicator">
           <div class="think-dots" aria-hidden="true"><span></span><span></span><span></span></div>
           <span class="think-label">Evaluando tu respuesta contra las fuentes...</span>
+          <button type="button" class="inline-stop-btn" data-stop-scope="quiz-grade" title="Detener evaluación"><span class="stop-sq" aria-hidden="true"></span> Detener</button>
         </div>
       `;
       openWrap.appendChild(loadingBox);
@@ -2459,14 +2672,18 @@ async function submitOpenAnswer(session, q, userAnswerText) {
     return;
   }
   const qs = getQuizState(session.id);
+  const controller = new AbortController();
+  state.quizGradeAbortController = controller;
   qs.drafts[q.id] = clean;
   qs.answers[q.id] = { type: "open", userAnswer: clean, grading: true, result: null };
+  syncGlobalStopButton();
   updateSingleQuizCard(session, q);
 
   try {
     const result = await api(`/api/sessions/${session.id}/quiz/grade`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
       body: JSON.stringify({
         question: q.question,
         expected_answer: q.expected_answer || "",
@@ -2477,8 +2694,16 @@ async function submitOpenAnswer(session, q, userAnswerText) {
     qs.answers[q.id] = { type: "open", userAnswer: clean, grading: false, result };
   } catch (err) {
     delete qs.answers[q.id];
-    showToast(err.message, true);
+    if (controller.signal.aborted || isAbortError(err)) {
+      showToast("Evaluación detenida.");
+    } else {
+      showToast(err.message, true);
+    }
   } finally {
+    if (state.quizGradeAbortController === controller) {
+      state.quizGradeAbortController = null;
+    }
+    syncGlobalStopButton();
     updateSingleQuizCard(session, q);
   }
 }
@@ -2487,22 +2712,40 @@ async function submitFullExam(session) {
   const qs = getQuizState(session.id);
   if (!qs.questions || qs.submittingExam || qs.examSubmitted) return;
 
+  const controller = new AbortController();
+  state.quizGradeAbortController = controller;
   qs.submittingExam = true;
   stopQuizTimer(qs);
-  const submitBtn = document.querySelector("#tab-quiz .quiz-submit-exam-btn");
+  syncGlobalStopButton();
+
+  const submitBar = document.querySelector("#tab-quiz .quiz-submit-exam-bar");
+  const submitBtn = submitBar?.querySelector(".quiz-submit-exam-btn");
+  let tempStopBtn = null;
   if (submitBtn) {
     submitBtn.disabled = true;
     submitBtn.textContent = "Calificando examen...";
   }
+  if (submitBar) {
+    tempStopBtn = document.createElement("button");
+    tempStopBtn.type = "button";
+    tempStopBtn.className = "inline-stop-btn";
+    tempStopBtn.dataset.stopScope = "quiz-grade";
+    tempStopBtn.innerHTML = `<span class="stop-sq" aria-hidden="true"></span> Detener`;
+    submitBar.appendChild(tempStopBtn);
+  }
 
   try {
     for (const q of qs.questions) {
+      if (controller.signal.aborted) {
+        throw new DOMException("Aborted", "AbortError");
+      }
       if (q.type === "open") {
         const draft = (qs.drafts[q.id] || "").trim();
         if (draft && !qs.answers[q.id]?.result) {
           const result = await api(`/api/sessions/${session.id}/quiz/grade`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
+            signal: controller.signal,
             body: JSON.stringify({
               question: q.question,
               expected_answer: q.expected_answer || "",
@@ -2518,13 +2761,22 @@ async function submitFullExam(session) {
     invalidateMemo("quiz-pane");
     renderQuizTab(session);
   } catch (err) {
-    showToast(err.message, true);
+    if (controller.signal.aborted || isAbortError(err)) {
+      showToast("Calificación detenida. Tus respuestas siguen guardadas.");
+    } else {
+      showToast(err.message, true);
+    }
     if (submitBtn) {
       submitBtn.disabled = false;
       submitBtn.textContent = "Entregar y calificar examen";
     }
   } finally {
+    if (tempStopBtn) tempStopBtn.remove();
+    if (state.quizGradeAbortController === controller) {
+      state.quizGradeAbortController = null;
+    }
     qs.submittingExam = false;
+    syncGlobalStopButton();
   }
 }
 
@@ -2568,7 +2820,11 @@ function renderQuizTab(session) {
   if (qs.loading) {
     if (resetBtn) resetBtn.classList.add("hidden");
     const modelName = getActiveModelLabel();
-    pane.innerHTML = buildSkeletonHtml(`${modelName} está diseñando tu examen personalizado...`);
+    pane.innerHTML = buildSkeletonHtml(
+      `${modelName} está diseñando tu examen personalizado...`,
+      true,
+      "quiz-gen"
+    );
     return;
   }
 
@@ -3533,6 +3789,7 @@ function appendChatBubble(role, content, isThinkingPlaceholder = false) {
         <div class="thinking-indicator">
           <div class="think-dots" aria-hidden="true"><span></span><span></span><span></span></div>
           <span class="think-label">${escapeHtml(getActiveModelLabel())} está pensando...</span>
+          <button type="button" class="inline-stop-btn" data-stop-scope="chat" title="Detener respuesta"><span class="stop-sq" aria-hidden="true"></span> Detener</button>
         </div>
       `;
     } else {
@@ -3619,8 +3876,11 @@ async function sendChatQuestion(questionText) {
     switchTab("chat");
   }
 
+  const controller = new AbortController();
+  state.chatAbortController = controller;
   state.isStreaming = true;
-  document.getElementById("btn-send-chat").disabled = true;
+  setChatSendButtonMode(true);
+  syncGlobalStopButton();
   const inputEl = document.getElementById("chat-input");
   inputEl.value = "";
   inputEl.style.height = "auto";
@@ -3635,11 +3895,13 @@ async function sendChatQuestion(questionText) {
   let thinkingBoxEl = null;
   let thinkingContentEl = null;
   let answerContainerEl = null;
+  let wasStopped = false;
 
   try {
     const resp = await fetch(`/api/sessions/${state.activeSessionId}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
       body: JSON.stringify({ question }),
     });
 
@@ -3711,15 +3973,37 @@ async function sendChatQuestion(questionText) {
             if (answerContainerEl) {
               answerContainerEl.innerHTML = renderMarkdown(accumulated, true);
             }
+          } else if (payload.type === "stopped") {
+            wasStopped = true;
+            break;
           } else if (payload.type === "error") {
             throw new Error(payload.detail || "Error en la respuesta del modelo.");
           }
         }
+        if (wasStopped) break;
       }
+      if (wasStopped) break;
     }
 
     ecoProgress?.stop();
-    if (answerContainerEl) {
+    if (wasStopped || controller.signal.aborted) {
+      const indicator = assistantBubble.querySelector(".thinking-indicator");
+      if (indicator) indicator.remove();
+      if (thinkingBoxEl) thinkingBoxEl.open = false;
+      if (accumulated.trim()) {
+        if (!answerContainerEl) {
+          answerContainerEl = document.createElement("div");
+          answerContainerEl.className = "md";
+          assistantBubble.appendChild(answerContainerEl);
+        }
+        answerContainerEl.innerHTML =
+          renderMarkdown(accumulated, true) +
+          `<div class="stopped-note">Generación detenida por el usuario.</div>`;
+      } else {
+        assistantBubble.innerHTML = `<div class="stopped-note">Respuesta detenida por el usuario.</div>`;
+      }
+      showToast("Respuesta detenida.");
+    } else if (answerContainerEl) {
       answerContainerEl.innerHTML = renderMarkdown(accumulated, true);
     }
 
@@ -3731,12 +4015,42 @@ async function sendChatQuestion(questionText) {
     await loadSessions(false);
   } catch (err) {
     ecoProgress?.stop();
-    assistantBubble.innerHTML = `<span style="color:#fca5a5;">${escapeHtml(err.message)}</span>`;
-    showToast(err.message, true);
+    if (controller.signal.aborted || isAbortError(err)) {
+      const indicator = assistantBubble.querySelector(".thinking-indicator");
+      if (indicator) indicator.remove();
+      if (thinkingBoxEl) thinkingBoxEl.open = false;
+      if (accumulated.trim()) {
+        if (!answerContainerEl) {
+          answerContainerEl = document.createElement("div");
+          answerContainerEl.className = "md";
+          assistantBubble.appendChild(answerContainerEl);
+        }
+        answerContainerEl.innerHTML =
+          renderMarkdown(accumulated, true) +
+          `<div class="stopped-note">Generación detenida por el usuario.</div>`;
+      } else {
+        assistantBubble.innerHTML = `<div class="stopped-note">Respuesta detenida por el usuario.</div>`;
+      }
+      showToast("Respuesta detenida.");
+      if (state.activeSessionId) {
+        api(`/api/sessions/${state.activeSessionId}`).then((fresh) => {
+          state.activeSession = fresh;
+          renderContextMetrics(fresh.context_metrics);
+          updateChatControls(fresh);
+        }).catch(() => {});
+      }
+    } else {
+      assistantBubble.innerHTML = `<span style="color:#fca5a5;">${escapeHtml(err.message)}</span>`;
+      showToast(err.message, true);
+    }
   } finally {
     ecoProgress?.stop();
+    if (state.chatAbortController === controller) {
+      state.chatAbortController = null;
+    }
     state.isStreaming = false;
-    document.getElementById("btn-send-chat").disabled = false;
+    setChatSendButtonMode(false);
+    syncGlobalStopButton();
   }
 }
 
@@ -4060,6 +4374,29 @@ function initEvents() {
   window.addEventListener("resize", updateTabIndicator);
 
   document.getElementById("center-scroll").addEventListener("click", (e) => {
+    const stopBtn = e.target.closest(".skeleton-stop-btn, .inline-stop-btn");
+    if (stopBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const scope = stopBtn.dataset.stopScope || "";
+      if (scope === "chat") {
+        stopActiveChatGeneration();
+      } else if (scope === "resummarize") {
+        stopResummarizeGeneration();
+      } else if (scope === "quiz-gen") {
+        stopQuizGeneration();
+      } else if (scope === "quiz-grade") {
+        stopQuizGrading();
+      } else if (state.isResummarizing) {
+        stopResummarizeGeneration();
+      } else if (state.activeSessionId && sessionQuizzes.get(state.activeSessionId)?.loading) {
+        stopQuizGeneration();
+      } else {
+        forceStopAllAI();
+      }
+      return;
+    }
+
     const pill = e.target.closest(".chat-ts-pill");
     if (pill) {
       const seconds = Number(pill.dataset.seconds || 0);
@@ -4107,12 +4444,22 @@ function initEvents() {
   };
 
   document.getElementById("btn-resummarize").onclick = async () => {
-    if (!state.activeSessionId || state.isResummarizing) return;
+    if (state.isResummarizing) {
+      stopResummarizeGeneration();
+      return;
+    }
+    if (!state.activeSessionId) return;
     const btn = document.getElementById("btn-resummarize");
     const prevHtml = btn.innerHTML;
+    const prevTitle = btn.title;
+    const controller = new AbortController();
+    state.resummarizeAbortController = controller;
     state.isResummarizing = true;
-    btn.disabled = true;
-    btn.innerHTML = `<span class="btn-spinner"></span><span>Regenerando...</span>`;
+    btn.disabled = false;
+    btn.classList.add("is-stop-btn");
+    btn.title = "Detener regeneración del resumen";
+    btn.innerHTML = `<span class="stop-sq" aria-hidden="true"></span><span>Detener</span>`;
+    syncGlobalStopButton();
 
     if (state.activeTab !== "summary") {
       switchTab("summary");
@@ -4120,7 +4467,9 @@ function initEvents() {
     const modelName = getActiveModelLabel();
     const summaryPane = document.getElementById("tab-summary");
     summaryPane.innerHTML = buildSkeletonHtml(
-      `${modelName} está recreando el resumen...`
+      `${modelName} está recreando el resumen...`,
+      true,
+      "resummarize"
     );
     const ecoProgress = createEcoProgressController(summaryPane, "Generando resumen");
 
@@ -4128,6 +4477,7 @@ function initEvents() {
       const fresh = await api(`/api/sessions/${state.activeSessionId}/resummarize`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({}),
       });
       ecoProgress?.stop();
@@ -4136,13 +4486,26 @@ function initEvents() {
       showToast("Resumen actualizado.");
     } catch (err) {
       ecoProgress?.stop();
-      if (state.activeSession) renderSummaryTab(state.activeSession);
-      showToast(err.message, true);
+      if (state.activeSession) {
+        invalidateMemo("summary-pane");
+        renderSummaryTab(state.activeSession);
+      }
+      if (controller.signal.aborted || isAbortError(err)) {
+        showToast("Resumen detenido.");
+      } else {
+        showToast(err.message, true);
+      }
     } finally {
       ecoProgress?.stop();
+      if (state.resummarizeAbortController === controller) {
+        state.resummarizeAbortController = null;
+      }
       state.isResummarizing = false;
-      btn.disabled = false;
+      btn.classList.remove("is-stop-btn");
+      btn.disabled = Boolean(state.podcastBusy);
       btn.innerHTML = prevHtml;
+      btn.title = prevTitle;
+      syncGlobalStopButton();
     }
   };
 
@@ -4172,9 +4535,20 @@ function initEvents() {
     }
   });
 
+  document.getElementById("btn-stop-ai").onclick = () => forceStopAllAI();
+
+  document.getElementById("btn-send-chat").onclick = (e) => {
+    if (state.isStreaming) {
+      e.preventDefault();
+      stopActiveChatGeneration();
+    }
+  };
+
   document.getElementById("chat-form").onsubmit = (e) => {
     e.preventDefault();
-    sendChatQuestion(chatInput.value);
+    if (!state.isStreaming) {
+      sendChatQuestion(chatInput.value);
+    }
   };
 
   document.getElementById("btn-clear-chat").onclick = handleClearChatHistory;

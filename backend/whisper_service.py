@@ -7,6 +7,7 @@ import os
 import site
 import subprocess
 import sysconfig
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,6 +16,10 @@ from backend.config import HTML5_PLAYABLE_EXTENSIONS, MODELS_DIR
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _DLL_HANDLES: list[Any] = []
 _CUDA_DIRS_REGISTERED = False
+
+
+class WhisperCancelledError(RuntimeError):
+    """Raised when an active Whisper transcription is stopped by the user."""
 
 
 def register_cuda_dlls() -> list[str]:
@@ -268,10 +273,15 @@ class WhisperService:
         language: str = "auto",
         progress_callback: Callable[[float, str], None] | None = None,
         classroom_enhance: bool = True,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Transcribe an audio file synchronously and emit progress callbacks."""
-        if self._model is None:
+        model = self._model
+        if model is None:
             raise RuntimeError("WhisperModel no está cargado.")
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise WhisperCancelledError("Transcripción detenida por el usuario.")
 
         lang_arg = None if not language or language == "auto" else language
         enhanced_tmp: Path | None = None
@@ -282,6 +292,9 @@ class WhisperService:
                 target_audio = enhanced_tmp
 
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise WhisperCancelledError("Transcripción detenida por el usuario.")
+
             transcribe_kwargs: dict[str, Any] = {
                 "language": lang_arg,
                 "beam_size": 5,
@@ -297,7 +310,7 @@ class WhisperService:
                     "speech_pad_ms": 400,
                 },
             }
-            segments_iter, info = self._model.transcribe(str(target_audio), **transcribe_kwargs)
+            segments_iter, info = model.transcribe(str(target_audio), **transcribe_kwargs)
 
             total_duration = float(getattr(info, "duration", 0.0) or 0.0)
             detected_lang = getattr(info, "language", "") or (lang_arg or "")
@@ -307,6 +320,8 @@ class WhisperService:
             last_norm = ""
 
             for seg in segments_iter:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise WhisperCancelledError("Transcripción detenida por el usuario.")
                 clean = (seg.text or "").strip()
                 if clean:
                     norm = clean.lower()

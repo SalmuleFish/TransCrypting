@@ -36,10 +36,76 @@ _FTS_STOPWORDS = {
 }
 
 
+_MATCH_SYNONYMS = {
+    "capitulo": "chapter",
+    "capitulos": "chapter",
+    "cap": "chapter",
+    "chap": "chapter",
+    "ch": "chapter",
+    "chapters": "chapter",
+    "tema": "unit",
+    "unidad": "unit",
+    "modulo": "unit",
+    "clase": "lecture",
+    "sesion": "lecture",
+    "grabacion": "lecture",
+    "diapositiva": "slides",
+    "diapositivas": "slides",
+    "presentacion": "slides",
+    "ppt": "slides",
+    "resumen": "summary",
+    "guia": "guide",
+    "apuntes": "notes",
+    "notas": "notes",
+}
+
+_LEGACY_EMPTY_PLACEHOLDERS = {
+    "[Página sin texto seleccionable o escaneada]",
+    "[Diapositiva sin texto]",
+    "[Documento sin texto]",
+    "[Archivo vacío]",
+}
+
+
+def _strip_accents_lower(text: str) -> str:
+    decomposed = unicodedata.normalize("NFD", (text or ""))
+    return "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn").lower()
+
+
+def _humanize_name_for_match(filename: str) -> str:
+    stem = Path(filename or "").stem
+    stem = re.sub(r"([a-z])([A-Z0-9])", r"\1 \2", stem)
+    stem = re.sub(r"([A-Za-z])([0-9])", r"\1 \2", stem)
+    stem = re.sub(r"([0-9])([A-Za-z])", r"\1 \2", stem)
+    stem = re.sub(r"[_\-\./]+", " ", stem)
+    return re.sub(r"\s+", " ", _strip_accents_lower(stem)).strip()
+
+
+def _normalize_match_tokens(text: str) -> tuple[str, list[str], set[str]]:
+    spaced = _humanize_name_for_match(text) if "." in (text or "") else re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[_\-\./]+", " ", _strip_accents_lower(re.sub(r"([a-z])([A-Z0-9])", r"\1 \2", text or ""))),
+    ).strip()
+    raw_tokens = re.findall(r"[a-z0-9]+", spaced)
+    norm_tokens: list[str] = []
+    num_tokens: set[str] = set()
+    for tok in raw_tokens:
+        if tok.isdigit():
+            num_tokens.add(tok)
+            norm_tokens.append(tok)
+            continue
+        mapped = _MATCH_SYNONYMS.get(tok, tok)
+        if len(mapped) >= 2 and mapped not in _FTS_STOPWORDS:
+            norm_tokens.append(mapped)
+    canon_phrase = " ".join(norm_tokens)
+    return canon_phrase, norm_tokens, num_tokens
+
+
 def _normalize_fts_tokens(text: str) -> list[str]:
     decomposed = unicodedata.normalize("NFD", (text or "").lower())
     ascii_text = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
-    tokens = re.findall(r"[a-z0-9]{2,}", ascii_text)
+    tokens = re.findall(r"[a-z0-9]+", ascii_text)
     filtered = [t for t in tokens if t not in _FTS_STOPWORDS]
     chosen = filtered or tokens
     seen: list[str] = []
@@ -290,7 +356,55 @@ class Database:
                 WHERE status IN ('queued', 'scripting', 'synthesizing', 'mixing')
                 """
             )
+            self._cleanup_placeholder_sources(conn)
             conn.commit()
+
+    def _cleanup_placeholder_sources(self, conn: sqlite3.Connection) -> None:
+        """Remove legacy empty-page FTS chunks and demote unreadable placeholder sources."""
+        placeholders = tuple(_LEGACY_EMPTY_PLACEHOLDERS)
+        conn.execute(
+            f"DELETE FROM source_chunks WHERE TRIM(content) IN ({','.join('?' for _ in placeholders)})",
+            placeholders,
+        )
+        rows = conn.execute(
+            "SELECT id, extracted_text, page_count FROM sources WHERE status = 'ready'"
+        ).fetchall()
+        for row in rows:
+            txt = (row["extracted_text"] or "").strip()
+            meaningful = False
+            if txt:
+                kept = []
+                for line in txt.splitlines():
+                    s = line.strip()
+                    if not s or s in _LEGACY_EMPTY_PLACEHOLDERS:
+                        continue
+                    if re.fullmatch(r"\[(?:p\.|diap\.|sec\.)\s*\d+\]", s, flags=re.IGNORECASE):
+                        continue
+                    kept.append(s)
+                if len(re.findall(r"[A-Za-z0-9ÁÉÍÓÚÜáéíóúüñÑ]", " ".join(kept))) >= 6:
+                    meaningful = True
+            if not meaningful:
+                sid = row["id"]
+                pages = int(row["page_count"] or 0)
+                conn.execute(
+                    "DELETE FROM source_chunks WHERE item_kind = 'source' AND item_id = ?",
+                    (sid,),
+                )
+                conn.execute(
+                    """
+                    UPDATE sources
+                    SET extracted_text = '',
+                        summary_text = '',
+                        status = 'error',
+                        stage = 'Sin texto legible',
+                        error_message = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        f"Fuente descartada por no contener texto seleccionable ni OCR ({pages} pág./secc.). Si es un escaneo o imagen, súbela como .png/.jpg con un modelo con visión.",
+                        sid,
+                    ),
+                )
 
     def _row_to_recording(self, row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
@@ -918,14 +1032,86 @@ class Database:
                     chunks=chunks,
                 )
 
+    def match_session_items_by_query(
+        self,
+        session_id: str,
+        query: str,
+        enabled_only: bool = True,
+    ) -> list[tuple[str, str, str]]:
+        """Identify recordings or sources explicitly referenced by filename, abbreviation, or unit number."""
+        q_phrase, q_tokens, q_nums = _normalize_match_tokens(query)
+        q_set = set(q_tokens)
+        if not q_set:
+            return []
+
+        rec_filter = "AND COALESCE(enabled, 1) = 1" if enabled_only else ""
+        src_filter = "AND COALESCE(enabled, 1) = 1" if enabled_only else ""
+
+        with self._lock:
+            conn = self._get_conn()
+            recs = conn.execute(
+                f"SELECT id, filename FROM recordings WHERE session_id = ? AND status = 'ready' {rec_filter}",
+                (session_id,),
+            ).fetchall()
+            srcs = conn.execute(
+                f"SELECT id, filename FROM sources WHERE session_id = ? AND status = 'ready' {src_filter}",
+                (session_id,),
+            ).fetchall()
+
+        candidates: list[tuple[float, str, str, str]] = []
+        for kind, rows in (("recording", recs), ("source", srcs)):
+            for r in rows:
+                fname = r["filename"] or ""
+                f_phrase, f_tokens, f_nums = _normalize_match_tokens(fname)
+                f_set = set(f_tokens)
+                if not f_set:
+                    continue
+
+                score = 0.0
+                if len(f_phrase) >= 5 and f_phrase in q_phrase:
+                    score += 12.0
+                elif len(q_phrase) >= 4 and q_phrase in f_phrase:
+                    score += 10.0
+
+                word_overlap = (q_set - q_nums) & (f_set - f_nums)
+                num_overlap = q_nums & f_nums
+
+                if word_overlap and num_overlap:
+                    score += 10.0 + len(word_overlap) * 2.0 + len(num_overlap) * 3.0
+                elif num_overlap:
+                    score += len(num_overlap) * 4.5 + len(word_overlap) * 2.0
+                elif len(word_overlap) >= 2:
+                    score += len(word_overlap) * 3.2
+                elif len(word_overlap) == 1:
+                    only = next(iter(word_overlap))
+                    if len(only) >= 5 and not (q_nums and f_nums and not num_overlap):
+                        score += 4.2
+
+                if q_nums and f_nums and not num_overlap:
+                    score -= 6.0
+
+                if score >= 4.0:
+                    candidates.append((score, kind, r["id"], fname))
+
+        if not candidates:
+            return []
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        top_score = candidates[0][0]
+        return [
+            (kind, item_id, fname)
+            for sc, kind, item_id, fname in candidates
+            if sc >= max(4.0, top_score * 0.75)
+        ]
+
     def search_session_chunks(
         self,
         session_id: str,
         query: str,
         limit: int = 12,
         enabled_only: bool = True,
+        primary_query: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Query the persistent FTS5 index scoped to active sources & recordings."""
+        """Query the persistent FTS5 index, prioritizing items whose filename matches the user query."""
         safe_limit = max(1, min(50, int(limit)))
         tokens = _normalize_fts_tokens(query)
         enabled_clause = (
@@ -939,10 +1125,69 @@ class Database:
             else ""
         )
 
+        matched_items = self.match_session_items_by_query(
+            session_id,
+            primary_query if primary_query is not None else query,
+            enabled_only=enabled_only,
+        )
+
         with self._lock:
             conn = self._get_conn()
-            results: list[dict[str, Any]] = []
-            if tokens:
+            prioritized: list[dict[str, Any]] = []
+            seen_ids: set[int] = set()
+
+            if matched_items:
+                item_budget = max(6, int(safe_limit * 0.7))
+                per_item_intro = max(2, item_budget // max(1, len(matched_items)))
+                fts_expr = " OR ".join(f"{tok}*" for tok in tokens) if tokens else ""
+
+                for kind, item_id, _fname in matched_items:
+                    if fts_expr:
+                        try:
+                            scoped_rows = conn.execute(
+                                """
+                                SELECT c.*, bm25(source_chunks_fts) AS rank
+                                FROM source_chunks_fts
+                                JOIN source_chunks c ON c.id = source_chunks_fts.rowid
+                                WHERE source_chunks_fts MATCH ?
+                                  AND c.session_id = ?
+                                  AND c.item_kind = ?
+                                  AND c.item_id = ?
+                                ORDER BY rank ASC, c.chunk_index ASC
+                                LIMIT ?
+                                """,
+                                (fts_expr, session_id, kind, item_id, per_item_intro),
+                            ).fetchall()
+                            for row in scoped_rows:
+                                d = dict(row)
+                                if d["id"] not in seen_ids:
+                                    seen_ids.add(d["id"])
+                                    prioritized.append(d)
+                        except sqlite3.OperationalError:
+                            pass
+
+                    intro_rows = conn.execute(
+                        """
+                        SELECT c.*
+                        FROM source_chunks c
+                        WHERE c.session_id = ?
+                          AND c.item_kind = ?
+                          AND c.item_id = ?
+                        ORDER BY c.chunk_index ASC
+                        LIMIT ?
+                        """,
+                        (session_id, kind, item_id, per_item_intro),
+                    ).fetchall()
+                    for row in intro_rows:
+                        d = dict(row)
+                        if d["id"] not in seen_ids:
+                            seen_ids.add(d["id"])
+                            prioritized.append(d)
+
+                prioritized = prioritized[:item_budget]
+
+            results: list[dict[str, Any]] = list(prioritized)
+            if tokens and len(results) < safe_limit:
                 fts_expr = " OR ".join(f"{tok}*" for tok in tokens)
                 try:
                     rows = conn.execute(
@@ -960,12 +1205,18 @@ class Database:
                         """,
                         (fts_expr, session_id, safe_limit),
                     ).fetchall()
-                    results = [dict(r) for r in rows]
+                    for row in rows:
+                        d = dict(row)
+                        if d["id"] not in seen_ids:
+                            seen_ids.add(d["id"])
+                            results.append(d)
+                            if len(results) >= safe_limit:
+                                break
                 except sqlite3.OperationalError:
-                    results = []
+                    pass
 
             if results:
-                return results
+                return results[:safe_limit]
 
             # Fallback: return evenly distributed chunks across active items
             all_rows = conn.execute(

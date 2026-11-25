@@ -43,6 +43,16 @@
       </div>
 
       <div class="topbar-right">
+        <button
+          id="btn-stop-ai"
+          type="button"
+          class="stop-ai-pill hidden"
+          title="Detener de forma forzada cualquier generación o procesamiento de IA activo"
+        >
+          <span class="stop-sq" aria-hidden="true"></span>
+          <span>Detener IA</span>
+        </button>
+
         <div class="telemetry-anchor">
           <button id="btn-telemetry-popover" type="button" class="telemetry-trigger" title="Ver uso de GPU, RAM, contexto y liberar VRAM">
             <span id="model-state-pill" class="mini-status idle">

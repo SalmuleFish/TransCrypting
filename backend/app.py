@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import threading
 import uuid
@@ -44,7 +45,7 @@ from backend.context_manager import (
 )
 from backend.database import db
 from backend.hardware import get_system_stats
-from backend.ollama_service import VisionUnsupportedError, ollama_service
+from backend.ollama_service import GenerationAbortedError, VisionUnsupportedError, ollama_service
 from backend.podcast_service import (
     PodcastCancelledError,
     build_podcast_script_messages,
@@ -59,10 +60,11 @@ from backend.source_service import (
     detect_source_type,
     extract_document_pages,
     extract_image_text_windows_ocr,
+    is_meaningful_page_text,
     pages_to_full_text,
     prepare_image_base64,
 )
-from backend.whisper_service import prepare_audio_file
+from backend.whisper_service import WhisperCancelledError, prepare_audio_file
 
 
 class SessionCreateRequest(BaseModel):
@@ -148,12 +150,19 @@ class ProcessingPipeline:
     def __init__(self) -> None:
         self._queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._worker_task: asyncio.Task[None] | None = None
+        self._current_item_task: asyncio.Task[None] | None = None
+        self._current_item: tuple[str, str] | None = None
+        self._stopping: bool = False
 
     def start(self) -> None:
+        self._stopping = False
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._worker_loop())
 
     async def stop(self) -> None:
+        self._stopping = True
+        if self._current_item_task is not None and not self._current_item_task.done():
+            self._current_item_task.cancel()
         if self._worker_task is not None and not self._worker_task.done():
             self._worker_task.cancel()
             try:
@@ -161,6 +170,28 @@ class ProcessingPipeline:
             except asyncio.CancelledError:
                 pass
             self._worker_task = None
+
+    def cancel_current_and_clear(self) -> int:
+        """Drain pending queue items and cancel the currently running pipeline item without stopping the worker."""
+        cancelled = 0
+        while not self._queue.empty():
+            try:
+                kind, item_id = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                if kind == "source":
+                    db.update_source_error(item_id, "Procesamiento detenido manualmente.")
+                else:
+                    db.update_recording_error(item_id, "Procesamiento detenido manualmente.")
+                cancelled += 1
+            finally:
+                self._queue.task_done()
+
+        if self._current_item_task is not None and not self._current_item_task.done():
+            self._current_item_task.cancel()
+            cancelled += 1
+        return cancelled
 
     def enqueue(self, recording_id: str) -> None:
         self._queue.put_nowait(("recording", recording_id))
@@ -171,19 +202,52 @@ class ProcessingPipeline:
     async def _worker_loop(self) -> None:
         while True:
             kind, item_id = await self._queue.get()
+            self._current_item = (kind, item_id)
             try:
-                if kind == "source":
-                    await self._process_source(item_id)
-                else:
-                    await self._process_recording(item_id)
+                coro = (
+                    self._process_source(item_id)
+                    if kind == "source"
+                    else self._process_recording(item_id)
+                )
+                self._current_item_task = asyncio.create_task(coro)
+                await self._current_item_task
             except asyncio.CancelledError:
-                raise
+                if self._stopping:
+                    raise
+                if kind == "source":
+                    src = db.get_source(item_id)
+                    if src and src.get("status") in ("queued", "extracting", "indexing", "summarizing"):
+                        if src.get("extracted_text") and db.count_session_chunks(src["session_id"], enabled_only=False) > 0:
+                            db.update_source_summary(
+                                item_id,
+                                "",
+                                status="ready",
+                                progress=1.0,
+                                stage="Indexado (resumen detenido)",
+                            )
+                        else:
+                            db.update_source_error(item_id, "Procesamiento detenido manualmente.")
+                else:
+                    rec = db.get_recording(item_id)
+                    if rec and rec.get("status") in ("queued", "preparing", "transcribing", "summarizing"):
+                        if rec.get("transcript_text"):
+                            db.update_recording_summary(
+                                item_id,
+                                "",
+                                status="ready",
+                                progress=1.0,
+                                stage="Transcripción lista (resumen detenido)",
+                            )
+                        else:
+                            db.update_recording_error(item_id, "Transcripción detenida manualmente.")
             except Exception as exc:
                 if kind == "source":
                     db.update_source_error(item_id, f"Error inesperado: {exc}")
                 else:
                     db.update_recording_error(item_id, f"Error inesperado: {exc}")
             finally:
+                self._current_item_task = None
+                self._current_item = None
                 self._queue.task_done()
 
     async def _process_recording(self, rec_id: str) -> None:
@@ -244,6 +308,9 @@ class ProcessingPipeline:
                 progress_callback=_on_progress,
                 classroom_enhance=classroom_enhance,
             )
+        except (WhisperCancelledError, asyncio.CancelledError):
+            db.update_recording_error(rec_id, "Transcripción detenida manualmente.")
+            return
         except Exception as exc:
             db.update_recording_error(rec_id, f"Error al transcribir con Whisper: {exc}")
             return
@@ -315,6 +382,15 @@ class ProcessingPipeline:
                 num_ctx=num_ctx,
                 idle_unload_sec=idle_unload_sec,
             )
+        except (GenerationAbortedError, asyncio.CancelledError):
+            db.update_recording_summary(
+                rec_id=rec_id,
+                summary_text="",
+                status="ready",
+                progress=1.0,
+                stage="Transcripción lista (resumen detenido)",
+            )
+            return
         except Exception as exc:
             db.update_recording_error(
                 rec_id,
@@ -341,7 +417,17 @@ class ProcessingPipeline:
                 progress=0.92,
                 stage="Actualizando resumen integrado...",
             )
-            await regenerate_combined_summary_if_needed(session_id, extra_rec_id=rec_id)
+            try:
+                await regenerate_combined_summary_if_needed(session_id, extra_rec_id=rec_id)
+            except (GenerationAbortedError, asyncio.CancelledError):
+                db.update_recording_summary(
+                    rec_id=rec_id,
+                    summary_text=summary_text,
+                    status="ready",
+                    progress=1.0,
+                    stage="Completado (resumen integrado detenido)",
+                )
+                return
 
         db.update_recording_summary(
             rec_id=rec_id,
@@ -353,6 +439,8 @@ class ProcessingPipeline:
 
         try:
             await generate_and_save_suggestions(session_id)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
 
@@ -403,6 +491,9 @@ class ProcessingPipeline:
                         idle_unload_sec=idle_unload_sec,
                     )
                     used_vision = bool(extracted_text.strip())
+                except (GenerationAbortedError, asyncio.CancelledError):
+                    db.update_source_error(source_id, "Procesamiento detenido manualmente.")
+                    return
                 except VisionUnsupportedError:
                     extracted_text = ""
                 except Exception:
@@ -416,14 +507,16 @@ class ProcessingPipeline:
                     "Extrayendo texto con OCR local (CPU)...",
                 )
                 ocr_text = await asyncio.to_thread(extract_image_text_windows_ocr, src_path)
-                if ocr_text:
+                if is_meaningful_page_text(ocr_text):
                     extracted_text = f"Texto extraído mediante OCR local:\n{ocr_text}"
                 else:
-                    extracted_text = (
-                        "Imagen indexada localmente. El modelo de lenguaje actual no admite visión "
-                        "multimodal y no se detectó texto OCR legible; selecciona un modelo con visión "
-                        "(por ejemplo gemma4:e4b) y pulsa Reprocesar."
+                    db.delete_item_chunks("source", source_id)
+                    db.update_source_content(source_id, "", [], page_count=1)
+                    db.update_source_error(
+                        source_id,
+                        "No se detectó texto legible por OCR y el modelo actual no admite visión multimodal. Selecciona un modelo con visión (por ejemplo gemma4:e4b) y pulsa Reprocesar.",
                     )
+                    return
 
             pages = [{"locator": src["filename"], "label": "Imagen", "text": extracted_text}]
             db.update_source_content(source_id, extracted_text, pages, page_count=1)
@@ -451,13 +544,22 @@ class ProcessingPipeline:
             if not db.get_source(source_id):
                 return
 
+            chunks = chunk_pages(pages)
+            if not chunks or not is_meaningful_page_text(extracted_text):
+                db.delete_item_chunks("source", source_id)
+                db.update_source_content(source_id, "", pages, page_count=len(pages))
+                db.update_source_error(
+                    source_id,
+                    f"No se pudo extraer texto legible de este archivo ({len(pages)} pág./secc. sin texto seleccionable ni OCR). Si es un documento escaneado, prueba exportarlo con OCR o subir una captura .png/.jpg con un modelo de visión.",
+                )
+                return
+
             db.update_source_content(
                 source_id, extracted_text, pages, page_count=len(pages)
             )
             db.update_source_progress(
                 source_id, "indexing", 0.50, "Construyendo índice FTS5 local...", page_count=len(pages)
             )
-            chunks = chunk_pages(pages)
             db.replace_item_chunks(
                 session_id=session_id,
                 item_kind="source",
@@ -499,6 +601,15 @@ class ProcessingPipeline:
                     num_ctx=num_ctx,
                     idle_unload_sec=idle_unload_sec,
                 )
+        except (GenerationAbortedError, asyncio.CancelledError):
+            db.update_source_summary(
+                source_id=source_id,
+                summary_text="",
+                status="ready",
+                progress=1.0,
+                stage="Indexado (resumen detenido)",
+            )
+            return
         except Exception as exc:
             db.update_source_error(
                 source_id,
@@ -525,7 +636,17 @@ class ProcessingPipeline:
                 progress=0.92,
                 stage="Actualizando resumen integrado...",
             )
-            await regenerate_combined_summary_if_needed(session_id, extra_source_id=source_id)
+            try:
+                await regenerate_combined_summary_if_needed(session_id, extra_source_id=source_id)
+            except (GenerationAbortedError, asyncio.CancelledError):
+                db.update_source_summary(
+                    source_id=source_id,
+                    summary_text=summary_text,
+                    status="ready",
+                    progress=1.0,
+                    stage="Indexado (resumen integrado detenido)",
+                )
+                return
 
         db.update_source_summary(
             source_id=source_id,
@@ -537,6 +658,8 @@ class ProcessingPipeline:
 
         try:
             await generate_and_save_suggestions(session_id)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
 
@@ -580,6 +703,44 @@ async def generate_and_save_suggestions(session_id: str) -> list[dict[str, str]]
     prompts = parse_suggestions_json(raw, recording_count=total_ready)
     db.update_session_suggestions(session_id, prompts)
     return prompts
+
+
+_combined_summary_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+def _schedule_combined_summary_refresh(session_id: str) -> None:
+    """Refresh or clear combined session summary without blocking HTTP responses."""
+    prior = _combined_summary_tasks.pop(session_id, None)
+    if prior and not prior.done():
+        prior.cancel()
+
+    ready_recs = [
+        r for r in db.list_recordings(session_id)
+        if r.get("enabled", True) and r.get("status") == "ready"
+    ]
+    ready_srcs = [
+        s for s in db.list_sources(session_id)
+        if s.get("enabled", True) and s.get("status") == "ready"
+    ]
+    if len(ready_recs) + len(ready_srcs) < 2:
+        db.update_session_summary(session_id, "")
+        return
+
+    if bool(db.get_settings().get("eco_mode", False)):
+        return
+
+    async def _runner() -> None:
+        try:
+            await regenerate_combined_summary_if_needed(session_id)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        finally:
+            if _combined_summary_tasks.get(session_id) is asyncio.current_task():
+                _combined_summary_tasks.pop(session_id, None)
+
+    _combined_summary_tasks[session_id] = asyncio.create_task(_runner())
 
 
 async def regenerate_combined_summary_if_needed(
@@ -633,6 +794,8 @@ async def lifespan(_app: FastAPI):
     pipeline.start()
     resource_manager.start_idle_watchdog()
     yield
+    for task in list(_combined_summary_tasks.values()):
+        task.cancel()
     for task, cancel_ev in list(_podcast_jobs.values()):
         cancel_ev.set()
         task.cancel()
@@ -682,6 +845,33 @@ async def system_unload() -> dict[str, Any]:
     await resource_manager.unload_everything()
     stats = await asyncio.to_thread(get_system_stats, True)
     return {"status": "unloaded", "hardware": stats, "resources": resource_manager.get_state()}
+
+
+@app.post("/api/system/stop")
+async def system_stop() -> dict[str, Any]:
+    """Forcibly stop all running AI tasks (LLM, Whisper, Podcast, background pipeline)."""
+    cancelled_podcasts = 0
+    for _pod_id, (task, cancel_ev) in list(_podcast_jobs.items()):
+        cancel_ev.set()
+        if not task.done():
+            task.cancel()
+            cancelled_podcasts += 1
+
+    cancelled_combined = 0
+    for task in list(_combined_summary_tasks.values()):
+        if not task.done():
+            task.cancel()
+            cancelled_combined += 1
+
+    cancelled_pipeline = pipeline.cancel_current_and_clear()
+    stop_info = await resource_manager.force_stop_all()
+    return {
+        "stopped": True,
+        "cancelled_podcasts": cancelled_podcasts,
+        "cancelled_combined": cancelled_combined,
+        "cancelled_pipeline": cancelled_pipeline,
+        **stop_info,
+    }
 
 
 @app.get("/api/settings")
@@ -820,12 +1010,18 @@ async def generate_session_quiz(
         focus_prompt=focus_prompt,
         include_hints=include_hints,
     )
-    raw = await resource_manager.summarize_exclusive(
-        messages=msgs,
-        model_name=ollama_model,
-        num_ctx=num_ctx,
-        idle_unload_sec=idle_unload_sec,
-    )
+    try:
+        raw = await resource_manager.summarize_exclusive(
+            messages=msgs,
+            model_name=ollama_model,
+            num_ctx=num_ctx,
+            idle_unload_sec=idle_unload_sec,
+        )
+    except (asyncio.CancelledError, GenerationAbortedError) as exc:
+        raise HTTPException(
+            status_code=499,
+            detail="Generación detenida por el usuario.",
+        ) from exc
     questions = parse_quiz_json(raw, mode=mode)
     if not questions:
         raise HTTPException(
@@ -892,12 +1088,18 @@ async def grade_session_quiz_answer(
         user_answer=user_answer,
         relevant_excerpt=excerpt,
     )
-    raw = await resource_manager.summarize_exclusive(
-        messages=msgs,
-        model_name=ollama_model,
-        num_ctx=min(num_ctx, 8192),
-        idle_unload_sec=idle_unload_sec,
-    )
+    try:
+        raw = await resource_manager.summarize_exclusive(
+            messages=msgs,
+            model_name=ollama_model,
+            num_ctx=min(num_ctx, 8192),
+            idle_unload_sec=idle_unload_sec,
+        )
+    except (asyncio.CancelledError, GenerationAbortedError) as exc:
+        raise HTTPException(
+            status_code=499,
+            detail="Evaluación detenida por el usuario.",
+        ) from exc
     return parse_grade_json(raw, fallback_timestamp=payload.timestamp)
 
 
@@ -1005,11 +1207,7 @@ async def toggle_recording_enabled(
     if not rec or rec["session_id"] != session_id:
         raise HTTPException(status_code=404, detail="Grabación no encontrada.")
     db.set_recording_enabled(rec_id, payload.enabled)
-    if not bool(db.get_settings().get("eco_mode", False)):
-        try:
-            await regenerate_combined_summary_if_needed(session_id)
-        except Exception:
-            pass
+    _schedule_combined_summary_refresh(session_id)
     return _build_session_response(session_id)
 
 
@@ -1019,12 +1217,7 @@ async def delete_recording(session_id: str, rec_id: str) -> dict[str, Any]:
     if not rec or rec["session_id"] != session_id:
         raise HTTPException(status_code=404, detail="Grabación no encontrada.")
     db.delete_recording(rec_id)
-
-    if not bool(db.get_settings().get("eco_mode", False)):
-        try:
-            await regenerate_combined_summary_if_needed(session_id)
-        except Exception:
-            pass
+    _schedule_combined_summary_refresh(session_id)
     return {"deleted": True}
 
 
@@ -1100,11 +1293,7 @@ async def toggle_source_enabled(
     if not src or src["session_id"] != session_id:
         raise HTTPException(status_code=404, detail="Fuente no encontrada.")
     db.set_source_enabled(source_id, payload.enabled)
-    if not bool(db.get_settings().get("eco_mode", False)):
-        try:
-            await regenerate_combined_summary_if_needed(session_id)
-        except Exception:
-            pass
+    _schedule_combined_summary_refresh(session_id)
     return _build_session_response(session_id)
 
 
@@ -1127,11 +1316,7 @@ async def delete_source(session_id: str, source_id: str) -> dict[str, Any]:
     if not src or src["session_id"] != session_id:
         raise HTTPException(status_code=404, detail="Fuente no encontrada.")
     db.delete_source(source_id)
-    if not bool(db.get_settings().get("eco_mode", False)):
-        try:
-            await regenerate_combined_summary_if_needed(session_id)
-        except Exception:
-            pass
+    _schedule_combined_summary_refresh(session_id)
     return {"deleted": True}
 
 
@@ -1210,38 +1395,44 @@ async def resummarize_session(
     if not rec_targets and not src_targets:
         raise HTTPException(status_code=400, detail="No hay fuentes ni transcripciones activas para resumir.")
 
-    for rec in rec_targets:
-        msgs = build_recording_summary_messages(
-            filename=rec["filename"],
-            transcript_text=rec["transcript_text"],
-            duration_sec=float(rec.get("duration_sec") or 0.0),
-            max_input_chars=max(8000, int(num_ctx * 2.2)),
-        )
-        summary_text = await resource_manager.summarize_exclusive(
-            messages=msgs,
-            model_name=ollama_model,
-            num_ctx=num_ctx,
-            idle_unload_sec=idle_unload_sec,
-        )
-        db.update_recording_summary(rec["id"], summary_text)
+    try:
+        for rec in rec_targets:
+            msgs = build_recording_summary_messages(
+                filename=rec["filename"],
+                transcript_text=rec["transcript_text"],
+                duration_sec=float(rec.get("duration_sec") or 0.0),
+                max_input_chars=max(8000, int(num_ctx * 2.2)),
+            )
+            summary_text = await resource_manager.summarize_exclusive(
+                messages=msgs,
+                model_name=ollama_model,
+                num_ctx=num_ctx,
+                idle_unload_sec=idle_unload_sec,
+            )
+            db.update_recording_summary(rec["id"], summary_text)
 
-    for src in src_targets:
-        msgs = build_source_summary_messages(
-            filename=src["filename"],
-            source_type=src.get("source_type", "text"),
-            extracted_text=src["extracted_text"],
-            page_count=int(src.get("page_count") or 0),
-            max_input_chars=max(8000, int(num_ctx * 2.2)),
-        )
-        summary_text = await resource_manager.summarize_exclusive(
-            messages=msgs,
-            model_name=ollama_model,
-            num_ctx=num_ctx,
-            idle_unload_sec=idle_unload_sec,
-        )
-        db.update_source_summary(src["id"], summary_text)
+        for src in src_targets:
+            msgs = build_source_summary_messages(
+                filename=src["filename"],
+                source_type=src.get("source_type", "text"),
+                extracted_text=src["extracted_text"],
+                page_count=int(src.get("page_count") or 0),
+                max_input_chars=max(8000, int(num_ctx * 2.2)),
+            )
+            summary_text = await resource_manager.summarize_exclusive(
+                messages=msgs,
+                model_name=ollama_model,
+                num_ctx=num_ctx,
+                idle_unload_sec=idle_unload_sec,
+            )
+            db.update_source_summary(src["id"], summary_text)
 
-    await regenerate_combined_summary_if_needed(session_id)
+        await regenerate_combined_summary_if_needed(session_id)
+    except (asyncio.CancelledError, GenerationAbortedError) as exc:
+        raise HTTPException(
+            status_code=499,
+            detail="Resumen detenido por el usuario.",
+        ) from exc
     return _build_session_response(session_id)
 
 
@@ -1337,7 +1528,13 @@ async def chat_with_session(session_id: str, payload: ChatRequest) -> StreamingR
     prior_messages = detail["messages"]
     recent_turns = " ".join(m["content"] for m in prior_messages[-4:] if m.get("role") == "user")
     fts_query = f"{question} {recent_turns}".strip()
-    indexed_hits = db.search_session_chunks(session_id, fts_query, limit=12, enabled_only=True)
+    indexed_hits = db.search_session_chunks(
+        session_id,
+        fts_query,
+        limit=12,
+        enabled_only=True,
+        primary_query=question,
+    )
 
     llm_messages, context_mode = build_chat_messages(
         recordings=ready_recs,
@@ -1383,6 +1580,11 @@ async def chat_with_session(session_id: str, payload: ChatRequest) -> StreamingR
                 full_answer = "No obtuve una respuesta del modelo local."
             saved_assistant = db.add_message(session_id, "assistant", full_answer)
             yield _sse({"type": "done", "message": saved_assistant})
+        except (asyncio.CancelledError, GenerationAbortedError):
+            partial = "".join(chunks).strip()
+            if partial:
+                db.add_message(session_id, "assistant", partial)
+            yield _sse({"type": "stopped", "partial": bool(partial)})
         except Exception as exc:
             partial = "".join(chunks).strip()
             if partial:

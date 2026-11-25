@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import threading
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
 from backend.database import db
 from backend.ollama_service import ollama_service
-from backend.whisper_service import whisper_service
+from backend.whisper_service import WhisperCancelledError, whisper_service
 
 
 class ResourceManager:
@@ -32,6 +33,18 @@ class ResourceManager:
         self.podcast_progress: float = 0.0
         self.last_activity_ts: float = time.monotonic()
         self._watchdog_task: asyncio.Task[None] | None = None
+        self._active_tasks: set[asyncio.Task[Any]] = set()
+        self._active_cancel_events: set[threading.Event] = set()
+
+    def _register_current_task(self) -> asyncio.Task[Any] | None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_tasks.add(task)
+        return task
+
+    def _unregister_task(self, task: asyncio.Task[Any] | None) -> None:
+        if task is not None:
+            self._active_tasks.discard(task)
 
     def touch_activity(self) -> None:
         self.last_activity_ts = time.monotonic()
@@ -62,35 +75,50 @@ class ResourceManager:
         classroom_enhance: bool = True,
     ) -> dict[str, Any]:
         """Unload Ollama, run Whisper transcription, and always release Whisper afterwards."""
-        async with self._gpu_lock:
-            try:
-                self.phase = "unloading"
-                self.active_model = ""
-                self.active_device = ""
-                await ollama_service.unload_all()
+        task = self._register_current_task()
+        cancel_ev = threading.Event()
+        self._active_cancel_events.add(cancel_ev)
+        try:
+            async with self._gpu_lock:
+                if cancel_ev.is_set():
+                    raise WhisperCancelledError("Transcripción detenida por el usuario.")
+                try:
+                    self.phase = "unloading"
+                    self.active_model = ""
+                    self.active_device = ""
+                    await ollama_service.unload_all()
 
-                self.phase = "whisper"
-                self.active_model = f"whisper-{model_name}"
+                    if cancel_ev.is_set():
+                        raise WhisperCancelledError("Transcripción detenida por el usuario.")
 
-                def _run_whisper() -> dict[str, Any]:
-                    used_device = whisper_service.load(model_name=model_name, device_pref=device_pref)
-                    self.active_device = used_device
-                    return whisper_service.transcribe(
-                        audio_path=audio_path,
-                        language=language,
-                        progress_callback=progress_callback,
-                        classroom_enhance=classroom_enhance,
-                    )
+                    self.phase = "whisper"
+                    self.active_model = f"whisper-{model_name}"
 
-                result = await asyncio.to_thread(_run_whisper)
-                self.touch_activity()
-                return result
-            finally:
-                whisper_service.unload()
-                gc.collect()
-                self.phase = "idle"
-                self.active_model = ""
-                self.active_device = ""
+                    def _run_whisper() -> dict[str, Any]:
+                        if cancel_ev.is_set():
+                            raise WhisperCancelledError("Transcripción detenida por el usuario.")
+                        used_device = whisper_service.load(model_name=model_name, device_pref=device_pref)
+                        self.active_device = used_device
+                        return whisper_service.transcribe(
+                            audio_path=audio_path,
+                            language=language,
+                            progress_callback=progress_callback,
+                            classroom_enhance=classroom_enhance,
+                            cancel_event=cancel_ev,
+                        )
+
+                    result = await asyncio.to_thread(_run_whisper)
+                    self.touch_activity()
+                    return result
+                finally:
+                    whisper_service.unload()
+                    gc.collect()
+                    self.phase = "idle"
+                    self.active_model = ""
+                    self.active_device = ""
+        finally:
+            self._active_cancel_events.discard(cancel_ev)
+            self._unregister_task(task)
 
     async def summarize_exclusive(
         self,
@@ -100,33 +128,37 @@ class ResourceManager:
         idle_unload_sec: int,
     ) -> str:
         """Ensure Whisper is unloaded, then run Ollama summary generation."""
-        async with self._gpu_lock:
-            try:
-                if whisper_service.is_loaded:
-                    self.phase = "unloading"
-                    whisper_service.unload()
+        task = self._register_current_task()
+        try:
+            async with self._gpu_lock:
+                try:
+                    if whisper_service.is_loaded:
+                        self.phase = "unloading"
+                        whisper_service.unload()
 
-                self.phase = "llm"
-                self.active_model = model_name
-                self.active_device = "gpu/ollama"
-                keep_alive = f"{max(30, int(idle_unload_sec))}s"
-                settings = db.get_settings()
-                eco_mode = bool(settings.get("eco_mode", False))
-                eco_cpu_threads = int(settings.get("eco_cpu_threads") or 2)
-                text = await ollama_service.generate_complete(
-                    model=model_name,
-                    messages=messages,
-                    num_ctx=num_ctx,
-                    keep_alive=keep_alive,
-                    eco_mode=eco_mode,
-                    eco_cpu_threads=eco_cpu_threads,
-                )
-                self.touch_activity()
-                return text
-            finally:
-                self.phase = "idle"
-                self.active_model = ""
-                self.active_device = ""
+                    self.phase = "llm"
+                    self.active_model = model_name
+                    self.active_device = "gpu/ollama"
+                    keep_alive = f"{max(30, int(idle_unload_sec))}s"
+                    settings = db.get_settings()
+                    eco_mode = bool(settings.get("eco_mode", False))
+                    eco_cpu_threads = int(settings.get("eco_cpu_threads") or 2)
+                    text = await ollama_service.generate_complete(
+                        model=model_name,
+                        messages=messages,
+                        num_ctx=num_ctx,
+                        keep_alive=keep_alive,
+                        eco_mode=eco_mode,
+                        eco_cpu_threads=eco_cpu_threads,
+                    )
+                    self.touch_activity()
+                    return text
+                finally:
+                    self.phase = "idle"
+                    self.active_model = ""
+                    self.active_device = ""
+        finally:
+            self._unregister_task(task)
 
     async def chat_events_exclusive(
         self,
@@ -137,36 +169,40 @@ class ResourceManager:
         think: bool = False,
     ) -> AsyncIterator[tuple[str, str]]:
         """Acquire GPU lock, ensure Whisper is unloaded, and stream ('thinking'|'token', text)."""
-        async with self._gpu_lock:
-            try:
-                if whisper_service.is_loaded:
-                    self.phase = "unloading"
-                    whisper_service.unload()
+        task = self._register_current_task()
+        try:
+            async with self._gpu_lock:
+                try:
+                    if whisper_service.is_loaded:
+                        self.phase = "unloading"
+                        whisper_service.unload()
 
-                self.phase = "llm"
-                self.active_model = model_name
-                self.active_device = "gpu/ollama"
-                keep_alive = f"{max(30, int(idle_unload_sec))}s"
-                settings = db.get_settings()
-                eco_mode = bool(settings.get("eco_mode", False))
-                eco_cpu_threads = int(settings.get("eco_cpu_threads") or 2)
+                    self.phase = "llm"
+                    self.active_model = model_name
+                    self.active_device = "gpu/ollama"
+                    keep_alive = f"{max(30, int(idle_unload_sec))}s"
+                    settings = db.get_settings()
+                    eco_mode = bool(settings.get("eco_mode", False))
+                    eco_cpu_threads = int(settings.get("eco_cpu_threads") or 2)
 
-                async for kind, text in ollama_service.stream_chat_events(
-                    model=model_name,
-                    messages=messages,
-                    num_ctx=num_ctx,
-                    keep_alive=keep_alive,
-                    think=think,
-                    eco_mode=eco_mode,
-                    eco_cpu_threads=eco_cpu_threads,
-                ):
+                    async for kind, text in ollama_service.stream_chat_events(
+                        model=model_name,
+                        messages=messages,
+                        num_ctx=num_ctx,
+                        keep_alive=keep_alive,
+                        think=think,
+                        eco_mode=eco_mode,
+                        eco_cpu_threads=eco_cpu_threads,
+                    ):
+                        self.touch_activity()
+                        yield (kind, text)
+                finally:
                     self.touch_activity()
-                    yield (kind, text)
-            finally:
-                self.touch_activity()
-                self.phase = "idle"
-                self.active_model = ""
-                self.active_device = ""
+                    self.phase = "idle"
+                    self.active_model = ""
+                    self.active_device = ""
+        finally:
+            self._unregister_task(task)
 
     async def chat_stream_exclusive(
         self,
@@ -201,6 +237,9 @@ class ResourceManager:
         3. Completely unload Ollama from VRAM/RAM + gc.collect().
         4. Run local TTS synthesis cleanly with free resources, then unload.
         """
+        task = self._register_current_task()
+        if cancel_event is not None:
+            self._active_cancel_events.add(cancel_event)
         self.podcast_active = True
         self.podcast_id = podcast_id
         self.podcast_stage = "Esperando turno exclusivo..."
@@ -208,57 +247,102 @@ class ResourceManager:
         if on_stage:
             on_stage("queued", 0.05, self.podcast_stage)
 
-        async with self._gpu_lock:
+        try:
+            async with self._gpu_lock:
+                try:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise asyncio.CancelledError()
+                    self.phase = "podcast"
+                    self.active_model = "Podcast Studio · Guion LLM"
+                    self.active_device = "exclusivo"
+                    whisper_service.unload()
+
+                    self.podcast_stage = "Escribiendo guion de podcast con modelo local..."
+                    self.podcast_progress = 0.15
+                    if on_stage:
+                        on_stage("scripting", 0.15, self.podcast_stage)
+
+                    script_turns = await script_coro_factory()
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise asyncio.CancelledError()
+
+                    self.podcast_stage = "Liberando VRAM de Ollama antes de cargar voces..."
+                    self.podcast_progress = 0.38
+                    if on_stage:
+                        on_stage("synthesizing", 0.38, self.podcast_stage)
+
+                    await ollama_service.unload_all()
+                    gc.collect()
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise asyncio.CancelledError()
+
+                    self.active_model = "Podcast Studio · Voces Kokoro-82M"
+                    self.active_device = "local/cpu"
+                    self.podcast_stage = "Sintetizando voces locales (Kokoro-82M)..."
+                    self.podcast_progress = 0.45
+
+                    result = await asyncio.to_thread(synth_fn, script_turns)
+                    self.touch_activity()
+                    return result
+                finally:
+                    if cancel_event is not None and cancel_event.is_set():
+                        try:
+                            await ollama_service.unload_all()
+                        except Exception:
+                            pass
+                    whisper_service.unload()
+                    gc.collect()
+                    self.podcast_active = False
+                    self.podcast_id = ""
+                    self.podcast_stage = ""
+                    self.podcast_progress = 0.0
+                    self.phase = "idle"
+                    self.active_model = ""
+                    self.active_device = ""
+        finally:
+            if cancel_event is not None:
+                self._active_cancel_events.discard(cancel_event)
+            self._unregister_task(task)
+
+    async def force_stop_all(self) -> dict[str, Any]:
+        """Forcibly stop all active LLM streams, Whisper runs, podcasts, and queued tasks."""
+        for ev in list(self._active_cancel_events):
             try:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise asyncio.CancelledError()
-                self.phase = "podcast"
-                self.active_model = "Podcast Studio · Guion LLM"
-                self.active_device = "exclusivo"
-                whisper_service.unload()
+                ev.set()
+            except Exception:
+                pass
 
-                self.podcast_stage = "Escribiendo guion de podcast con modelo local..."
-                self.podcast_progress = 0.15
-                if on_stage:
-                    on_stage("scripting", 0.15, self.podcast_stage)
+        aborted_streams = 0
+        try:
+            aborted_streams = await ollama_service.abort_active()
+        except Exception:
+            pass
 
-                script_turns = await script_coro_factory()
-                if cancel_event is not None and cancel_event.is_set():
-                    raise asyncio.CancelledError()
+        current = asyncio.current_task()
+        cancelled_tasks = 0
+        for task in list(self._active_tasks):
+            if task is not None and task is not current and not task.done():
+                task.cancel()
+                cancelled_tasks += 1
 
-                self.podcast_stage = "Liberando VRAM de Ollama antes de cargar voces..."
-                self.podcast_progress = 0.38
-                if on_stage:
-                    on_stage("synthesizing", 0.38, self.podcast_stage)
+        await asyncio.sleep(0.05)
 
-                await ollama_service.unload_all()
-                gc.collect()
-                if cancel_event is not None and cancel_event.is_set():
-                    raise asyncio.CancelledError()
+        if not self._gpu_lock.locked():
+            whisper_service.unload()
+            gc.collect()
+            self.phase = "idle"
+            self.active_model = ""
+            self.active_device = ""
+            self.podcast_active = False
+            self.podcast_id = ""
+            self.podcast_stage = ""
+            self.podcast_progress = 0.0
 
-                self.active_model = "Podcast Studio · Voces Kokoro-82M"
-                self.active_device = "local/cpu"
-                self.podcast_stage = "Sintetizando voces locales (Kokoro-82M)..."
-                self.podcast_progress = 0.45
-
-                result = await asyncio.to_thread(synth_fn, script_turns)
-                self.touch_activity()
-                return result
-            finally:
-                if cancel_event is not None and cancel_event.is_set():
-                    try:
-                        await ollama_service.unload_all()
-                    except Exception:
-                        pass
-                whisper_service.unload()
-                gc.collect()
-                self.podcast_active = False
-                self.podcast_id = ""
-                self.podcast_stage = ""
-                self.podcast_progress = 0.0
-                self.phase = "idle"
-                self.active_model = ""
-                self.active_device = ""
+        return {
+            "aborted_streams": aborted_streams,
+            "cancelled_tasks": cancelled_tasks,
+            "resources": self.get_state(),
+        }
 
     async def unload_everything(self) -> None:
         """Force immediate unloading of all AI models from VRAM and RAM."""
