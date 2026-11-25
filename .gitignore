@@ -1,0 +1,32 @@
+# Local user data, recordings, database, and downloaded model weights/caches
+data/*
+!data/.gitkeep
+
+# Python virtual environments & caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Compiled native launcher (rebuilt via setup.bat from launcher/TransCryptingLauncher.cs)
+TransCrypting.exe
+*.exe
+*.db
+*.db-wal
+*.db-shm
+*.gguf
+*.safetensors
+
+# OS, editor & environment files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+.env
+.vscode/
+.idea/

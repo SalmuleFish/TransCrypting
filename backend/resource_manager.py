@@ -1,0 +1,214 @@
+"""Exclusive GPU/RAM resource orchestrator with idle background unloading."""
+
+from __future__ import annotations
+
+import asyncio
+import gc
+import time
+from pathlib import Path
+from typing import Any, AsyncIterator, Callable
+
+from backend.database import db
+from backend.ollama_service import ollama_service
+from backend.whisper_service import whisper_service
+
+
+class ResourceManager:
+    """
+    Coordinates exclusive access to the 8 GB RTX 4060 VRAM & 16 GB RAM.
+
+    Guarantees that Whisper and Ollama (Gemma 4) never stay loaded simultaneously,
+    and automatically unloads idle models in the background.
+    """
+
+    def __init__(self) -> None:
+        self._gpu_lock = asyncio.Lock()
+        self.phase: str = "idle"  # idle | unloading | whisper | llm
+        self.active_model: str = ""
+        self.active_device: str = ""
+        self.last_activity_ts: float = time.monotonic()
+        self._watchdog_task: asyncio.Task[None] | None = None
+
+    def touch_activity(self) -> None:
+        self.last_activity_ts = time.monotonic()
+
+    def get_state(self) -> dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "active_model": self.active_model,
+            "active_device": self.active_device,
+            "whisper_loaded": whisper_service.is_loaded,
+            "idle_seconds": int(max(0.0, time.monotonic() - self.last_activity_ts)),
+        }
+
+    async def transcribe_exclusive(
+        self,
+        audio_path: Path,
+        model_name: str,
+        device_pref: str = "auto",
+        language: str = "auto",
+        progress_callback: Callable[[float, str], None] | None = None,
+        classroom_enhance: bool = True,
+    ) -> dict[str, Any]:
+        """Unload Ollama, run Whisper transcription, and always release Whisper afterwards."""
+        async with self._gpu_lock:
+            try:
+                self.phase = "unloading"
+                self.active_model = ""
+                self.active_device = ""
+                await ollama_service.unload_all()
+
+                self.phase = "whisper"
+                self.active_model = f"whisper-{model_name}"
+
+                def _run_whisper() -> dict[str, Any]:
+                    used_device = whisper_service.load(model_name=model_name, device_pref=device_pref)
+                    self.active_device = used_device
+                    return whisper_service.transcribe(
+                        audio_path=audio_path,
+                        language=language,
+                        progress_callback=progress_callback,
+                        classroom_enhance=classroom_enhance,
+                    )
+
+                result = await asyncio.to_thread(_run_whisper)
+                self.touch_activity()
+                return result
+            finally:
+                whisper_service.unload()
+                gc.collect()
+                self.phase = "idle"
+                self.active_model = ""
+                self.active_device = ""
+
+    async def summarize_exclusive(
+        self,
+        messages: list[dict[str, str]],
+        model_name: str,
+        num_ctx: int,
+        idle_unload_sec: int,
+    ) -> str:
+        """Ensure Whisper is unloaded, then run Ollama summary generation."""
+        async with self._gpu_lock:
+            try:
+                if whisper_service.is_loaded:
+                    self.phase = "unloading"
+                    whisper_service.unload()
+
+                self.phase = "llm"
+                self.active_model = model_name
+                self.active_device = "gpu/ollama"
+                keep_alive = f"{max(30, int(idle_unload_sec))}s"
+                text = await ollama_service.generate_complete(
+                    model=model_name,
+                    messages=messages,
+                    num_ctx=num_ctx,
+                    keep_alive=keep_alive,
+                )
+                self.touch_activity()
+                return text
+            finally:
+                self.phase = "idle"
+                self.active_model = ""
+                self.active_device = ""
+
+    async def chat_events_exclusive(
+        self,
+        messages: list[dict[str, str]],
+        model_name: str,
+        num_ctx: int,
+        idle_unload_sec: int,
+        think: bool = False,
+    ) -> AsyncIterator[tuple[str, str]]:
+        """Acquire GPU lock, ensure Whisper is unloaded, and stream ('thinking'|'token', text)."""
+        async with self._gpu_lock:
+            try:
+                if whisper_service.is_loaded:
+                    self.phase = "unloading"
+                    whisper_service.unload()
+
+                self.phase = "llm"
+                self.active_model = model_name
+                self.active_device = "gpu/ollama"
+                keep_alive = f"{max(30, int(idle_unload_sec))}s"
+
+                async for kind, text in ollama_service.stream_chat_events(
+                    model=model_name,
+                    messages=messages,
+                    num_ctx=num_ctx,
+                    keep_alive=keep_alive,
+                    think=think,
+                ):
+                    self.touch_activity()
+                    yield (kind, text)
+            finally:
+                self.touch_activity()
+                self.phase = "idle"
+                self.active_model = ""
+                self.active_device = ""
+
+    async def chat_stream_exclusive(
+        self,
+        messages: list[dict[str, str]],
+        model_name: str,
+        num_ctx: int,
+        idle_unload_sec: int,
+    ) -> AsyncIterator[str]:
+        """Acquire GPU lock, ensure Whisper is unloaded, and stream Ollama chat tokens."""
+        async for kind, text in self.chat_events_exclusive(
+            messages=messages,
+            model_name=model_name,
+            num_ctx=num_ctx,
+            idle_unload_sec=idle_unload_sec,
+            think=False,
+        ):
+            if kind == "token" and text:
+                yield text
+
+    async def unload_everything(self) -> None:
+        """Force immediate unloading of all AI models from VRAM and RAM."""
+        async with self._gpu_lock:
+            self.phase = "unloading"
+            whisper_service.unload()
+            await ollama_service.unload_all()
+            gc.collect()
+            self.phase = "idle"
+            self.active_model = ""
+            self.active_device = ""
+
+    def start_idle_watchdog(self) -> None:
+        """Start background loop that frees VRAM/RAM after configured idle timeout."""
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._idle_watchdog_loop())
+
+    async def stop_idle_watchdog(self) -> None:
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+            self._watchdog_task = None
+
+    async def _idle_watchdog_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                if self._gpu_lock.locked() or self.phase != "idle":
+                    continue
+                settings = db.get_settings()
+                timeout_sec = max(30, int(settings.get("idle_unload_sec", 180)))
+                idle_elapsed = time.monotonic() - self.last_activity_ts
+                if idle_elapsed < timeout_sec:
+                    continue
+
+                running_ollama = await ollama_service.get_running_models()
+                if whisper_service.is_loaded or running_ollama:
+                    await self.unload_everything()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+
+resource_manager = ResourceManager()

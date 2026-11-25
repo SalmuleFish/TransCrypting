@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TransCrypting — Transcripción, Resumen y Chat Local</title>
+  <link rel="icon" type="image/x-icon" href="/icon.ico" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="app-shell" class="bento-shell">
+    <!-- Left Column: Brand Hero + Conversations -->
+    <aside class="col-left">
+      <section class="hero-card">
+        <div class="hero-top">
+          <div class="hero-brand">
+            <div class="brand-badge" aria-hidden="true">TC</div>
+            <div>
+              <div class="hero-brand-name">TransCrypting</div>
+              <div class="hero-brand-sub">Whisper + Ollama · Local</div>
+            </div>
+          </div>
+          <div class="hero-actions">
+            <button id="btn-toggle-theme" class="circle-btn light" title="Cambiar entre modo claro y modo oscuro grafito">
+              <svg id="theme-icon-moon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+              </svg>
+              <svg id="theme-icon-sun" class="hidden" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="5"/>
+                <line x1="12" y1="1" x2="12" y2="3"/>
+                <line x1="12" y1="21" x2="12" y2="23"/>
+                <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+                <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+                <line x1="1" y1="12" x2="3" y2="12"/>
+                <line x1="21" y1="12" x2="23" y2="12"/>
+                <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+                <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+              </svg>
+            </button>
+            <button id="btn-hero-unload" class="circle-btn light" title="Liberar VRAM y RAM ahora">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+              </svg>
+            </button>
+            <button id="btn-open-settings" class="circle-btn light" title="Configuración de modelos y memoria">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div id="hero-status-title" class="hero-title">Listo para analizar</div>
+
+        <div class="hero-progress-wrap">
+          <div class="hero-progress-track">
+            <div id="hero-progress-fill" class="hero-progress-fill"></div>
+          </div>
+          <div id="hero-substatus" class="hero-sub">Sin modelos activos · 100% local</div>
+        </div>
+      </section>
+
+      <section class="card conversations-card">
+        <div class="card-header">
+          <h2 class="card-title">Conversaciones</h2>
+          <button id="btn-new-session" class="circle-btn dark" title="Nueva conversación">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+              <line x1="12" y1="5" x2="12" y2="19"/>
+              <line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+          </button>
+        </div>
+
+        <div class="search-pill-wrap">
+          <svg class="search-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"/>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input id="session-search" type="search" class="pill-search" placeholder="Buscar conversación..." autocomplete="off" />
+        </div>
+
+        <div id="session-list" class="session-list"></div>
+      </section>
+    </aside>
+
+    <!-- Center Column: Main Workspace (Summary / Transcript / Chat) -->
+    <main class="col-center card workspace-card">
+      <div id="empty-session-state" class="empty-state hidden">
+        <div class="empty-card">
+          <div class="empty-pill">100% Local · Sin nube</div>
+          <h1>Bienvenido a TransCrypting</h1>
+          <p>Crea una conversación o arrastra una grabación para transcribirla con Whisper y analizarla con tu modelo local de Ollama de forma privada.</p>
+          <button id="btn-empty-new" class="pill-btn dark lg">+ Crear primera conversación</button>
+        </div>
+      </div>
+
+      <div id="active-session-view" class="session-view hidden">
+        <!-- Workspace Header -->
+        <header class="ws-header">
+          <div class="ws-title-block">
+            <div class="ws-title-row">
+              <h1 id="session-title" class="ws-title">Conversación</h1>
+              <button id="btn-rename-session" class="icon-ghost" title="Renombrar conversación">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 20h9"/>
+                  <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+                </svg>
+              </button>
+            </div>
+            <div class="ws-status-line">
+              <span class="lime-dot"></span>
+              <span id="session-subtitle">Sin grabaciones listas aún</span>
+            </div>
+          </div>
+
+          <div class="ws-actions">
+            <div id="actions-summary" class="action-group">
+              <button id="btn-resummarize" class="pill-btn outline sm" title="Regenerar resúmenes con el modelo actual">
+                Regenerar
+              </button>
+              <button id="btn-export-md" class="pill-btn outline sm" title="Exportar resumen, transcripción y chat a Markdown">
+                Exportar .md
+              </button>
+            </div>
+
+            <div id="actions-transcript" class="action-group hidden">
+              <input id="transcript-search" type="search" class="pill-search compact" placeholder="Buscar en texto..." />
+              <button id="btn-copy-transcript" class="pill-btn outline sm">Copiar todo</button>
+            </div>
+
+            <div id="actions-chat" class="action-group hidden">
+              <button
+                id="btn-clear-chat"
+                class="pill-btn danger-soft sm"
+                title="Elimina solo los mensajes del chat; conserva tus audios, transcripciones y resúmenes"
+              >
+                Borrar historial
+              </button>
+            </div>
+
+            <div id="actions-quiz" class="action-group hidden">
+              <button id="btn-reset-quiz" class="pill-btn outline sm hidden">
+                Nuevo examen
+              </button>
+            </div>
+          </div>
+        </header>
+
+        <!-- Segmented Tab Control -->
+        <div class="ws-tabs-row">
+          <div id="segmented-tabs" class="segmented-tabs" role="tablist">
+            <div id="seg-indicator" class="seg-indicator" aria-hidden="true"></div>
+            <button class="seg-btn active" data-tab="summary" role="tab">Resumen</button>
+            <button class="seg-btn" data-tab="transcript" role="tab">Transcripción</button>
+            <button class="seg-btn" data-tab="chat" role="tab">
+              Chat <span id="chat-badge-count" class="tab-count hidden">0</span>
+            </button>
+            <button class="seg-btn" data-tab="quiz" role="tab">Examen</button>
+          </div>
+        </div>
+
+        <!-- Main Scrollable Content -->
+        <div id="center-scroll" class="ws-scroll">
+          <div id="tab-summary" class="tab-pane"></div>
+          <div id="tab-transcript" class="tab-pane hidden"></div>
+          <div id="tab-chat" class="tab-pane hidden">
+            <div id="chat-messages" class="chat-messages"></div>
+            <div id="quick-prompts" class="quick-prompts hidden"></div>
+          </div>
+          <div id="tab-quiz" class="tab-pane hidden"></div>
+        </div>
+
+        <!-- Floating Bottom Chat Composer -->
+        <div class="composer-dock">
+          <form id="chat-form" class="composer-pill">
+            <button type="button" id="btn-quick-attach" class="circle-btn soft" title="Adjuntar otra grabación a esta conversación">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+                <line x1="12" y1="5" x2="12" y2="19"/>
+                <line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+            </button>
+            <textarea
+              id="chat-input"
+              rows="1"
+              placeholder="Pregunta sobre tus grabaciones..."
+            ></textarea>
+            <button id="btn-send-chat" type="submit" class="circle-btn dark" title="Enviar pregunta (Enter)">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="12" y1="19" x2="12" y2="5"/>
+                <polyline points="5 12 12 5 19 12"/>
+              </svg>
+            </button>
+          </form>
+        </div>
+      </div>
+    </main>
+
+    <!-- Right Column: Hardware Telemetry + Stats + Recordings & Player -->
+    <aside class="col-right">
+      <!-- Dark Obsidian Telemetry Card -->
+      <section class="obsidian-card telemetry-card">
+        <div class="obsidian-top">
+          <span class="obsidian-label">Recursos locales</span>
+          <span id="model-state-pill" class="mini-status idle">
+            <span class="mini-dot"></span>
+            <span id="model-state-text">En espera</span>
+          </span>
+        </div>
+
+        <div class="telemetry-rows">
+          <div class="tel-row">
+            <span id="gpu-label" class="tel-key">GPU VRAM</span>
+            <span id="vram-text" class="tel-val">-- / -- MB</span>
+          </div>
+          <div class="tel-bar"><div id="vram-bar" class="tel-fill lime"></div></div>
+
+          <div class="tel-row">
+            <span class="tel-key">RAM Sistema</span>
+            <span id="ram-text" class="tel-val">-- / -- GB</span>
+          </div>
+          <div class="tel-bar"><div id="ram-bar" class="tel-fill soft"></div></div>
+
+          <div class="tel-row" id="ctx-row" title="Porcentaje estimado de la ventana de contexto utilizada; si se llena con muchos audios se activa RAG Local protegido automáticamente.">
+            <span class="tel-key">Contexto LLM</span>
+            <span class="tel-val-group">
+              <span id="ctx-badge" class="ctx-badge optimal">Óptimo</span>
+              <span id="ctx-text" class="tel-val">0%</span>
+            </span>
+          </div>
+          <div class="tel-bar"><div id="ctx-bar" class="tel-fill lime"></div></div>
+
+          <div class="tel-row model-row">
+            <span class="tel-key">Modelo chat</span>
+            <span id="active-model-name" class="tel-val mono">Ollama local</span>
+          </div>
+        </div>
+
+        <div class="obsidian-footer">
+          <span id="gpu-temp-text" class="tel-foot-meta">GPU --°C</span>
+          <button id="btn-unload-vram" class="pill-btn dark-muted xs">Liberar VRAM</button>
+        </div>
+      </section>
+
+      <!-- Side-by-Side Stat Tiles -->
+      <div class="stat-tiles">
+        <div class="stat-tile white">
+          <div id="stat-audio-count" class="stat-circle">0</div>
+          <div>
+            <div class="stat-label">Grabaciones</div>
+            <div id="stat-audio-duration" class="stat-sub">00:00 total</div>
+          </div>
+        </div>
+        <div class="stat-tile sage">
+          <div class="stat-label light">Privacidad</div>
+          <div class="stat-big">100% Local</div>
+        </div>
+      </div>
+
+      <!-- Recordings & Custom Player Card -->
+      <section class="card recordings-card">
+        <div class="card-header compact">
+          <div>
+            <h2 class="card-title">Grabaciones</h2>
+            <div class="card-sub">Contexto activo de la sesión</div>
+          </div>
+        </div>
+
+        <div id="recordings-list" class="recordings-list"></div>
+
+        <div id="upload-drop-area" class="drop-mini">
+          Arrastra audios aquí (MP3, WAV, M4A, OGG, FLAC, MP4...)
+        </div>
+
+        <label class="cta-lime-btn" for="audio-file-input">
+          <span>Adjuntar grabaciones</span>
+          <span class="cta-circle" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+              <line x1="12" y1="5" x2="12" y2="19"/>
+              <line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+          </span>
+        </label>
+        <input id="audio-file-input" type="file" multiple accept=".mp3,.wav,.m4a,.ogg,.flac,.webm,.aac,.wma,.mp4,.mkv,.mov,.opus" hidden />
+      </section>
+    </aside>
+  </div>
+
+  <!-- Settings Modal -->
+  <div id="settings-modal" class="modal-backdrop">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>Configuración local y recursos</h2>
+        <button id="btn-close-settings" class="icon-ghost">✕</button>
+      </div>
+      <form id="settings-form" class="modal-body">
+        <div class="field">
+          <div class="field-header-row">
+            <span class="field-label">Modelo de lenguaje (Ollama local)</span>
+            <div class="field-actions-inline">
+              <button type="button" id="btn-refresh-models" class="pill-btn outline xs" title="Volver a escanear modelos instalados en Ollama y Whisper">
+                Actualizar lista
+              </button>
+              <button type="button" id="btn-open-models-guide" class="pill-btn info-lime xs" title="Ver guía para instalar tus propios modelos locales">
+                ¿Cómo instalar modelos?
+              </button>
+            </div>
+          </div>
+          <select id="set-ollama-model"></select>
+          <small>Detecta automáticamente todos los modelos instalados en tu Ollama local.</small>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <span class="field-label">Modelo Whisper (transcripción)</span>
+            <select id="set-whisper-model"></select>
+          </div>
+          <div class="field">
+            <span class="field-label">Dispositivo Whisper</span>
+            <select id="set-whisper-device">
+              <option value="auto">Automático (GPU CUDA con respaldo CPU)</option>
+              <option value="cuda">Solo GPU CUDA</option>
+              <option value="cpu">Solo CPU</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <span class="field-label">Idioma del audio</span>
+            <select id="set-whisper-lang">
+              <option value="auto">Auto-detectar</option>
+              <option value="es">Español</option>
+              <option value="en">Inglés</option>
+              <option value="pt">Portugués</option>
+              <option value="fr">Francés</option>
+              <option value="de">Alemán</option>
+              <option value="it">Italiano</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <span class="field-label">Ventana de contexto (num_ctx)</span>
+            <select id="set-num-ctx">
+              <option value="4096">4096 tokens (bajo uso de VRAM)</option>
+              <option value="8192">8192 tokens (equilibrado)</option>
+              <option value="16384">16384 tokens (clases muy largas)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field">
+          <span class="field-label">Liberar VRAM automáticamente tras inactividad</span>
+          <select id="set-idle-unload">
+            <option value="60">1 minuto</option>
+            <option value="180">3 minutos (recomendado)</option>
+            <option value="300">5 minutos</option>
+            <option value="600">10 minutos</option>
+          </select>
+          <small>Whisper y tu modelo de Ollama se turnan en memoria para nunca saturar la VRAM ni la RAM.</small>
+        </div>
+
+        <div class="toggles-group">
+          <label class="toggle-row">
+            <div class="toggle-copy">
+              <span class="toggle-title">Mejora de audio para clases y ruido</span>
+              <small>Nivela la voz del profesor y reduce eco/murmullos antes de transcribir.</small>
+            </div>
+            <input id="set-classroom-enhance" type="checkbox" class="bento-switch-input" checked />
+            <span class="bento-switch" aria-hidden="true"></span>
+          </label>
+
+          <label class="toggle-row">
+            <div class="toggle-copy">
+              <span class="toggle-title">Razonamiento profundo (Thinking) en chat</span>
+              <small>Permite que el modelo razone paso a paso en preguntas difíciles.</small>
+            </div>
+            <input id="set-enable-thinking" type="checkbox" class="bento-switch-input" />
+            <span class="bento-switch" aria-hidden="true"></span>
+          </label>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" id="btn-cancel-settings" class="pill-btn outline">Cancelar</button>
+          <button type="submit" class="pill-btn dark">Guardar cambios</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Confirmation Modal -->
+  <div id="confirm-modal" class="modal-backdrop">
+    <div class="modal-card compact">
+      <div class="modal-header">
+        <h2 id="confirm-title">Confirmar</h2>
+        <button id="btn-close-confirm" class="icon-ghost">✕</button>
+      </div>
+      <div class="modal-body">
+        <p id="confirm-message" class="confirm-text"></p>
+        <div class="modal-footer">
+          <button type="button" id="btn-confirm-cancel" class="pill-btn outline">Cancelar</button>
+          <button type="button" id="btn-confirm-ok" class="pill-btn danger">Confirmar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Rename Conversation Modal -->
+  <div id="rename-modal" class="modal-backdrop">
+    <div class="modal-card compact">
+      <div class="modal-header">
+        <h2>Renombrar conversación</h2>
+        <button id="btn-close-rename" class="icon-ghost">✕</button>
+      </div>
+      <form id="rename-form" class="modal-body">
+        <label class="field">
+          <span>Nombre de la conversación</span>
+          <input
+            id="rename-input"
+            type="text"
+            class="pill-input"
+            maxlength="120"
+            required
+            placeholder="Ej. Clase de Ética — Repaso"
+            autocomplete="off"
+          />
+        </label>
+        <div class="modal-footer">
+          <button type="button" id="btn-cancel-rename" class="pill-btn outline">Cancelar</button>
+          <button type="submit" id="btn-save-rename" class="pill-btn dark">Guardar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Models Installation Guide Modal -->
+  <div id="models-guide-modal" class="modal-backdrop">
+    <div class="modal-card wide">
+      <div class="modal-header">
+        <h2>Cómo instalar tus propios modelos locales</h2>
+        <button id="btn-close-models-guide" class="icon-ghost">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="guide-section">
+          <h3>1. Modelos de lenguaje (Resumen, Chat y Examen vía Ollama)</h3>
+          <p>TransCrypting detecta automáticamente cualquier modelo que descargues en Ollama. Abre una terminal (PowerShell o CMD) y ejecuta uno según la memoria de tu GPU:</p>
+          <div class="guide-cmd-list">
+            <div class="guide-cmd-row">
+              <div class="guide-cmd-main">
+                <span class="guide-badge">4–6 GB VRAM</span>
+                <code>ollama pull llama3.2:3b</code>
+              </div>
+              <button type="button" class="pill-btn outline xs guide-cmd-copy" data-cmd="ollama pull llama3.2:3b">Copiar</button>
+            </div>
+            <div class="guide-cmd-row">
+              <div class="guide-cmd-main">
+                <span class="guide-badge">8 GB VRAM</span>
+                <code>ollama pull gemma4:e4b</code>
+              </div>
+              <button type="button" class="pill-btn outline xs guide-cmd-copy" data-cmd="ollama pull gemma4:e4b">Copiar</button>
+            </div>
+            <div class="guide-cmd-row">
+              <div class="guide-cmd-main">
+                <span class="guide-badge">8 GB VRAM</span>
+                <code>ollama pull qwen3:8b</code>
+              </div>
+              <button type="button" class="pill-btn outline xs guide-cmd-copy" data-cmd="ollama pull qwen3:8b">Copiar</button>
+            </div>
+            <div class="guide-cmd-row">
+              <div class="guide-cmd-main">
+                <span class="guide-badge">8–12 GB VRAM</span>
+                <code>ollama pull qwen3.5:9b</code>
+              </div>
+              <button type="button" class="pill-btn outline xs guide-cmd-copy" data-cmd="ollama pull qwen3.5:9b">Copiar</button>
+            </div>
+            <div class="guide-cmd-row">
+              <div class="guide-cmd-main">
+                <span class="guide-badge">Verificar</span>
+                <code>ollama list</code>
+              </div>
+              <button type="button" class="pill-btn outline xs guide-cmd-copy" data-cmd="ollama list">Copiar</button>
+            </div>
+          </div>
+          <p>Cuando termine la descarga, vuelve a Configuración y pulsa <strong>Actualizar lista</strong>.</p>
+        </div>
+
+        <div class="guide-section">
+          <h3>2. Modelos de transcripción (Whisper / CTranslate2)</h3>
+          <ul class="guide-list">
+            <li>Los modelos estándar (<span class="guide-path">tiny</span>, <span class="guide-path">base</span>, <span class="guide-path">small</span>, <span class="guide-path">medium</span>, <span class="guide-path">large-v3-turbo</span>, <span class="guide-path">large-v3</span>) se descargan una sola vez en <span class="guide-path">data/models/whisper/</span> la primera vez que los usas.</li>
+            <li>Para usar un modelo Whisper personalizado o fine-tuned en formato <strong>CTranslate2</strong> (con <span class="guide-path">model.bin</span> y <span class="guide-path">config.json</span>), copia su carpeta dentro de <span class="guide-path">data/models/whisper/tu-modelo/</span> y pulsa <strong>Actualizar lista</strong>: aparecerá como <em>Local: tu-modelo</em>.</li>
+          </ul>
+        </div>
+
+        <div class="guide-section">
+          <h3>3. Almacenamiento privado y Git</h3>
+          <p>Tus audios (<span class="guide-path">data/audio/</span>), base de datos (<span class="guide-path">data/transcript.db</span>) y cachés de modelos (<span class="guide-path">data/models/</span>) permanecen 100% en tu equipo y están excluidos en <span class="guide-path">.gitignore</span>.</p>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" id="btn-ok-models-guide" class="pill-btn dark">Entendido</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
