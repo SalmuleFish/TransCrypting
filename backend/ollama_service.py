@@ -18,6 +18,10 @@ from backend.config import OLLAMA_BASE_URL
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+class VisionUnsupportedError(RuntimeError):
+    """Raised when the selected Ollama model does not support multimodal image input."""
+
+
 def _find_ollama_exe() -> str | None:
     found = shutil.which("ollama")
     if found:
@@ -188,7 +192,7 @@ class OllamaService:
     async def stream_chat_events(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         num_ctx: int = 8192,
         keep_alive: str = "180s",
         think: bool = False,
@@ -196,12 +200,13 @@ class OllamaService:
         """Stream ('thinking', text) and ('token', text) tuples from local Ollama /api/chat."""
         await self.ensure_running()
         self._last_model = model
+        has_images = any(bool(m.get("images")) for m in messages)
 
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "stream": True,
-            "think": think,
+            "think": False if has_images else think,
             "options": {
                 "num_ctx": int(num_ctx),
                 "temperature": 0.3,
@@ -212,25 +217,30 @@ class OllamaService:
         timeout = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("POST", f"{self.base_url}/api/chat", json=payload) as resp:
-                if resp.status_code == 400 and "think" in payload:
-                    await resp.aread()
-                    payload.pop("think", None)
-                    async with client.stream(
-                        "POST", f"{self.base_url}/api/chat", json=payload
-                    ) as retry_resp:
-                        retry_resp.raise_for_status()
-                        async for evt in self._iter_chat_events(retry_resp):
-                            yield evt
-                    return
+                if resp.status_code >= 400:
+                    err_body = (await resp.aread()).decode("utf-8", errors="ignore")
+                    if resp.status_code == 400 and "think" in payload and not has_images:
+                        payload.pop("think", None)
+                        async with client.stream(
+                            "POST", f"{self.base_url}/api/chat", json=payload
+                        ) as retry_resp:
+                            retry_resp.raise_for_status()
+                            async for evt in self._iter_chat_events(retry_resp, has_images=has_images):
+                                yield evt
+                        return
+                    if has_images:
+                        raise VisionUnsupportedError(
+                            f"El modelo '{model}' no soporta análisis visual de imágenes ({err_body or resp.status_code})."
+                        )
+                    resp.raise_for_status()
 
-                resp.raise_for_status()
-                async for evt in self._iter_chat_events(resp):
+                async for evt in self._iter_chat_events(resp, has_images=has_images):
                     yield evt
 
     async def stream_chat(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         num_ctx: int = 8192,
         keep_alive: str = "180s",
         think: bool = False,
@@ -246,7 +256,9 @@ class OllamaService:
             if kind == "token" and text:
                 yield text
 
-    async def _iter_chat_events(self, resp: httpx.Response) -> AsyncIterator[tuple[str, str]]:
+    async def _iter_chat_events(
+        self, resp: httpx.Response, has_images: bool = False
+    ) -> AsyncIterator[tuple[str, str]]:
         async for line in resp.aiter_lines():
             if not line:
                 continue
@@ -255,7 +267,10 @@ class OllamaService:
             except json.JSONDecodeError:
                 continue
             if chunk.get("error"):
-                raise RuntimeError(str(chunk["error"]))
+                err_msg = str(chunk["error"])
+                if has_images:
+                    raise VisionUnsupportedError(err_msg)
+                raise RuntimeError(err_msg)
             msg = chunk.get("message") or {}
             thinking = msg.get("thinking") or ""
             if thinking:
@@ -267,21 +282,27 @@ class OllamaService:
     async def generate_complete(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         num_ctx: int = 8192,
         keep_alive: str = "180s",
     ) -> str:
-        """Run chat completion and return the full generated text."""
+        """Run chat completion and return full text, falling back to thinking if content is empty."""
         parts: list[str] = []
-        async for token in self.stream_chat(
+        thinking_parts: list[str] = []
+        async for kind, text in self.stream_chat_events(
             model=model,
             messages=messages,
             num_ctx=num_ctx,
             keep_alive=keep_alive,
             think=False,
         ):
-            parts.append(token)
-        return "".join(parts).strip()
+            if not text:
+                continue
+            if kind == "token":
+                parts.append(text)
+            elif kind == "thinking":
+                thinking_parts.append(text)
+        return "".join(parts).strip() or "".join(thinking_parts).strip()
 
     async def shutdown(self) -> None:
         """Unload active models and stop Ollama if spawned by this app."""

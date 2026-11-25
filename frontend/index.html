@@ -8,60 +8,123 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <div id="app-shell" class="bento-shell">
-    <!-- Left Column: Brand Hero + Conversations -->
-    <aside class="col-left">
-      <section class="hero-card">
-        <div class="hero-top">
-          <div class="hero-brand">
-            <div class="brand-badge" aria-hidden="true">TC</div>
-            <div>
-              <div class="hero-brand-name">TransCrypting</div>
-              <div class="hero-brand-sub">Whisper + Ollama · Local</div>
+  <div id="app-shell" class="studio-shell">
+    <!-- Editorial Studio Top Command Bar -->
+    <header class="studio-topbar">
+      <div class="topbar-left">
+        <button id="btn-toggle-sidebar" type="button" class="circle-btn soft sm" title="Mostrar u ocultar conversaciones">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <rect x="3" y="4" width="18" height="16" rx="3"/>
+            <line x1="9" y1="4" x2="9" y2="20"/>
+          </svg>
+        </button>
+        <div class="topbar-brand">
+          <div class="brand-badge" aria-hidden="true">TC</div>
+          <div class="topbar-brand-copy">
+            <span class="topbar-brand-name">TransCrypting</span>
+            <span class="topbar-brand-sub">Estudio Local</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="topbar-center">
+        <div id="segmented-tabs" class="segmented-tabs" role="tablist">
+          <div id="seg-indicator" class="seg-indicator" aria-hidden="true"></div>
+          <button class="seg-btn active" data-tab="summary" role="tab">Resumen</button>
+          <button class="seg-btn" data-tab="transcript" role="tab">Transcripción</button>
+          <button class="seg-btn" data-tab="chat" role="tab">
+            Chat <span id="chat-badge-count" class="tab-count hidden">0</span>
+          </button>
+          <button class="seg-btn" data-tab="quiz" role="tab">Examen</button>
+          <button class="seg-btn" data-tab="podcast" role="tab">Podcast</button>
+        </div>
+      </div>
+
+      <div class="topbar-right">
+        <div class="telemetry-anchor">
+          <button id="btn-telemetry-popover" type="button" class="telemetry-trigger" title="Ver uso de GPU, RAM, contexto y liberar VRAM">
+            <span id="model-state-pill" class="mini-status idle">
+              <span class="mini-dot"></span>
+              <span id="model-state-text">VRAM libre</span>
+            </span>
+            <span id="topbar-vram-pill" class="topbar-vram-chip">0%</span>
+          </button>
+
+          <div id="telemetry-popover" class="obsidian-card telemetry-popover hidden" role="dialog" aria-label="Recursos locales">
+            <div class="obsidian-top">
+              <span class="obsidian-label">Recursos locales</span>
+              <button id="btn-unload-vram" type="button" class="pill-btn dark-muted xs">Liberar VRAM</button>
+            </div>
+
+            <div class="telemetry-rows">
+              <div class="tel-row">
+                <span id="gpu-label" class="tel-key">GPU VRAM</span>
+                <span id="vram-text" class="tel-val">-- / -- MB</span>
+              </div>
+              <div class="tel-bar"><div id="vram-bar" class="tel-fill lime"></div></div>
+
+              <div class="tel-row">
+                <span class="tel-key">RAM Sistema</span>
+                <span id="ram-text" class="tel-val">-- / -- GB</span>
+              </div>
+              <div class="tel-bar"><div id="ram-bar" class="tel-fill soft"></div></div>
+
+              <div class="tel-row" id="ctx-row" title="Porcentaje estimado de la ventana de contexto utilizada; si se llena con muchos archivos se activa RAG Local protegido automáticamente.">
+                <span class="tel-key">Contexto LLM</span>
+                <span class="tel-val-group">
+                  <span id="ctx-badge" class="ctx-badge optimal">Óptimo</span>
+                  <span id="ctx-text" class="tel-val">0%</span>
+                </span>
+              </div>
+              <div class="tel-bar"><div id="ctx-bar" class="tel-fill lime"></div></div>
+
+              <div class="tel-row model-row">
+                <span class="tel-key">Modelo activo</span>
+                <span id="active-model-name" class="tel-val mono">Ollama local</span>
+              </div>
+            </div>
+
+            <div class="obsidian-footer">
+              <span id="gpu-temp-text" class="tel-foot-meta">GPU --°C</span>
+              <span class="tel-foot-meta">100% Privado</span>
             </div>
           </div>
-          <div class="hero-actions">
-            <button id="btn-toggle-theme" class="circle-btn light" title="Cambiar entre modo claro y modo oscuro grafito">
-              <svg id="theme-icon-moon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-              </svg>
-              <svg id="theme-icon-sun" class="hidden" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="5"/>
-                <line x1="12" y1="1" x2="12" y2="3"/>
-                <line x1="12" y1="21" x2="12" y2="23"/>
-                <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
-                <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
-                <line x1="1" y1="12" x2="3" y2="12"/>
-                <line x1="21" y1="12" x2="23" y2="12"/>
-                <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
-                <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
-              </svg>
-            </button>
-            <button id="btn-hero-unload" class="circle-btn light" title="Liberar VRAM y RAM ahora">
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
-              </svg>
-            </button>
-            <button id="btn-open-settings" class="circle-btn light" title="Configuración de modelos y memoria">
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="3"/>
-                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-              </svg>
-            </button>
-          </div>
         </div>
 
-        <div id="hero-status-title" class="hero-title">Listo para analizar</div>
+        <button id="btn-toggle-theme" type="button" class="circle-btn soft sm" title="Cambiar entre modo claro y modo oscuro grafito">
+          <svg id="theme-icon-moon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+          <svg id="theme-icon-sun" class="hidden" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="5"/>
+            <line x1="12" y1="1" x2="12" y2="3"/>
+            <line x1="12" y1="21" x2="12" y2="23"/>
+            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+            <line x1="1" y1="12" x2="3" y2="12"/>
+            <line x1="21" y1="12" x2="23" y2="12"/>
+            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+          </svg>
+        </button>
 
-        <div class="hero-progress-wrap">
-          <div class="hero-progress-track">
-            <div id="hero-progress-fill" class="hero-progress-fill"></div>
-          </div>
-          <div id="hero-substatus" class="hero-sub">Sin modelos activos · 100% local</div>
-        </div>
-      </section>
+        <button id="btn-open-settings" type="button" class="circle-btn soft sm" title="Configuración de modelos y memoria">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
 
-      <section class="card conversations-card">
+        <button id="btn-toggle-sources" type="button" class="pill-btn outline sm topbar-sources-btn" title="Mostrar u ocultar panel de Fuentes y audios">
+          <span>Fuentes</span>
+          <span id="stat-audio-count" class="tab-count">0</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Studio Body: Collapsible Conversations Rail + Wide Canvas + Compact Sources Shelf -->
+    <div id="studio-body" class="studio-body">
+      <aside id="sidebar-left" class="studio-sidebar-left card conversations-card">
         <div class="card-header">
           <h2 class="card-title">Conversaciones</h2>
           <button id="btn-new-session" class="circle-btn dark" title="Nueva conversación">
@@ -81,199 +144,122 @@
         </div>
 
         <div id="session-list" class="session-list"></div>
-      </section>
-    </aside>
+      </aside>
 
-    <!-- Center Column: Main Workspace (Summary / Transcript / Chat) -->
-    <main class="col-center card workspace-card">
-      <div id="empty-session-state" class="empty-state hidden">
-        <div class="empty-card">
-          <div class="empty-pill">100% Local · Sin nube</div>
-          <h1>Bienvenido a TransCrypting</h1>
-          <p>Crea una conversación o arrastra una grabación para transcribirla con Whisper y analizarla con tu modelo local de Ollama de forma privada.</p>
-          <button id="btn-empty-new" class="pill-btn dark lg">+ Crear primera conversación</button>
+      <main class="studio-main card workspace-card">
+        <div id="empty-session-state" class="empty-state hidden">
+          <div class="empty-card">
+            <div class="empty-pill">100% Local · Sin nube</div>
+            <h1>Bienvenido a TransCrypting</h1>
+            <p>Crea una conversación o arrastra grabaciones, PDFs, diapositivas, apuntes o imágenes para indexarlos localmente y estudiarlos con privacidad total.</p>
+            <button id="btn-empty-new" class="pill-btn dark lg">+ Crear primera conversación</button>
+          </div>
         </div>
-      </div>
 
-      <div id="active-session-view" class="session-view hidden">
-        <!-- Workspace Header -->
-        <header class="ws-header">
-          <div class="ws-title-block">
-            <div class="ws-title-row">
-              <h1 id="session-title" class="ws-title">Conversación</h1>
-              <button id="btn-rename-session" class="icon-ghost" title="Renombrar conversación">
-                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 20h9"/>
-                  <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+        <div id="active-session-view" class="session-view hidden">
+          <header class="ws-header">
+            <div class="ws-title-block">
+              <div class="ws-title-row">
+                <h1 id="session-title" class="ws-title">Conversación</h1>
+                <button id="btn-rename-session" class="icon-ghost" title="Renombrar conversación">
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 20h9"/>
+                    <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+                  </svg>
+                </button>
+              </div>
+              <div class="ws-status-line">
+                <span class="lime-dot"></span>
+                <span id="session-subtitle">Sin fuentes listas aún</span>
+              </div>
+            </div>
+
+            <div class="ws-actions">
+              <div id="actions-summary" class="action-group">
+                <button id="btn-resummarize" class="pill-btn outline sm" title="Regenerar resumen general con el modelo actual">
+                  Regenerar
+                </button>
+                <button id="btn-export-md" class="pill-btn outline sm" title="Exportar resumen, transcripción y chat a Markdown">
+                  Exportar .md
+                </button>
+              </div>
+
+              <div id="actions-transcript" class="action-group hidden">
+                <input id="transcript-search" type="search" class="pill-search compact" placeholder="Buscar en transcripción..." />
+                <button id="btn-copy-transcript" class="pill-btn outline sm">Copiar todo</button>
+              </div>
+
+              <div id="actions-chat" class="action-group hidden">
+                <button
+                  id="btn-clear-chat"
+                  class="pill-btn danger-soft sm"
+                  title="Elimina solo los mensajes del chat; conserva tus audios, transcripciones y resúmenes"
+                >
+                  Borrar historial
+                </button>
+              </div>
+
+              <div id="actions-quiz" class="action-group hidden">
+                <button id="btn-reset-quiz" class="pill-btn outline sm hidden">
+                  Nuevo examen
+                </button>
+              </div>
+
+              <div id="actions-podcast" class="action-group hidden"></div>
+            </div>
+          </header>
+
+          <div id="center-scroll" class="ws-scroll">
+            <div id="tab-summary" class="tab-pane"></div>
+            <div id="tab-transcript" class="tab-pane hidden"></div>
+            <div id="tab-chat" class="tab-pane hidden">
+              <div id="chat-messages" class="chat-messages"></div>
+              <div id="quick-prompts" class="quick-prompts hidden"></div>
+            </div>
+            <div id="tab-quiz" class="tab-pane hidden"></div>
+            <div id="tab-podcast" class="tab-pane hidden"></div>
+          </div>
+
+          <div id="composer-dock" class="composer-dock hidden">
+            <form id="chat-form" class="composer-pill">
+              <button type="button" id="btn-quick-attach" class="circle-btn soft" title="Adjuntar otra fuente o audio a esta conversación">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+                  <line x1="12" y1="5" x2="12" y2="19"/>
+                  <line x1="5" y1="12" x2="19" y2="12"/>
                 </svg>
               </button>
-            </div>
-            <div class="ws-status-line">
-              <span class="lime-dot"></span>
-              <span id="session-subtitle">Sin grabaciones listas aún</span>
-            </div>
-          </div>
-
-          <div class="ws-actions">
-            <div id="actions-summary" class="action-group">
-              <button id="btn-resummarize" class="pill-btn outline sm" title="Regenerar resúmenes con el modelo actual">
-                Regenerar
+              <textarea
+                id="chat-input"
+                rows="1"
+                placeholder="Pregunta sobre tus fuentes activas..."
+              ></textarea>
+              <button id="btn-send-chat" type="submit" class="circle-btn dark" title="Enviar pregunta (Enter)">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="12" y1="19" x2="12" y2="5"/>
+                  <polyline points="5 12 12 5 19 12"/>
+                </svg>
               </button>
-              <button id="btn-export-md" class="pill-btn outline sm" title="Exportar resumen, transcripción y chat a Markdown">
-                Exportar .md
-              </button>
-            </div>
-
-            <div id="actions-transcript" class="action-group hidden">
-              <input id="transcript-search" type="search" class="pill-search compact" placeholder="Buscar en texto..." />
-              <button id="btn-copy-transcript" class="pill-btn outline sm">Copiar todo</button>
-            </div>
-
-            <div id="actions-chat" class="action-group hidden">
-              <button
-                id="btn-clear-chat"
-                class="pill-btn danger-soft sm"
-                title="Elimina solo los mensajes del chat; conserva tus audios, transcripciones y resúmenes"
-              >
-                Borrar historial
-              </button>
-            </div>
-
-            <div id="actions-quiz" class="action-group hidden">
-              <button id="btn-reset-quiz" class="pill-btn outline sm hidden">
-                Nuevo examen
-              </button>
-            </div>
-          </div>
-        </header>
-
-        <!-- Segmented Tab Control -->
-        <div class="ws-tabs-row">
-          <div id="segmented-tabs" class="segmented-tabs" role="tablist">
-            <div id="seg-indicator" class="seg-indicator" aria-hidden="true"></div>
-            <button class="seg-btn active" data-tab="summary" role="tab">Resumen</button>
-            <button class="seg-btn" data-tab="transcript" role="tab">Transcripción</button>
-            <button class="seg-btn" data-tab="chat" role="tab">
-              Chat <span id="chat-badge-count" class="tab-count hidden">0</span>
-            </button>
-            <button class="seg-btn" data-tab="quiz" role="tab">Examen</button>
+            </form>
           </div>
         </div>
+      </main>
 
-        <!-- Main Scrollable Content -->
-        <div id="center-scroll" class="ws-scroll">
-          <div id="tab-summary" class="tab-pane"></div>
-          <div id="tab-transcript" class="tab-pane hidden"></div>
-          <div id="tab-chat" class="tab-pane hidden">
-            <div id="chat-messages" class="chat-messages"></div>
-            <div id="quick-prompts" class="quick-prompts hidden"></div>
-          </div>
-          <div id="tab-quiz" class="tab-pane hidden"></div>
-        </div>
-
-        <!-- Floating Bottom Chat Composer -->
-        <div class="composer-dock">
-          <form id="chat-form" class="composer-pill">
-            <button type="button" id="btn-quick-attach" class="circle-btn soft" title="Adjuntar otra grabación a esta conversación">
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
-                <line x1="12" y1="5" x2="12" y2="19"/>
-                <line x1="5" y1="12" x2="19" y2="12"/>
-              </svg>
-            </button>
-            <textarea
-              id="chat-input"
-              rows="1"
-              placeholder="Pregunta sobre tus grabaciones..."
-            ></textarea>
-            <button id="btn-send-chat" type="submit" class="circle-btn dark" title="Enviar pregunta (Enter)">
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-                <line x1="12" y1="19" x2="12" y2="5"/>
-                <polyline points="5 12 12 5 19 12"/>
-              </svg>
-            </button>
-          </form>
-        </div>
-      </div>
-    </main>
-
-    <!-- Right Column: Hardware Telemetry + Stats + Recordings & Player -->
-    <aside class="col-right">
-      <!-- Dark Obsidian Telemetry Card -->
-      <section class="obsidian-card telemetry-card">
-        <div class="obsidian-top">
-          <span class="obsidian-label">Recursos locales</span>
-          <span id="model-state-pill" class="mini-status idle">
-            <span class="mini-dot"></span>
-            <span id="model-state-text">En espera</span>
-          </span>
-        </div>
-
-        <div class="telemetry-rows">
-          <div class="tel-row">
-            <span id="gpu-label" class="tel-key">GPU VRAM</span>
-            <span id="vram-text" class="tel-val">-- / -- MB</span>
-          </div>
-          <div class="tel-bar"><div id="vram-bar" class="tel-fill lime"></div></div>
-
-          <div class="tel-row">
-            <span class="tel-key">RAM Sistema</span>
-            <span id="ram-text" class="tel-val">-- / -- GB</span>
-          </div>
-          <div class="tel-bar"><div id="ram-bar" class="tel-fill soft"></div></div>
-
-          <div class="tel-row" id="ctx-row" title="Porcentaje estimado de la ventana de contexto utilizada; si se llena con muchos audios se activa RAG Local protegido automáticamente.">
-            <span class="tel-key">Contexto LLM</span>
-            <span class="tel-val-group">
-              <span id="ctx-badge" class="ctx-badge optimal">Óptimo</span>
-              <span id="ctx-text" class="tel-val">0%</span>
-            </span>
-          </div>
-          <div class="tel-bar"><div id="ctx-bar" class="tel-fill lime"></div></div>
-
-          <div class="tel-row model-row">
-            <span class="tel-key">Modelo chat</span>
-            <span id="active-model-name" class="tel-val mono">Ollama local</span>
-          </div>
-        </div>
-
-        <div class="obsidian-footer">
-          <span id="gpu-temp-text" class="tel-foot-meta">GPU --°C</span>
-          <button id="btn-unload-vram" class="pill-btn dark-muted xs">Liberar VRAM</button>
-        </div>
-      </section>
-
-      <!-- Side-by-Side Stat Tiles -->
-      <div class="stat-tiles">
-        <div class="stat-tile white">
-          <div id="stat-audio-count" class="stat-circle">0</div>
-          <div>
-            <div class="stat-label">Grabaciones</div>
-            <div id="stat-audio-duration" class="stat-sub">00:00 total</div>
-          </div>
-        </div>
-        <div class="stat-tile sage">
-          <div class="stat-label light">Privacidad</div>
-          <div class="stat-big">100% Local</div>
-        </div>
-      </div>
-
-      <!-- Recordings & Custom Player Card -->
-      <section class="card recordings-card">
+      <aside id="sidebar-right" class="studio-sidebar-right card recordings-card">
         <div class="card-header compact">
           <div>
-            <h2 class="card-title">Grabaciones</h2>
-            <div class="card-sub">Contexto activo de la sesión</div>
+            <h2 class="card-title">Fuentes</h2>
+            <div id="stat-audio-duration" class="card-sub">0 activas</div>
           </div>
         </div>
 
         <div id="recordings-list" class="recordings-list"></div>
 
         <div id="upload-drop-area" class="drop-mini">
-          Arrastra audios aquí (MP3, WAV, M4A, OGG, FLAC, MP4...)
+          Arrastra audios, PDFs, diapositivas o imágenes aquí
         </div>
 
         <label class="cta-lime-btn" for="audio-file-input">
-          <span>Adjuntar grabaciones</span>
+          <span>Adjuntar fuentes</span>
           <span class="cta-circle" aria-hidden="true">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
               <line x1="12" y1="5" x2="12" y2="19"/>
@@ -281,9 +267,9 @@
             </svg>
           </span>
         </label>
-        <input id="audio-file-input" type="file" multiple accept=".mp3,.wav,.m4a,.ogg,.flac,.webm,.aac,.wma,.mp4,.mkv,.mov,.opus" hidden />
-      </section>
-    </aside>
+        <input id="audio-file-input" type="file" multiple accept=".mp3,.wav,.m4a,.ogg,.flac,.webm,.aac,.wma,.mp4,.mkv,.mov,.opus,.pdf,.pptx,.docx,.txt,.md,.png,.jpg,.jpeg,.webp,.bmp" hidden />
+      </aside>
+    </div>
   </div>
 
   <!-- Settings Modal -->
@@ -493,12 +479,38 @@
         </div>
 
         <div class="guide-section">
-          <h3>3. Almacenamiento privado y Git</h3>
-          <p>Tus audios (<span class="guide-path">data/audio/</span>), base de datos (<span class="guide-path">data/transcript.db</span>) y cachés de modelos (<span class="guide-path">data/models/</span>) permanecen 100% en tu equipo y están excluidos en <span class="guide-path">.gitignore</span>.</p>
+          <h3>3. Voces neuronales locales para Podcast (Kokoro-82M ONNX)</h3>
+          <ul class="guide-list">
+            <li>Podcast Studio usa por defecto <strong>Kokoro-82M ONNX</strong> 100% en tu equipo. En la primera síntesis descarga una sola vez <span class="guide-path">kokoro-v1.0.onnx</span> y <span class="guide-path">voices-v1.0.bin</span> en <span class="guide-path">data/models/tts/kokoro/</span>.</li>
+            <li>Tus audios (<span class="guide-path">data/audio/</span>), documentos (<span class="guide-path">data/sources/</span>), podcasts (<span class="guide-path">data/podcasts/</span>), base de datos (<span class="guide-path">data/transcript.db</span>) y modelos (<span class="guide-path">data/models/</span>) permanecen privados en tu PC y están excluidos en <span class="guide-path">.gitignore</span>.</li>
+          </ul>
         </div>
 
         <div class="modal-footer">
           <button type="button" id="btn-ok-models-guide" class="pill-btn dark">Entendido</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Source Preview Modal -->
+  <div id="source-viewer-modal" class="modal-backdrop">
+    <div class="modal-card wide">
+      <div class="modal-header">
+        <div class="source-viewer-head-title">
+          <h2 id="source-viewer-title">Vista de fuente</h2>
+          <span id="source-viewer-meta" class="card-badge">Documento</span>
+        </div>
+        <button id="btn-close-source-viewer" class="icon-ghost">✕</button>
+      </div>
+      <div class="modal-body source-viewer-modal-body">
+        <div id="source-viewer-image-wrap" class="source-viewer-img-box hidden">
+          <img id="source-viewer-img" alt="Vista previa de fuente visual" />
+        </div>
+        <div id="source-viewer-pages" class="source-viewer-pages-bar hidden"></div>
+        <div id="source-viewer-text" class="source-viewer-body md"></div>
+        <div class="modal-footer">
+          <button type="button" id="btn-ok-source-viewer" class="pill-btn dark">Cerrar</button>
         </div>
       </div>
     </div>

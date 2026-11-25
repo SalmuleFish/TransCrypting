@@ -376,10 +376,45 @@ def test_quiz_parsers_and_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     with TestClient(app_module.app) as client:
         g_resp = client.post(
             f"/api/sessions/{s['id']}/quiz/generate",
-            json={"num_questions": 2, "mode": "mixed"},
+            json={
+                "num_questions": 2,
+                "mode": "mixed",
+                "difficulty": "hard",
+                "question_style": "practical",
+                "focus_prompt": "fair test",
+                "include_hints": True,
+            },
         )
         assert g_resp.status_code == 200
         assert len(g_resp.json()["questions"]) == 2
+        assert g_resp.json()["config"]["difficulty"] == "hard"
+        assert g_resp.json()["config"]["question_style"] == "practical"
+
+        tf_parsed = parse_quiz_json(
+            '[{"type": "true_false", "question": "El examen tiene 30 preguntas.", "correct_answer": true, "hint": "Mencionado al minuto 5.", "timestamp": "05:01"}]',
+            mode="true_false",
+        )
+        assert len(tf_parsed) == 1
+        assert tf_parsed[0]["type"] == "true_false"
+        assert tf_parsed[0]["options"] == ["Verdadero", "Falso"]
+        assert tf_parsed[0]["correct_index"] == 0
+        assert "minuto 5" in tf_parsed[0]["hint"]
+
+        from backend.context_manager import build_quiz_generation_messages
+
+        msgs_custom = build_quiz_generation_messages(
+            recordings=[test_db.get_recording(rec["id"])],  # type: ignore[list-item]
+            num_questions=4,
+            mode="true_false",
+            difficulty="hard",
+            question_style="tricky",
+            focus_prompt="regla del fair test",
+            include_hints=True,
+        )
+        assert "DIFÍCIL" in msgs_custom[1]["content"]
+        assert "TRAMPAS DE EXAMEN" in msgs_custom[1]["content"]
+        assert "regla del fair test" in msgs_custom[1]["content"]
+        assert "true_false" in msgs_custom[1]["content"]
 
         gr_resp = client.post(
             f"/api/sessions/{s['id']}/quiz/grade",
@@ -485,3 +520,460 @@ def test_windows_icon_and_taskbar_properties() -> None:
         assert run_module._set_windows_taskbar_properties(hwnd, icon_path) is True
     finally:
         form.Dispose()
+
+
+def test_fts5_persistent_index_and_source_enable_toggle(tmp_path: Path) -> None:
+    test_db = Database(
+        db_path=tmp_path / "fts.db",
+        audio_dir=tmp_path / "audio",
+        sources_dir=tmp_path / "sources",
+    )
+    test_db.init_db()
+    session = test_db.create_session("Arquitectura de Computadoras")
+    sid = session["id"]
+
+    rec = test_db.create_recording(sid, "clase_intro.m4a", "intro.m4a", "intro.m4a")
+    test_db.update_recording_transcript(
+        rec["id"],
+        "Hoy hablamos sobre registros del procesador y ALU.",
+        [{"start": 12.0, "end": 20.0, "text": "Hoy hablamos sobre registros del procesador y ALU."}],
+        "es",
+        25.0,
+        "small",
+    )
+    test_db.update_recording_summary(rec["id"], "Resumen de registros.")
+
+    # Legacy ready recording without chunks should be lazily indexed
+    test_db.ensure_recording_chunks_indexed(sid)
+    assert test_db.count_session_chunks(sid, enabled_only=True) == 1
+
+    src = test_db.create_source(sid, "apuntes_cache.pdf", "pdf", "apuntes.pdf", "application/pdf", 2048)
+    pages = [
+        {"locator": "p. 1", "label": "Página 1", "text": "La arquitectura Von Neumann utiliza memoria compartida."},
+        {"locator": "p. 2", "label": "Página 2", "text": "La memoria caché L1 aprovecha la localidad temporal para reducir latencia."},
+    ]
+    test_db.update_source_content(src["id"], "\n\n".join(p["text"] for p in pages), pages, page_count=2)
+    test_db.replace_item_chunks(
+        sid,
+        "source",
+        src["id"],
+        "apuntes_cache.pdf",
+        "pdf",
+        [{"locator": p["locator"], "content": p["text"]} for p in pages],
+    )
+    test_db.update_source_summary(src["id"], "Resumen sobre caché L1.")
+
+    hits = test_db.search_session_chunks(sid, "¿Cómo reduce latencia la caché L1?", limit=5, enabled_only=True)
+    assert len(hits) >= 1
+    assert hits[0]["filename"] == "apuntes_cache.pdf"
+    assert hits[0]["locator"] == "p. 2"
+
+    # Toggle source disabled -> excluded from enabled-only FTS search and chunk count
+    test_db.set_source_enabled(src["id"], False)
+    assert test_db.count_session_chunks(sid, enabled_only=True) == 1
+    hits_disabled = test_db.search_session_chunks(sid, "caché L1 localidad temporal", limit=5, enabled_only=True)
+    assert all(h["item_id"] != src["id"] for h in hits_disabled)
+
+    # Toggle back enabled -> returns cleanly
+    test_db.set_source_enabled(src["id"], True)
+    assert test_db.count_session_chunks(sid, enabled_only=True) == 3
+
+    # Deleting session cascades source_chunks + triggers cleanly without errors
+    assert test_db.delete_session(sid) is True
+    assert test_db.count_session_chunks(sid, enabled_only=False) == 0
+    test_db.close()
+
+
+def test_document_and_image_extraction_and_chunking(tmp_path: Path) -> None:
+    import base64
+    from PIL import Image
+    from docx import Document
+    from pptx import Presentation
+    from pypdf import PdfWriter
+
+    from backend.source_service import (
+        chunk_pages,
+        detect_source_type,
+        extract_document_pages,
+        prepare_image_base64,
+    )
+
+    assert detect_source_type("tema1.pdf") == "pdf"
+    assert detect_source_type("slides.PPTX") == "pptx"
+    assert detect_source_type("notas.docx") == "docx"
+    assert detect_source_type("apuntes.md") == "text"
+    assert detect_source_type("pizarron.PNG") == "image"
+
+    # TXT / MD
+    txt_file = tmp_path / "notas.txt"
+    txt_file.write_text("Primer bloque de apuntes.\n\nSegundo bloque sobre recursividad.", encoding="utf-8")
+    txt_pages = extract_document_pages(txt_file, "text")
+    assert txt_pages and txt_pages[0]["locator"] == "sec. 1"
+    assert "recursividad" in txt_pages[0]["text"]
+    assert chunk_pages(txt_pages)
+
+    # DOCX
+    docx_file = tmp_path / "guia.docx"
+    doc = Document()
+    doc.add_paragraph("Guía de estudio para programación orientada a objetos.")
+    table = doc.add_table(rows=1, cols=2)
+    table.rows[0].cells[0].text = "Polimorfismo"
+    table.rows[0].cells[1].text = "Múltiples formas de un método"
+    doc.save(str(docx_file))
+    docx_pages = extract_document_pages(docx_file, "docx")
+    assert "programación orientada a objetos" in docx_pages[0]["text"]
+    assert "Polimorfismo" in docx_pages[0]["text"]
+
+    # PPTX
+    pptx_file = tmp_path / "clase.pptx"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[1])
+    slide.shapes.title.text = "Complejidad Algorítmica"
+    slide.placeholders[1].text = "Búsqueda binaria O(log n)"
+    slide.notes_slide.notes_text_frame.text = "Insistir en precondición de arreglo ordenado."
+    prs.save(str(pptx_file))
+    pptx_pages = extract_document_pages(pptx_file, "pptx")
+    assert len(pptx_pages) == 1
+    assert pptx_pages[0]["locator"] == "diap. 1"
+    assert "Complejidad Algorítmica" in pptx_pages[0]["text"]
+    assert "arreglo ordenado" in pptx_pages[0]["text"]
+
+    # PDF structure
+    pdf_file = tmp_path / "vacio.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    with pdf_file.open("wb") as fh:
+        writer.write(fh)
+    pdf_pages = extract_document_pages(pdf_file, "pdf")
+    assert len(pdf_pages) == 1
+    assert pdf_pages[0]["locator"] == "p. 1"
+
+    # Image base64 resize + JPEG encoding
+    img_file = tmp_path / "diagrama.png"
+    Image.new("RGBA", (2200, 1200), color=(20, 40, 60, 255)).save(img_file)
+    b64 = prepare_image_base64(img_file, max_dim=1024)
+    decoded = base64.b64decode(b64)
+    assert decoded[:2] == b"\xff\xd8"  # JPEG header
+
+
+def test_sources_api_endpoints_and_document_only_chat_quiz(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_db = Database(
+        db_path=tmp_path / "sources_api.db",
+        audio_dir=tmp_path / "audio",
+        sources_dir=tmp_path / "sources",
+    )
+    test_db.init_db()
+
+    monkeypatch.setattr(app_module, "db", test_db)
+    monkeypatch.setattr("backend.resource_manager.db", test_db)
+    monkeypatch.setattr(app_module, "AUDIO_DIR", tmp_path / "audio")
+    monkeypatch.setattr(app_module, "SOURCES_DIR", tmp_path / "sources")
+    monkeypatch.setattr(app_module.pipeline, "enqueue", lambda _id: None)
+    monkeypatch.setattr(app_module.pipeline, "enqueue_source", lambda _id: None)
+    monkeypatch.setattr(app_module.pipeline, "start", lambda: None)
+    monkeypatch.setattr(app_module.resource_manager, "start_idle_watchdog", lambda: None)
+    monkeypatch.setattr(app_module.ollama_service, "shutdown", AsyncMock())
+    monkeypatch.setattr(
+        app_module.ollama_service,
+        "resolve_default_model",
+        AsyncMock(return_value="gemma4:e4b"),
+    )
+
+    quiz_payload = (
+        '[{"id": 1, "type": "mcq", "question": "¿Qué protocolo usa el servidor?", '
+        '"options": ["FTP", "HTTP local", "SMTP", "IRC"], "correct_index": 1, '
+        '"explanation": "Funciona sobre HTTP local.", "timestamp": "apuntes.md · sec. 1"}]'
+    )
+    monkeypatch.setattr(
+        app_module.resource_manager,
+        "summarize_exclusive",
+        AsyncMock(return_value=quiz_payload),
+    )
+
+    async def fake_chat_events(*_args, **_kwargs):
+        yield ("token", "El documento indica HTTP local [apuntes.md · sec. 1].")
+
+    monkeypatch.setattr(app_module.resource_manager, "chat_events_exclusive", fake_chat_events)
+
+    with TestClient(app_module.app) as client:
+        sid = client.post("/api/sessions", json={"title": "Cuaderno PDF"}).json()["id"]
+
+        up = client.post(
+            f"/api/sessions/{sid}/sources",
+            files=[("files", ("apuntes.md", b"# Redes\nEl servidor opera sobre HTTP local en 127.0.0.1.", "text/markdown"))],
+        )
+        assert up.status_code == 200
+        src_id = up.json()[0]["id"]
+
+        # Simulate completed extraction & FTS5 indexing
+        test_db.update_source_content(
+            src_id,
+            "El servidor opera sobre HTTP local en 127.0.0.1.",
+            [{"locator": "sec. 1", "label": "Sección 1", "text": "El servidor opera sobre HTTP local en 127.0.0.1."}],
+            page_count=1,
+        )
+        test_db.replace_item_chunks(
+            sid,
+            "source",
+            src_id,
+            "apuntes.md",
+            "text",
+            [{"locator": "sec. 1", "content": "El servidor opera sobre HTTP local en 127.0.0.1."}],
+        )
+        test_db.update_source_summary(src_id, "### Resumen\nOpera en HTTP local.")
+
+        # Serve stored source file
+        file_resp = client.get(f"/api/sources/{src_id}/file")
+        assert file_resp.status_code == 200
+        assert b"HTTP local" in file_resp.content
+
+        # Search persistent FTS5 index
+        srch = client.get(f"/api/sessions/{sid}/search", params={"q": "HTTP local"})
+        assert srch.status_code == 200
+        assert len(srch.json()["results"]) == 1
+
+        # Chat works with ONLY document sources (0 audios)
+        chat_resp = client.post(
+            f"/api/sessions/{sid}/chat",
+            json={"question": "¿Sobre qué protocolo opera?"},
+        )
+        assert chat_resp.status_code == 200
+        assert "HTTP local" in chat_resp.text
+
+        # Quiz works with ONLY document sources (0 audios)
+        quiz_resp = client.post(
+            f"/api/sessions/{sid}/quiz/generate",
+            json={"num_questions": 2, "mode": "mcq"},
+        )
+        assert quiz_resp.status_code == 200
+        assert quiz_resp.json()["questions"][0]["timestamp"] == "apuntes.md · sec. 1"
+
+        # Disable source -> chat rejects cleanly since 0 active sources remain
+        toggled = client.patch(f"/api/sessions/{sid}/sources/{src_id}", json={"enabled": False})
+        assert toggled.status_code == 200
+        assert toggled.json()["sources"][0]["enabled"] is False
+
+        chat_disabled = client.post(
+            f"/api/sessions/{sid}/chat",
+            json={"question": "¿Hola?"},
+        )
+        assert chat_disabled.status_code == 400
+
+        # Re-enable source -> export includes Fuentes documentales e imágenes
+        client.patch(f"/api/sessions/{sid}/sources/{src_id}", json={"enabled": True})
+        exp = client.get(f"/api/sessions/{sid}/export")
+        assert exp.status_code == 200
+        assert "Fuentes documentales e imágenes" in exp.text
+        assert "apuntes.md" in exp.text
+
+        # Delete source cleans DB and file
+        del_resp = client.delete(f"/api/sessions/{sid}/sources/{src_id}")
+        assert del_resp.status_code == 200
+        assert client.get(f"/api/sessions/{sid}").json()["sources"] == []
+
+    test_db.close()
+
+
+def test_podcast_script_parser_and_tts_sanitizer() -> None:
+    from backend.podcast_service import (
+        build_podcast_script_messages,
+        parse_podcast_script_json,
+        sanitize_text_for_tts,
+    )
+
+    cleaned = sanitize_text_for_tts(
+        "### **Concepto clave** [04:12] revisar `fair test` en [tema.pdf · p. 3]!"
+    )
+    assert "[04:12]" not in cleaned
+    assert "tema.pdf" not in cleaned
+    assert "**" not in cleaned and "#" not in cleaned
+    assert "Concepto clave" in cleaned
+    assert "fair test" in cleaned
+
+    raw_json = """```json
+    [
+      {"speaker": "A", "name": "Sofía", "text": "Hoy repasamos **la caché L1** [02:10]."},
+      {"speaker": "B", "name": "Mateo", "text": "Exacto, aprovecha la localidad temporal [tema.pdf · p. 2]."}
+    ]
+    ```"""
+    turns = parse_podcast_script_json(raw_json, language="es")
+    assert len(turns) == 2
+    assert turns[0]["speaker"] == "A" and turns[0]["name"] == "Sofía"
+    assert "**" not in turns[0]["text"] and "[02:10]" not in turns[0]["text"]
+    assert turns[1]["speaker"] == "B" and "[tema.pdf" not in turns[1]["text"]
+
+    # Wrapper object JSON + line format + markdown bold + broken JSON + prose fallback
+    wrapped_turns = parse_podcast_script_json(
+        '{"dialogue": [{"host": "Sofía", "line": "Bienvenidos."}, {"host": "Mateo", "line": "Empezamos."}]}',
+        language="es",
+    )
+    assert [t["speaker"] for t in wrapped_turns] == ["A", "B"]
+
+    line_turns = parse_podcast_script_json(
+        "SOFIA: Hola, hoy analizamos redes neuronales.\nMATEO: Y veremos cómo funcionan en la práctica.",
+        language="es",
+    )
+    assert len(line_turns) == 2
+    assert line_turns[0]["name"] == "Sofía" and line_turns[1]["name"] == "Mateo"
+
+    md_turns = parse_podcast_script_json(
+        "1. **Claire:** Welcome back to the study brief!\n2. **Ryan**: Today we connect lecture slides and notes.",
+        language="en",
+    )
+    assert len(md_turns) == 2
+    assert md_turns[0]["name"] == "Claire" and md_turns[1]["name"] == "Ryan"
+
+    broken_json_turns = parse_podcast_script_json(
+        '[{"speaker": "A", "text": "Primer punto clave."}, {"speaker": "B", "text": "Segundo punto sin cierre',
+        language="es",
+    )
+    assert len(broken_json_turns) == 2
+
+    prose_turns = parse_podcast_script_json(
+        "Primero explicamos la memoria caché de primer nivel y su latencia.\n\nDespués comparamos cómo afecta al rendimiento real.",
+        language="es",
+    )
+    assert [t["speaker"] for t in prose_turns] == ["A", "B"]
+
+    msgs = build_podcast_script_messages(
+        recordings=[],
+        sources=[{"filename": "tema.pdf", "extracted_text": "La localidad temporal acelera la caché."}],
+        focus_prompt="Enfóquense en la caché L1",
+        style="exam_review",
+        length="short",
+        language="es",
+    )
+    assert "Enfóquense en la caché L1" in msgs[1]["content"]
+    assert "localidad temporal" in msgs[1]["content"]
+    assert "SOFIA:" in msgs[1]["content"] and "MATEO:" in msgs[1]["content"]
+
+
+def test_podcast_db_crud_and_exclusive_409_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_db = Database(
+        db_path=tmp_path / "pod.db",
+        audio_dir=tmp_path / "audio",
+        sources_dir=tmp_path / "sources",
+        podcasts_dir=tmp_path / "podcasts",
+    )
+    test_db.init_db()
+    s = test_db.create_session("Curso Sistemas")
+    src = test_db.create_source(s["id"], "guia.txt", "text", str(tmp_path / "guia.txt"))
+    test_db.update_source_content(src["id"], "Contenido de prueba.", [], page_count=1)
+    test_db.update_source_summary(src["id"], "Resumen breve.")
+
+    pod_wav = tmp_path / "podcasts" / s["id"] / "ep1.wav"
+    pod_wav.parent.mkdir(parents=True, exist_ok=True)
+    pod_wav.write_bytes(b"RIFFdemo")
+
+    pod = test_db.create_podcast(
+        session_id=s["id"],
+        title="Episodio Repaso",
+        focus_prompt="Conceptos clave",
+        style="conversation",
+        length="short",
+        language="es",
+        source_refs=["guia.txt"],
+        podcast_id="ep1",
+    )
+    assert pod["status"] == "queued"
+    test_db.update_podcast_script("ep1", [{"speaker": "A", "name": "Sofía", "text": "Hola."}])
+    test_db.update_podcast_ready("ep1", str(pod_wav), 12.5, "piper-onnx")
+
+    detail = test_db.get_session_detail(s["id"])
+    assert detail is not None and len(detail["podcasts"]) == 1
+    assert detail["podcasts"][0]["status"] == "ready"
+    assert detail["podcasts"][0]["tts_engine"] == "piper-onnx"
+
+    monkeypatch.setattr(app_module, "db", test_db)
+    monkeypatch.setattr("backend.resource_manager.db", test_db)
+    monkeypatch.setattr(app_module.pipeline, "start", lambda: None)
+    monkeypatch.setattr(app_module.resource_manager, "start_idle_watchdog", lambda: None)
+    monkeypatch.setattr(app_module.ollama_service, "shutdown", AsyncMock())
+    monkeypatch.setattr(app_module.resource_manager, "podcast_active", True)
+
+    with TestClient(app_module.app) as client:
+        # While podcast is active, other AI endpoints return 409 Conflict
+        assert client.post(f"/api/sessions/{s['id']}/chat", json={"question": "Hola"}).status_code == 409
+        assert client.post(f"/api/sessions/{s['id']}/quiz/generate", json={}).status_code == 409
+        assert client.post(f"/api/sessions/{s['id']}/podcasts", json={}).status_code == 409
+
+        monkeypatch.setattr(app_module.resource_manager, "podcast_active", False)
+        audio_resp = client.get("/api/podcasts/ep1/audio")
+        assert audio_resp.status_code == 200
+        assert audio_resp.content == b"RIFFdemo"
+
+        del_resp = client.delete(f"/api/sessions/{s['id']}/podcasts/ep1")
+        assert del_resp.status_code == 200
+        assert not pod_wav.exists()
+
+        # Cancellation endpoint triggers cancel_event + task.cancel() cleanly
+        import threading
+
+        pod2 = test_db.create_podcast(
+            session_id=s["id"],
+            title="Cancelable Podcast",
+            focus_prompt="",
+            style="conversation",
+            length="short",
+            language="es",
+            source_refs=["guia.txt"],
+            podcast_id="ep_cancel",
+        )
+        ev = threading.Event()
+
+        class DummyTask:
+            def __init__(self) -> None:
+                self.cancelled = False
+
+            def cancel(self) -> None:
+                self.cancelled = True
+
+        dummy_task = DummyTask()
+        app_module._podcast_jobs[pod2["id"]] = (dummy_task, ev)  # type: ignore[assignment]
+        cancel_resp = client.post(f"/api/sessions/{s['id']}/podcasts/{pod2['id']}/cancel")
+        assert cancel_resp.status_code == 200
+        assert cancel_resp.json()["cancelled"] is True
+        assert ev.is_set() and dummy_task.cancelled
+        app_module._podcast_jobs.pop(pod2["id"], None)
+
+    test_db.close()
+
+
+def test_kokoro_presets_and_podcast_cancellation_signal(tmp_path: Path) -> None:
+    import threading
+    from backend.config import KOKORO_VOICE_PRESETS
+    from backend.podcast_service import PodcastCancelledError, synthesize_podcast_audio
+
+    assert KOKORO_VOICE_PRESETS["es"]["A"]["voice"] == "ef_dora"
+    assert KOKORO_VOICE_PRESETS["es"]["B"]["voice"] == "em_alex"
+    assert KOKORO_VOICE_PRESETS["en"]["A"]["voice"] == "af_heart"
+
+    ev = threading.Event()
+    ev.set()
+    with pytest.raises(PodcastCancelledError):
+        synthesize_podcast_audio(
+            turns=[{"speaker": "A", "name": "Sofía", "text": "Hola"}],
+            output_path=tmp_path / "out.wav",
+            language="es",
+            models_dir=tmp_path / "tts",
+            cancel_event=ev,
+        )
+
+
+def test_ollama_generate_complete_falls_back_to_thinking() -> None:
+    import asyncio
+    from backend.ollama_service import OllamaService
+
+    svc = OllamaService()
+
+    async def fake_stream_events(**_kwargs):
+        yield ("thinking", "SOFIA: Hola.\nMATEO: Empezamos.")
+
+    svc.stream_chat_events = fake_stream_events  # type: ignore[method-assign]
+    out = asyncio.run(svc.generate_complete("demo-model", [{"role": "user", "content": "hi"}]))
+    assert "SOFIA: Hola." in out
+    assert "MATEO: Empezamos." in out

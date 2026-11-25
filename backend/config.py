@@ -5,7 +5,11 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audio"
+SOURCES_DIR = DATA_DIR / "sources"
+PODCASTS_DIR = DATA_DIR / "podcasts"
 MODELS_DIR = DATA_DIR / "models" / "whisper"
+TTS_MODELS_DIR = DATA_DIR / "models" / "tts"
+KOKORO_MODELS_DIR = TTS_MODELS_DIR / "kokoro"
 DB_PATH = DATA_DIR / "transcript.db"
 FRONTEND_DIR = BASE_DIR / "frontend"
 
@@ -98,9 +102,74 @@ HTML5_PLAYABLE_EXTENSIONS = {
     ".opus",
 }
 
+SUPPORTED_DOCUMENT_EXTENSIONS = {
+    ".pdf",
+    ".txt",
+    ".md",
+    ".pptx",
+    ".docx",
+}
+
+SUPPORTED_IMAGE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+}
+
+SUPPORTED_SOURCE_EXTENSIONS = SUPPORTED_DOCUMENT_EXTENSIONS | SUPPORTED_IMAGE_EXTENSIONS
+
+PODCAST_VOICE_PRESETS = {
+    "es": {
+        "A": {
+            "name": "Sofía",
+            "key": "es_MX-claude-high",
+            "rel_path": "es/es_MX/claude/high/es_MX-claude-high",
+        },
+        "B": {
+            "name": "Mateo",
+            "key": "es_MX-ald-medium",
+            "rel_path": "es/es_MX/ald/medium/es_MX-ald-medium",
+        },
+    },
+    "en": {
+        "A": {
+            "name": "Claire",
+            "key": "en_US-amy-medium",
+            "rel_path": "en/en_US/amy/medium/en_US-amy-medium",
+        },
+        "B": {
+            "name": "Ryan",
+            "key": "en_US-ryan-medium",
+            "rel_path": "en/en_US/ryan/medium/en_US-ryan-medium",
+        },
+    },
+}
+
 
 def ensure_directories() -> None:
     """Create local data directories if they do not exist."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    SOURCES_DIR.mkdir(parents=True, exist_ok=True)
+    PODCASTS_DIR.mkdir(parents=True, exist_ok=True)
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    TTS_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+KOKORO_MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
+KOKORO_VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
+
+KOKORO_VOICE_PRESETS = {
+    "es": {
+        "lang": "es",
+        "A": {"name": "Sofía", "voice": "ef_dora", "speed": 1.02},
+        "B": {"name": "Mateo", "voice": "em_alex", "speed": 1.0},
+    },
+    "en": {
+        "lang": "en-us",
+        "A": {"name": "Claire", "voice": "af_heart", "speed": 1.02},
+        "B": {"name": "Ryan", "voice": "am_michael", "speed": 1.0},
+    },
+}

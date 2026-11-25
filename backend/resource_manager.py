@@ -23,14 +23,21 @@ class ResourceManager:
 
     def __init__(self) -> None:
         self._gpu_lock = asyncio.Lock()
-        self.phase: str = "idle"  # idle | unloading | whisper | llm
+        self.phase: str = "idle"  # idle | unloading | whisper | llm | podcast
         self.active_model: str = ""
         self.active_device: str = ""
+        self.podcast_active: bool = False
+        self.podcast_id: str = ""
+        self.podcast_stage: str = ""
+        self.podcast_progress: float = 0.0
         self.last_activity_ts: float = time.monotonic()
         self._watchdog_task: asyncio.Task[None] | None = None
 
     def touch_activity(self) -> None:
         self.last_activity_ts = time.monotonic()
+
+    def is_podcast_busy(self) -> bool:
+        return bool(self.podcast_active)
 
     def get_state(self) -> dict[str, Any]:
         return {
@@ -39,6 +46,10 @@ class ResourceManager:
             "active_device": self.active_device,
             "whisper_loaded": whisper_service.is_loaded,
             "idle_seconds": int(max(0.0, time.monotonic() - self.last_activity_ts)),
+            "podcast_active": self.podcast_active,
+            "podcast_id": self.podcast_id,
+            "podcast_stage": self.podcast_stage,
+            "podcast_progress": self.podcast_progress,
         }
 
     async def transcribe_exclusive(
@@ -83,7 +94,7 @@ class ResourceManager:
 
     async def summarize_exclusive(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         model_name: str,
         num_ctx: int,
         idle_unload_sec: int,
@@ -114,7 +125,7 @@ class ResourceManager:
 
     async def chat_events_exclusive(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         model_name: str,
         num_ctx: int,
         idle_unload_sec: int,
@@ -149,7 +160,7 @@ class ResourceManager:
 
     async def chat_stream_exclusive(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         model_name: str,
         num_ctx: int,
         idle_unload_sec: int,
@@ -164,6 +175,80 @@ class ResourceManager:
         ):
             if kind == "token" and text:
                 yield text
+
+    async def run_podcast_exclusive(
+        self,
+        podcast_id: str,
+        script_coro_factory: Callable[[], Any],
+        synth_fn: Callable[[Any], Any],
+        on_stage: Callable[[str, float, str], None] | None = None,
+        cancel_event: Any = None,
+    ) -> Any:
+        """
+        Run Podcast Studio in strict exclusive mode:
+        1. Acquire GPU/RAM lock and unload Whisper.
+        2. Generate script with Ollama LLM.
+        3. Completely unload Ollama from VRAM/RAM + gc.collect().
+        4. Run local TTS synthesis cleanly with free resources, then unload.
+        """
+        self.podcast_active = True
+        self.podcast_id = podcast_id
+        self.podcast_stage = "Esperando turno exclusivo..."
+        self.podcast_progress = 0.05
+        if on_stage:
+            on_stage("queued", 0.05, self.podcast_stage)
+
+        async with self._gpu_lock:
+            try:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise asyncio.CancelledError()
+                self.phase = "podcast"
+                self.active_model = "Podcast Studio · Guion LLM"
+                self.active_device = "exclusivo"
+                whisper_service.unload()
+
+                self.podcast_stage = "Escribiendo guion de podcast con modelo local..."
+                self.podcast_progress = 0.15
+                if on_stage:
+                    on_stage("scripting", 0.15, self.podcast_stage)
+
+                script_turns = await script_coro_factory()
+                if cancel_event is not None and cancel_event.is_set():
+                    raise asyncio.CancelledError()
+
+                self.podcast_stage = "Liberando VRAM de Ollama antes de cargar voces..."
+                self.podcast_progress = 0.38
+                if on_stage:
+                    on_stage("synthesizing", 0.38, self.podcast_stage)
+
+                await ollama_service.unload_all()
+                gc.collect()
+                if cancel_event is not None and cancel_event.is_set():
+                    raise asyncio.CancelledError()
+
+                self.active_model = "Podcast Studio · Voces Kokoro-82M"
+                self.active_device = "local/cpu"
+                self.podcast_stage = "Sintetizando voces locales (Kokoro-82M)..."
+                self.podcast_progress = 0.45
+
+                result = await asyncio.to_thread(synth_fn, script_turns)
+                self.touch_activity()
+                return result
+            finally:
+                if cancel_event is not None and cancel_event.is_set():
+                    try:
+                        await ollama_service.unload_all()
+                    except Exception:
+                        pass
+                whisper_service.unload()
+                gc.collect()
+                self.podcast_active = False
+                self.podcast_id = ""
+                self.podcast_stage = ""
+                self.podcast_progress = 0.0
+                self.phase = "idle"
+                self.active_model = ""
+                self.active_device = ""
 
     async def unload_everything(self) -> None:
         """Force immediate unloading of all AI models from VRAM and RAM."""

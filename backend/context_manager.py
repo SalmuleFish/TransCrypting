@@ -210,6 +210,132 @@ def _bm25_select_chunks(
     return [chunks[i] for i in selected_indices]
 
 
+def _chunk_source(src: dict[str, Any], chunk_chars: int = 1100) -> list[dict[str, Any]]:
+    """Split an indexed document/image source into located chunks for BM25 fallback."""
+    filename = src.get("filename", "fuente")
+    pages = src.get("pages") or []
+    chunks: list[dict[str, Any]] = []
+    if pages:
+        for page in pages:
+            loc = (page.get("locator") or "").strip() or "p. 1"
+            txt = (page.get("text") or "").strip()
+            if not txt:
+                continue
+            for idx in range(0, len(txt), chunk_chars):
+                piece = txt[idx : idx + chunk_chars].strip()
+                if piece:
+                    chunks.append({"filename": filename, "start_ts": loc, "text": piece})
+        if chunks:
+            return chunks
+
+    raw = (src.get("extracted_text") or "").strip()
+    if not raw:
+        return []
+    loc = filename if src.get("source_type") == "image" else "sec. 1"
+    for idx in range(0, len(raw), chunk_chars):
+        piece = raw[idx : idx + chunk_chars].strip()
+        if piece:
+            chunks.append({"filename": filename, "start_ts": loc, "text": piece})
+    return chunks
+
+
+def _format_source_for_llm(src: dict[str, Any]) -> str:
+    pages = src.get("pages") or []
+    if pages:
+        blocks = []
+        for p in pages:
+            loc = (p.get("locator") or "").strip()
+            txt = (p.get("text") or "").strip()
+            if txt:
+                blocks.append(f"[{loc}]\n{txt}" if loc else txt)
+        if blocks:
+            return "\n\n".join(blocks)
+    return (src.get("extracted_text") or "").strip()
+
+
+def _format_indexed_chunk_header(chunk: dict[str, Any]) -> str:
+    filename = chunk.get("filename") or "fuente"
+    locator = (chunk.get("locator") or "").strip()
+    if chunk.get("item_kind") == "recording":
+        return f"[{filename} @ {locator or '00:00'}]"
+    if locator:
+        return f"[{filename} · {locator}]"
+    return f"[{filename}]"
+
+
+def _select_chunks_within_budget(
+    chunks: list[dict[str, Any]],
+    max_chars: int,
+    max_chunks: int | None = None,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    used = 0
+    for c in chunks:
+        text = c.get("content") or c.get("text") or ""
+        if not text:
+            continue
+        est = len(text) + 70
+        if max_chunks is not None and len(selected) >= max_chunks:
+            break
+        if used + est > max_chars and selected:
+            break
+        selected.append(c)
+        used += est
+    return selected
+
+
+def build_source_summary_messages(
+    filename: str,
+    source_type: str,
+    extracted_text: str,
+    page_count: int = 0,
+    max_input_chars: int = 18000,
+) -> list[dict[str, str]]:
+    """Build prompt messages to summarize a single document or indexed image source."""
+    clean_text = (extracted_text or "").strip()
+    truncated_note = ""
+    if len(clean_text) > max_input_chars:
+        half = max_input_chars // 2
+        clean_text = (
+            clean_text[:half]
+            + "\n\n[... contenido intermedio resumido por límite de ventana de contexto ...]\n\n"
+            + clean_text[-half:]
+        )
+        truncated_note = "Nota: el documento es extenso y fue condensado a sus secciones principales.\n"
+
+    type_labels = {
+        "pdf": "Documento PDF",
+        "pptx": "Presentación / Diapositivas",
+        "docx": "Documento Word",
+        "text": "Texto / Apuntes",
+        "image": "Imagen analizada",
+    }
+    kind_label = type_labels.get((source_type or "").lower(), "Fuente documental")
+    meta_detail = f"{page_count} página(s)/sección(es)" if page_count else "contenido único"
+
+    system_prompt = (
+        "Eres un asistente experto en analizar documentos de estudio, presentaciones, apuntes e imágenes. "
+        "Responde siempre en español claro y estructurado. "
+        "Basa tu resumen EXCLUSIVAMENTE en el texto extraído proporcionado; cita ubicaciones como [p. X] o [diap. X] cuando aparezcan."
+    )
+    user_prompt = (
+        f"Fuente: {filename} ({kind_label}, {meta_detail})\n"
+        f"{truncated_note}\n"
+        "Genera un resumen útil y bien organizado en Markdown:\n"
+        "### Resumen general\n"
+        "Párrafo breve explicando el tema y propósito de esta fuente.\n\n"
+        "### Puntos clave y conceptos\n"
+        "- Lista con definiciones, fórmulas, fechas o ideas centrales citando su página o diapositiva cuando aplique.\n\n"
+        "### Datos o indicaciones destacadas (si aplica)\n"
+        "- Lista breve de conclusiones, tareas o detalles importantes (omite si no aplica).\n\n"
+        f"Contenido extraído:\n\"\"\"\n{clean_text}\n\"\"\""
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
 def build_recording_summary_messages(
     filename: str,
     transcript_text: str,
@@ -255,10 +381,13 @@ def build_recording_summary_messages(
 
 def build_combined_summary_messages(
     recordings: list[dict[str, Any]],
+    sources: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
-    """Build prompt messages to synthesize multiple recording summaries in one conversation."""
+    """Build prompt messages to synthesize multiple enabled recordings and sources in one conversation."""
+    active_recs = [r for r in recordings if r.get("enabled", True) and (r.get("summary_text") or r.get("transcript_text"))]
+    active_srcs = [s for s in (sources or []) if s.get("enabled", True) and (s.get("summary_text") or s.get("extracted_text"))]
     parts = []
-    for idx, rec in enumerate(recordings, start=1):
+    for idx, rec in enumerate(active_recs, start=1):
         duration_str = format_timestamp(float(rec.get("duration_sec") or 0.0))
         summary = (rec.get("summary_text") or "").strip()
         if not summary:
@@ -267,20 +396,31 @@ def build_combined_summary_messages(
             f"=== Grabación {idx}: {rec['filename']} (duración {duration_str}) ===\n{summary}"
         )
 
+    for idx, src in enumerate(active_srcs, start=1):
+        summary = (src.get("summary_text") or "").strip()
+        if not summary:
+            summary = (src.get("extracted_text") or "")[:2000].strip()
+        kind = str(src.get("source_type") or "documento").upper()
+        parts.append(
+            f"=== Fuente {idx} ({kind}): {src['filename']} ===\n{summary}"
+        )
+
+    total_items = len(active_recs) + len(active_srcs)
     joined = "\n\n".join(parts)
     system_prompt = (
-        "Eres un asistente experto en sintetizar múltiples grabaciones de una misma conversación. "
-        "Responde en español, integrando la información de todos los audios sin inventar datos."
+        "Eres un asistente experto en sintetizar múltiples fuentes de estudio (grabaciones, PDFs, diapositivas e imágenes) de una misma conversación. "
+        "Responde en español, integrando la información de todas las fuentes activas sin inventar datos."
     )
     user_prompt = (
-        f"Esta conversación contiene {len(recordings)} grabaciones. "
+        f"Esta conversación contiene {total_items} fuente(s) activa(s) "
+        f"({len(active_recs)} grabación(es) y {len(active_srcs)} documento(s)/imagen(es)). "
         "Crea un resumen unificado en Markdown que conecte toda la información:\n"
         "### Síntesis global\n"
-        "Panorama general considerando todas las grabaciones.\n\n"
-        "### Qué aporta cada grabación y cambios/novedades\n"
-        "- Menciona explícitamente los puntos clave o actualizaciones por archivo.\n\n"
-        "### Conclusiones y pendientes consolidados\n"
-        "- Lista final de acuerdos, decisiones o pendientes vigentes.\n\n"
+        "Panorama general considerando todas las fuentes activas.\n\n"
+        "### Qué aporta cada fuente y cómo se complementan\n"
+        "- Menciona explícitamente los puntos clave o aportes por archivo.\n\n"
+        "### Conclusiones y puntos clave consolidados\n"
+        "- Lista final de conceptos esenciales, acuerdos o pendientes vigentes.\n\n"
         f"Resúmenes individuales:\n{joined}"
     )
     return [
@@ -295,14 +435,23 @@ def build_chat_messages(
     chat_history: list[dict[str, Any]],
     user_question: str,
     num_ctx: int = 8192,
+    sources: list[dict[str, Any]] | None = None,
+    indexed_chunks: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, str]], str]:
     """
-    Build LLM messages for contextual Q&A across all ready recordings in the session.
+    Build LLM messages for contextual Q&A across all enabled recordings & sources.
 
-    Uses paragraph grouping and hybrid BM25 spotlighting when transcripts are medium/long
-    so compact 4B models do not miss details buried in the middle of a class recording.
+    Uses full text when it safely fits num_ctx, and switches automatically to
+    indexed SQLite FTS5 / BM25 retrieval when total sources exceed budget.
     """
-    ready_recs = [r for r in recordings if r.get("status") == "ready" and r.get("transcript_text")]
+    ready_recs = [
+        r for r in recordings
+        if r.get("status") == "ready" and r.get("enabled", True) and r.get("transcript_text")
+    ]
+    ready_srcs = [
+        s for s in (sources or [])
+        if s.get("status") == "ready" and s.get("enabled", True) and s.get("extracted_text")
+    ]
 
     transcript_char_budget = max(4500, int(num_ctx * 2.2))
     history_char_budget = max(2000, int(num_ctx * 0.8))
@@ -321,6 +470,17 @@ def build_chat_messages(
         total_full_chars += len(block)
         all_chunks.extend(_chunk_recording(rec))
 
+    for idx, src in enumerate(ready_srcs, start=1):
+        src_kind = str(src.get("source_type") or "documento").upper()
+        src_text = _format_source_for_llm(src)
+        block = (
+            f"=== Fuente {idx} ({src_kind}): {src['filename']} ===\n"
+            f"{src_text}"
+        )
+        formatted_full_blocks.append(block)
+        total_full_chars += len(block)
+        all_chunks.extend(_chunk_source(src))
+
     recent_user_turns = " ".join(
         m["content"] for m in chat_history[-4:] if m.get("role") == "user"
     )
@@ -329,22 +489,31 @@ def build_chat_messages(
     if total_full_chars <= transcript_char_budget:
         context_mode = "full"
         full_text = "\n\n".join(formatted_full_blocks)
-        if total_full_chars > 3500 and all_chunks:
-            spotlight = _bm25_select_chunks(
-                all_chunks,
-                search_query,
-                max_chars=2600,
-                max_chunks=5,
-            )
-            if spotlight:
+        if total_full_chars > 3500:
+            if indexed_chunks:
+                picked = _select_chunks_within_budget(indexed_chunks, max_chars=2600, max_chunks=5)
+                spotlight_text = "\n\n".join(
+                    f"{_format_indexed_chunk_header(c)}\n{c['content']}" for c in picked
+                )
+            elif all_chunks:
+                spotlight = _bm25_select_chunks(
+                    all_chunks,
+                    search_query,
+                    max_chars=2600,
+                    max_chunks=5,
+                )
                 spotlight_text = "\n\n".join(
                     f"[{c['filename']} @ {c['start_ts']}]\n{c['text']}"
                     for c in spotlight
                 )
+            else:
+                spotlight_text = ""
+
+            if spotlight_text:
                 context_body = (
                     "FRAGMENTOS MÁS RELEVANTES DETECTADOS PARA ESTA PREGUNTA:\n"
                     f"{spotlight_text}\n\n"
-                    "TRANSCRIPCIÓN COMPLETA:\n"
+                    "CONTENIDO COMPLETO DE LAS FUENTES ACTIVAS:\n"
                     f"{full_text}"
                 )
             else:
@@ -357,12 +526,14 @@ def build_chat_messages(
         for idx, rec in enumerate(ready_recs, start=1):
             summary = (rec.get("summary_text") or "").strip()
             summary_blocks.append(f"- Grabación {idx} ({rec['filename']}): {summary}")
+        for idx, src in enumerate(ready_srcs, start=1):
+            summary = (src.get("summary_text") or "").strip()
+            summary_blocks.append(f"- Fuente {idx} ({src['filename']}): {summary}")
 
-        summaries_text = "RESÚMENES DE LAS GRABACIONES:\n" + "\n".join(summary_blocks)
+        summaries_text = "RESÚMENES DE LAS FUENTES ACTIVAS:\n" + "\n".join(summary_blocks)
         if combined_summary.strip():
             summaries_text += f"\n\nRESUMEN INTEGRADO:\n{combined_summary.strip()}"
 
-        # Hard cap summaries to 35% of budget so BM25 transcript excerpts always have room
         max_summary_chars = max(1600, int(transcript_char_budget * 0.35))
         if len(summaries_text) > max_summary_chars:
             summaries_text = (
@@ -371,29 +542,37 @@ def build_chat_messages(
             )
 
         remaining_budget = max(2500, transcript_char_budget - len(summaries_text))
-        selected_chunks = _bm25_select_chunks(all_chunks, search_query, remaining_budget)
+        if indexed_chunks:
+            selected = _select_chunks_within_budget(indexed_chunks, max_chars=remaining_budget)
+            chunk_blocks = [
+                f"{_format_indexed_chunk_header(c)}\n{c['content']}" for c in selected
+            ]
+        else:
+            selected_chunks = _bm25_select_chunks(all_chunks, search_query, remaining_budget)
+            chunk_blocks = [
+                f"[{c['filename']} @ {c['start_ts']}]\n{c['text']}"
+                for c in selected_chunks
+            ]
 
-        chunk_blocks = [
-            f"[{c['filename']} @ {c['start_ts']}]\n{c['text']}"
-            for c in selected_chunks
-        ]
         context_body = (
             f"{summaries_text}\n\n"
-            "FRAGMENTOS RELEVANTES DE LAS TRANSCRIPCIONES:\n"
+            "FRAGMENTOS MÁS RELEVANTES DEL ÍNDICE LOCAL:\n"
             + "\n\n".join(chunk_blocks)
         )
 
+    total_sources = len(ready_recs) + len(ready_srcs)
     system_prompt = (
-        "Eres TransCrypting, un asistente local que responde preguntas sobre grabaciones de audio y clases.\n"
+        "Eres TransCrypting, un asistente local estilo cuaderno de investigación que responde preguntas sobre grabaciones, PDFs, diapositivas, apuntes e imágenes.\n"
         "Reglas estrictas:\n"
         "1. Responde siempre en español claro y directo.\n"
-        "2. Las transcripciones provienen de audio real (por ejemplo clases con ruido de fondo, "
-        "voces superpuestas o mezcla de español e inglés). Revisa todo el texto buscando también "
-        "equivalencias fonéticas o conceptuales antes de concluir que algo no aparece.\n"
-        "3. Basa tus respuestas ÚNICAMENTE en el contexto de las grabaciones proporcionadas abajo.\n"
-        "4. Cita el archivo y la marca de tiempo [MM:SS] cuando sea útil.\n"
+        "2. Si hay transcripciones de audio real (clases con ruido o mezcla español/inglés), busca equivalencias fonéticas o conceptuales antes de descartar un dato.\n"
+        "3. Basa tus respuestas ÚNICAMENTE en las fuentes activas proporcionadas abajo.\n"
+        "4. Cita siempre de forma precisa usando estos formatos exactos entre corchetes:\n"
+        "   - Para audios: [MM:SS]\n"
+        "   - Para documentos/diapositivas: [nombre_archivo.pdf · p. 4] o [presentacion.pptx · diap. 2]\n"
+        "   - Para imágenes: [nombre_imagen.png]\n"
         "5. Si tras revisar todo el contexto el dato realmente no aparece, dilo claramente sin inventar.\n\n"
-        f"CONTEXTO DE LA CONVERSACIÓN ({len(ready_recs)} grabación(es)):\n"
+        f"FUENTES ACTIVAS DE LA CONVERSACIÓN ({total_sources} total: {len(ready_recs)} audio(s), {len(ready_srcs)} documento(s)/imagen(es)):\n"
         f"{context_body}"
     )
 
@@ -421,22 +600,31 @@ def estimate_session_context_usage(
     combined_summary: str,
     messages: list[dict[str, Any]],
     num_ctx: int = 8192,
+    sources: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Estimate current token usage vs num_ctx and report protection mode."""
-    ready_recs = [r for r in recordings if r.get("status") == "ready" and r.get("transcript_text")]
+    """Estimate current token usage vs num_ctx across active recordings and sources."""
+    ready_recs = [
+        r for r in recordings
+        if r.get("status") == "ready" and r.get("enabled", True) and r.get("transcript_text")
+    ]
+    ready_srcs = [
+        s for s in (sources or [])
+        if s.get("status") == "ready" and s.get("enabled", True) and s.get("extracted_text")
+    ]
     transcript_char_budget = max(4500, int(num_ctx * 2.2))
 
     transcript_chars = sum(len(format_transcript_for_llm(r)) + 80 for r in ready_recs)
+    source_chars = sum(len(_format_source_for_llm(s)) + 80 for s in ready_srcs)
+    total_source_chars = transcript_chars + source_chars
     chat_chars = sum(len(m.get("content") or "") for m in messages[-12:])
 
-    if transcript_chars <= transcript_char_budget:
+    if total_source_chars <= transcript_char_budget:
         mode = "full"
-        used_transcript_chars = transcript_chars
-        if transcript_chars > 3500:
-            used_transcript_chars += min(2600, transcript_chars // 2)
+        used_transcript_chars = total_source_chars
+        if total_source_chars > 3500:
+            used_transcript_chars += min(2600, total_source_chars // 2)
     else:
         mode = "retrieval"
-        # Protected mode caps injected context inside transcript_char_budget
         used_transcript_chars = transcript_char_budget
 
     system_overhead_tokens = 260
@@ -463,36 +651,50 @@ def estimate_session_context_usage(
         "health": health,
         "transcript_tokens": transcript_tokens,
         "chat_tokens": chat_tokens,
+        "active_recording_count": len(ready_recs),
+        "active_source_count": len(ready_srcs),
     }
 
 
 def build_suggestions_messages(
     recordings: list[dict[str, Any]],
     combined_summary: str = "",
+    sources: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
-    """Build prompt asking Gemma 4 for 3 tailored follow-up suggestions based on audio content."""
-    ready_recs = [r for r in recordings if r.get("status") == "ready"]
+    """Build prompt asking the local LLM for 3 tailored follow-up suggestions across active sources."""
+    ready_recs = [
+        r for r in recordings if r.get("status") == "ready" and r.get("enabled", True)
+    ]
+    ready_srcs = [
+        s for s in (sources or []) if s.get("status") == "ready" and s.get("enabled", True)
+    ]
     snippets: list[str] = []
     if combined_summary.strip():
         snippets.append(f"Resumen integrado:\n{combined_summary.strip()[:1800]}")
-    for idx, rec in enumerate(ready_recs[:4], start=1):
-        summary = (rec.get("summary_text") or "").strip()[:1200]
-        sample = (rec.get("transcript_text") or "").strip()[:900]
+    for idx, rec in enumerate(ready_recs[:3], start=1):
+        summary = (rec.get("summary_text") or "").strip()[:1000]
+        sample = (rec.get("transcript_text") or "").strip()[:700]
         snippets.append(
             f"Grabación {idx} ({rec.get('filename', 'audio')}):\n"
+            f"Resumen: {summary}\nMuestra: {sample}"
+        )
+    for idx, src in enumerate(ready_srcs[:3], start=1):
+        summary = (src.get("summary_text") or "").strip()[:1000]
+        sample = (src.get("extracted_text") or "").strip()[:700]
+        snippets.append(
+            f"Fuente {idx} ({src.get('filename', 'documento')} · {src.get('source_type', 'doc')}):\n"
             f"Resumen: {summary}\nMuestra: {sample}"
         )
 
     context = "\n\n".join(snippets)
     system_prompt = (
-        "Eres un asistente que sugiere preguntas útiles según el tipo de grabación "
-        "(clase escolar, examen, entrevista, reunión, conferencia, etc.). "
+        "Eres un asistente que sugiere preguntas útiles según las fuentes de estudio cargadas "
+        "(clases en audio, PDFs, diapositivas, apuntes o imágenes). "
         "Responde ÚNICAMENTE con un arreglo JSON válido de 3 objetos, sin texto adicional."
     )
     user_prompt = (
-        "Basándote en esta grabación, crea 3 sugerencias cortas y específicas para el usuario.\n"
-        "- Si es una clase o repaso de examen: incluye opciones como evaluar al estudiante con preguntas tipo examen, explicar conceptos difíciles de la clase, o listar temas/fechas clave.\n"
-        "- Si es una reunión o charla: incluye acuerdos, tareas o detalles específicos mencionados.\n"
+        "Basándote en estas fuentes activas, crea 3 sugerencias cortas y específicas para el usuario.\n"
+        "- Si son apuntes, clases o PDFs de estudio: incluye opciones como evaluar al estudiante con preguntas tipo examen, explicar conceptos difíciles o cruzar ideas entre fuentes.\n"
         "- Cada objeto debe tener exactamente: \"label\" (máximo 4 palabras) y \"prompt\" (pregunta directa en español).\n"
         "- Formato exacto: [{\"label\": \"...\", \"prompt\": \"...\"}, ...]\n\n"
         f"{context}"
@@ -551,8 +753,13 @@ def parse_suggestions_json(
 
 
 def _extract_timestamp(raw_ts: Any) -> str:
-    m = re.search(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b", str(raw_ts or ""))
-    return m.group(1) if m else ""
+    raw = str(raw_ts or "").strip()
+    if not raw or raw.upper() == "N/A":
+        return ""
+    m = re.search(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b", raw)
+    if m:
+        return m.group(1)
+    return raw.strip("[]")[:80]
 
 
 def build_quiz_generation_messages(
@@ -561,9 +768,22 @@ def build_quiz_generation_messages(
     num_questions: int = 5,
     mode: str = "mixed",
     num_ctx: int = 8192,
+    sources: list[dict[str, Any]] | None = None,
+    indexed_chunks: list[dict[str, Any]] | None = None,
+    difficulty: str = "medium",
+    question_style: str = "conceptual",
+    focus_prompt: str = "",
+    include_hints: bool = True,
 ) -> list[dict[str, str]]:
-    """Build prompt asking Gemma 4 / Ollama for structured multiple-choice & open study questions."""
-    ready_recs = [r for r in recordings if r.get("status") == "ready" and r.get("transcript_text")]
+    """Build prompt asking the local LLM for structured customizable study questions."""
+    ready_recs = [
+        r for r in recordings
+        if r.get("status") == "ready" and r.get("transcript_text")
+    ]
+    ready_srcs = [
+        s for s in (sources or [])
+        if s.get("status") == "ready" and s.get("extracted_text")
+    ]
     budget = max(4500, int(num_ctx * 1.9))
 
     full_blocks = []
@@ -573,46 +793,93 @@ def build_quiz_generation_messages(
         full_blocks.append(block)
         total_chars += len(block)
 
+    for idx, src in enumerate(ready_srcs, start=1):
+        kind = str(src.get("source_type") or "documento").upper()
+        block = f"=== Fuente {idx} ({kind}): {src['filename']} ===\n{_format_source_for_llm(src)}"
+        full_blocks.append(block)
+        total_chars += len(block)
+
     if total_chars <= budget:
         context = "\n\n".join(full_blocks)
     else:
         parts = []
         if combined_summary.strip():
             parts.append(f"Resumen integrado:\n{combined_summary.strip()[:2200]}")
-        per_rec = max(1200, (budget - 2200) // max(1, len(ready_recs)))
-        for idx, rec in enumerate(ready_recs, start=1):
-            text = format_transcript_for_llm(rec)
-            if len(text) > per_rec:
-                half = per_rec // 2
-                text = text[:half] + "\n[...]\n" + text[-half:]
-            parts.append(f"=== Grabación {idx}: {rec['filename']} ===\n{text}")
+        if indexed_chunks:
+            picked = _select_chunks_within_budget(indexed_chunks, max_chars=max(2000, budget - 2200))
+            parts.extend(f"{_format_indexed_chunk_header(c)}\n{c['content']}" for c in picked)
+        else:
+            count = max(1, len(ready_recs) + len(ready_srcs))
+            per_item = max(1000, (budget - 2200) // count)
+            for idx, rec in enumerate(ready_recs, start=1):
+                text = format_transcript_for_llm(rec)
+                if len(text) > per_item:
+                    half = per_item // 2
+                    text = text[:half] + "\n[...]\n" + text[-half:]
+                parts.append(f"=== Grabación {idx}: {rec['filename']} ===\n{text}")
+            for idx, src in enumerate(ready_srcs, start=1):
+                text = _format_source_for_llm(src)
+                if len(text) > per_item:
+                    half = per_item // 2
+                    text = text[:half] + "\n[...]\n" + text[-half:]
+                parts.append(f"=== Fuente {idx}: {src['filename']} ===\n{text}")
         context = "\n\n".join(parts)
 
-    clean_count = max(2, min(10, int(num_questions)))
+    clean_count = max(2, min(15, int(num_questions)))
     if mode == "mcq":
         mode_rule = f"TODAS las {clean_count} preguntas deben ser de tipo \"mcq\" (opción múltiple con 4 opciones)."
+    elif mode == "true_false":
+        mode_rule = f"TODAS las {clean_count} preguntas deben ser de tipo \"true_false\" (afirmación para responder Verdadero o Falso)."
     elif mode == "open":
         mode_rule = f"TODAS las {clean_count} preguntas deben ser de tipo \"open\" (respuesta abierta para redactar)."
     else:
         mode_rule = (
-            f"Alterna preguntas de tipo \"mcq\" (opción múltiple con 4 opciones) y \"open\" (respuesta abierta) "
+            f"Combina de forma variada preguntas \"mcq\" (4 opciones), \"true_false\" (Verdadero/Falso) y \"open\" (respuesta abierta) "
             f"hasta completar exactamente {clean_count} preguntas."
         )
 
+    diff_map = {
+        "easy": "Nivel BÁSICO: evalúa definiciones esenciales y conceptos centrales de forma clara.",
+        "medium": "Nivel INTERMEDIO: evalúa comprensión, relaciones entre ideas y ejemplos concretos de las fuentes.",
+        "hard": "Nivel DIFÍCIL / EXAMEN PARCIAL: redacta preguntas exigentes con distractores plausibles, análisis profundo, comparaciones y aplicación.",
+    }
+    style_map = {
+        "conceptual": "Estilo CONCEPTUAL: prioriza fundamentos teóricos, definiciones, causas y comparaciones.",
+        "practical": "Estilo PRÁCTICO: prioriza casos aplicados, ejercicios, escenarios reales y resolución de problemas.",
+        "tricky": "Estilo TRAMPAS DE EXAMEN: prioriza matices sutiles, excepciones, condiciones límite y errores frecuentes.",
+    }
+    diff_rule = diff_map.get(difficulty, diff_map["medium"])
+    style_rule = style_map.get(question_style, style_map["conceptual"])
+    focus_rule = (
+        f"ENFOQUE ESPECÍFICO DEL USUARIO (PRIORITARIO): {focus_prompt.strip()}\n"
+        if focus_prompt and focus_prompt.strip()
+        else ""
+    )
+    hint_rule = (
+        '- Incluye en cada objeto el campo `"hint": "pista breve sin revelar la respuesta"`.\n'
+        if include_hints
+        else '- Deja `"hint": ""` vacío en cada objeto.\n'
+    )
+
     system_prompt = (
-        "Eres un profesor creando un examen interactivo de repaso basado EXCLUSIVAMENTE en grabaciones de clase.\n"
+        "Eres un profesor creando un examen interactivo de repaso basado EXCLUSIVAMENTE en las fuentes cargadas (audios, PDFs, diapositivas, apuntes o imágenes).\n"
         "Devuelve ÚNICAMENTE un arreglo JSON válido sin texto ni explicaciones fuera del JSON."
     )
     user_prompt = (
-        f"Genera exactamente {clean_count} preguntas de estudio en español basadas únicamente en la clase.\n"
+        f"Genera exactamente {clean_count} preguntas de estudio en español basadas únicamente en las fuentes seleccionadas.\n"
         f"{mode_rule}\n"
+        f"{diff_rule}\n"
+        f"{style_rule}\n"
+        f"{focus_rule}"
         "Reglas de formato JSON estricto:\n"
-        "- Para \"mcq\": {\"id\": 1, \"type\": \"mcq\", \"question\": \"...\", \"options\": [\"op1\", \"op2\", \"op3\", \"op4\"], \"correct_index\": 0, \"explanation\": \"breve explicación\", \"timestamp\": \"MM:SS\"}\n"
-        "- Para \"open\": {\"id\": 2, \"type\": \"open\", \"question\": \"...\", \"expected_answer\": \"respuesta modelo breve según la clase\", \"timestamp\": \"MM:SS\"}\n"
+        "- Para \"mcq\": {\"id\": 1, \"type\": \"mcq\", \"question\": \"...\", \"options\": [\"op1\", \"op2\", \"op3\", \"op4\"], \"correct_index\": 0, \"explanation\": \"breve explicación\", \"hint\": \"pista corta\", \"timestamp\": \"MM:SS o fuente.pdf · p. X\"}\n"
+        "- Para \"true_false\": {\"id\": 2, \"type\": \"true_false\", \"question\": \"Afirmación clara...\", \"options\": [\"Verdadero\", \"Falso\"], \"correct_index\": 0, \"explanation\": \"breve explicación\", \"hint\": \"pista corta\", \"timestamp\": \"MM:SS o fuente.pdf · p. X\"} (correct_index 0 = Verdadero, 1 = Falso)\n"
+        "- Para \"open\": {\"id\": 3, \"type\": \"open\", \"question\": \"...\", \"expected_answer\": \"respuesta modelo breve\", \"hint\": \"pista corta\", \"timestamp\": \"MM:SS o fuente.pdf · p. X\"}\n"
         "- No pongas la letra A/B/C/D dentro de los strings de options.\n"
-        "- Incluye el \"timestamp\" [MM:SS] aproximado donde se menciona en el texto.\n"
-        "- No inventes datos que no estén en la grabación.\n\n"
-        f"CONTENIDO DE LA CLASE:\n{context}"
+        f"{hint_rule}"
+        "- Incluye en \"timestamp\" la marca [MM:SS] si proviene de audio, o \"archivo.pdf · p. X\" / \"imagen.png\" si proviene de documento/imagen.\n"
+        "- No inventes datos que no estén en las fuentes.\n\n"
+        f"CONTENIDO DE ESTUDIO:\n{context}"
     )
     return [
         {"role": "system", "content": system_prompt},
@@ -621,68 +888,127 @@ def build_quiz_generation_messages(
 
 
 def parse_quiz_json(raw_text: str, mode: str = "mixed") -> list[dict[str, Any]]:
-    """Parse and sanitize generated quiz questions JSON."""
+    """Parse and sanitize generated quiz questions JSON (supports mcq, true_false, open, hints)."""
     cleaned = (raw_text or "").strip()
-    match = re.search(r"\[[\s\S]*\]", cleaned)
     questions: list[dict[str, Any]] = []
 
-    if match:
+    parsed_list: list[Any] | None = None
+    candidates = [cleaned]
+    arr_m = re.search(r"\[[\s\S]*\]", cleaned)
+    if arr_m:
+        candidates.append(arr_m.group(0))
+    obj_m = re.search(r"\{[\s\S]*\}", cleaned)
+    if obj_m:
+        candidates.append(obj_m.group(0))
+
+    for cand in candidates:
         try:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, list):
-                for item in parsed:
-                    if not isinstance(item, dict):
-                        continue
-                    q_text = str(item.get("question") or "").strip()
-                    if not q_text:
-                        continue
-                    raw_type = str(item.get("type") or "").strip().lower()
-                    if mode in ("mcq", "open"):
-                        q_type = mode
+            obj = json.loads(cand)
+        except Exception:
+            continue
+        if isinstance(obj, list):
+            parsed_list = obj
+            break
+        if isinstance(obj, dict):
+            for key in ("questions", "quiz", "items"):
+                if isinstance(obj.get(key), list):
+                    parsed_list = obj[key]
+                    break
+            if parsed_list is not None:
+                break
+
+    if isinstance(parsed_list, list):
+        for item in parsed_list:
+            if not isinstance(item, dict):
+                continue
+            q_text = str(item.get("question") or "").strip()
+            if not q_text:
+                continue
+            raw_type = str(item.get("type") or "").strip().lower()
+            raw_opts = item.get("options") if isinstance(item.get("options"), list) else []
+
+            if mode in ("mcq", "true_false", "open"):
+                q_type = mode
+            elif raw_type in ("true_false", "tf", "boolean", "v_f"):
+                q_type = "true_false"
+            elif raw_type == "mcq" or len(raw_opts) >= 3:
+                q_type = "mcq"
+            elif len(raw_opts) == 2 and any("verdadero" in str(o).lower() or "true" in str(o).lower() for o in raw_opts):
+                q_type = "true_false"
+            else:
+                q_type = "open"
+
+            ts = _extract_timestamp(item.get("timestamp"))
+            hint = str(item.get("hint") or "").strip()
+
+            if q_type == "true_false":
+                c_idx = 0
+                if isinstance(item.get("correct_answer"), bool):
+                    c_idx = 0 if item["correct_answer"] else 1
+                else:
+                    raw_ca = str(item.get("correct_answer") or "").strip().lower()
+                    if raw_ca in ("false", "falso", "f", "1"):
+                        c_idx = 1
+                    elif raw_ca in ("true", "verdadero", "v", "0"):
+                        c_idx = 0
                     else:
-                        q_type = "mcq" if raw_type == "mcq" or isinstance(item.get("options"), list) else "open"
+                        try:
+                            c_idx = 1 if int(item.get("correct_index", 0)) == 1 else 0
+                        except (TypeError, ValueError):
+                            c_idx = 0
+                questions.append(
+                    {
+                        "id": len(questions) + 1,
+                        "type": "true_false",
+                        "question": q_text,
+                        "options": ["Verdadero", "Falso"],
+                        "correct_index": c_idx,
+                        "explanation": str(item.get("explanation") or "").strip(),
+                        "hint": hint,
+                        "timestamp": ts,
+                    }
+                )
+                continue
 
-                    ts = _extract_timestamp(item.get("timestamp"))
-                    if q_type == "mcq":
-                        raw_opts = item.get("options") or []
-                        opts = [str(o).strip() for o in raw_opts if str(o).strip()][:4]
-                        if len(opts) < 2:
-                            if mode == "mcq":
-                                continue
-                            q_type = "open"
-                        else:
-                            try:
-                                c_idx = int(item.get("correct_index", 0))
-                            except (TypeError, ValueError):
-                                c_idx = 0
-                            if c_idx < 0 or c_idx >= len(opts):
-                                c_idx = 0
-                            questions.append(
-                                {
-                                    "id": len(questions) + 1,
-                                    "type": "mcq",
-                                    "question": q_text,
-                                    "options": opts,
-                                    "correct_index": c_idx,
-                                    "explanation": str(item.get("explanation") or "").strip(),
-                                    "timestamp": ts,
-                                }
-                            )
-                            continue
-
+            if q_type == "mcq":
+                opts = [str(o).strip() for o in raw_opts if str(o).strip()][:4]
+                if len(opts) < 2:
+                    if mode == "mcq":
+                        continue
+                    q_type = "open"
+                else:
+                    try:
+                        c_idx = int(item.get("correct_index", 0))
+                    except (TypeError, ValueError):
+                        c_idx = 0
+                    if c_idx < 0 or c_idx >= len(opts):
+                        c_idx = 0
                     questions.append(
                         {
                             "id": len(questions) + 1,
-                            "type": "open",
+                            "type": "mcq",
                             "question": q_text,
-                            "expected_answer": str(
-                                item.get("expected_answer") or item.get("explanation") or ""
-                            ).strip(),
+                            "options": opts,
+                            "correct_index": c_idx,
+                            "explanation": str(item.get("explanation") or "").strip(),
+                            "hint": hint,
                             "timestamp": ts,
                         }
                     )
-        except Exception:
-            questions = []
+                    continue
+
+            questions.append(
+                {
+                    "id": len(questions) + 1,
+                    "type": "open",
+                    "question": q_text,
+                    "expected_answer": str(
+                        item.get("expected_answer") or item.get("explanation") or ""
+                    ).strip(),
+                    "hint": hint,
+                    "timestamp": ts,
+                }
+            )
 
     return questions
 
@@ -691,16 +1017,36 @@ def extract_relevant_excerpt(
     recordings: list[dict[str, Any]],
     query: str,
     max_chars: int = 3800,
+    sources: list[dict[str, Any]] | None = None,
+    indexed_chunks: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Return top BM25 transcript excerpts for grading an open-ended quiz answer."""
-    ready_recs = [r for r in recordings if r.get("status") == "ready" and r.get("transcript_text")]
+    """Return top indexed/BM25 excerpts across active recordings and sources for grading an open-ended answer."""
+    if indexed_chunks:
+        picked = _select_chunks_within_budget(indexed_chunks, max_chars=max_chars, max_chunks=5)
+        if picked:
+            return "\n\n".join(
+                f"{_format_indexed_chunk_header(c)}\n{c['content']}" for c in picked
+            )
+
+    ready_recs = [
+        r for r in recordings
+        if r.get("status") == "ready" and r.get("enabled", True) and r.get("transcript_text")
+    ]
+    ready_srcs = [
+        s for s in (sources or [])
+        if s.get("status") == "ready" and s.get("enabled", True) and s.get("extracted_text")
+    ]
     all_chunks: list[dict[str, Any]] = []
     for rec in ready_recs:
         all_chunks.extend(_chunk_recording(rec))
+    for src in ready_srcs:
+        all_chunks.extend(_chunk_source(src))
     selected = _bm25_select_chunks(all_chunks, query, max_chars=max_chars, max_chunks=4)
     if selected:
         return "\n\n".join(f"[{c['filename']} @ {c['start_ts']}]\n{c['text']}" for c in selected)
-    return "\n\n".join(format_transcript_for_llm(r)[:1500] for r in ready_recs[:2])
+    fallback_parts = [format_transcript_for_llm(r)[:1500] for r in ready_recs[:2]]
+    fallback_parts.extend(_format_source_for_llm(s)[:1500] for s in ready_srcs[:2])
+    return "\n\n".join(fallback_parts)
 
 
 def build_open_answer_grading_messages(

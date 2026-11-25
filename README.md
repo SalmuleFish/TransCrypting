@@ -1,103 +1,121 @@
-# TransCrypting — Transcripción, Resumen, Chat y Modo Examen 100% Local
+# TransCrypting — 100% Local Multi-Source Study Workspace, Audio Transcription, Podcast Studio & Exam Prep
 
-Aplicación de escritorio para Windows diseñada para trabajar **exclusivamente en tu computadora**, sin enviar ningún archivo de audio, transcripción ni conversación a la nube. Ideal para grabar o subir clases, obtener resúmenes estructurados, hacer preguntas con citas al minuto exacto y repasar con exámenes interactivos.
-
----
-
-## Capturas de pantalla
-
-### Vista de resumen e interfaz Bento (Modo Claro)
-Resumen estructurado automático con puntos clave, acuerdos para el examen, marcas de tiempo interactivas `▶ MM:SS` y telemetría de hardware en tiempo real.
-
-![Vista de resumen en modo claro](docs/screenshots/summary-light.png)
-
-### Chat contextual y citas al segundo exacto (Modo Oscuro Grafito)
-Preguntas y respuestas basadas en la clase con citas interactivas que saltan directo al audio, sugerencias dinámicas y medidor de salud de contexto (`Óptimo` / `RAG Protegido`).
-
-![Chat contextual con citas interactivas en modo oscuro](docs/screenshots/chat-dark.png)
-
-### Simulador de examen interactivo
-Preguntas de opción múltiple con retroalimentación instantánea y preguntas de respuesta abierta evaluadas por tu modelo local frente a lo explicado en clase.
-
-![Modo examen interactivo con corrección local](docs/screenshots/exam-dark.png)
-
-### Modelos modulares y guía integrada
-Compatibilidad flexible con cualquier modelo de Ollama o Whisper / CTranslate2 desde la ventana de **Configuración**.
-
-![Guía integrada para instalar modelos modulares](docs/screenshots/models-guide.png)
+A privacy-first Windows desktop workspace built to run **100% offline on your own PC**. Neither your class recordings, PDFs, slides, images, nor AI conversations ever leave your machine. Ideal for organizing courses into local notebooks: transcribe lectures, index documents and whiteboard photos in a persistent local search index, chat with exact cross-source citations, generate two-host study podcasts, and practice with interactive exams.
 
 ---
 
-## Características principales
+## Screenshots
 
-- **Transcripción local con Whisper (`faster-whisper`)**: aceleración en GPU NVIDIA (`CUDA int8_float16`) con respaldo automático en CPU, detección bilingüe por segmento (español/inglés) y preprocesamiento opcional con `ffmpeg` para clases con ruido o voces superpuestas.
-- **Modelos de lenguaje modulares vía Ollama**: detecta automáticamente cualquier modelo instalado en tu Ollama local (`Gemma 4`, `Qwen 3 / 3.5`, `Llama 3.2`, etc.) sin depender de un único modelo fijo.
-- **Múltiples grabaciones por conversación + Protección anti-saturación**: adjunta más audios a una misma sesión para generar un **Resumen integrado**. Cuando el contexto supera el límite seguro de `num_ctx`, activa automáticamente el modo **RAG Protegido (BM25 local)** para evitar saturar el modelo.
-- **Citas interactivas `▶ MM:SS`**: cada marca de tiempo en el Chat, Resumen, Transcripción o Examen es un botón que salta y reproduce el audio en ese segundo exacto.
-- **Modo Examen interactivo**: genera preguntas de **opción múltiple** (corrección al instante) y **respuesta abierta** (evaluada por el modelo local frente a lo explicado en clase, con enlace al minuto exacto).
-- **Gestión inteligente de VRAM y RAM**: Whisper y el modelo de Ollama se turnan de forma exclusiva y la memoria se libera automáticamente tras inactividad (o al instante con **Liberar VRAM**).
-- **Interfaz Bento con Modo Claro y Modo Oscuro Grafito**, exportación nativa a `.md` y opción **Borrar historial** de chat conservando intactas grabaciones, transcripciones y resúmenes.
+### Editorial Studio & Unified General Summary (Light Mode)
+Distraction-free top command bar, collapsible Conversations and Sources rails, unified gradient summary across active sources, and clickable `▶ MM:SS` audio & source citations.
+
+![Unified Editorial Studio summary in Light Mode](docs/screenshots/summary-light.png)
+
+### Contextual Chat & Cross-Source Citations (Graphite Dark Mode)
+Source-grounded Q&A with clickable timestamp/page/image pills, dynamic AI follow-up suggestions, and an on-demand GPU/RAM/Context telemetry popover in the top bar.
+
+![Contextual chat with interactive citations in Dark Mode](docs/screenshots/chat-dark.png)
+
+### Customizable Exam Studio
+Pick exact sources and topic focus, choose question count (`3–15`), format (`Mixed`, `MCQ`, `True / False`, `Open`), difficulty, question style, hints, countdown timer, and Real Exam Mode.
+
+![Customizable Exam Studio in Dark Mode](docs/screenshots/exam-dark.png)
+
+### 100% Local Podcast Studio (Kokoro-82M ONNX)
+Generate two-host study dialogues completely offline with custom focus/style, exclusive resource locking with instant cancellation, audio player, and full episode script.
+
+![Local Podcast Studio with Kokoro-82M ONNX in Dark Mode](docs/screenshots/podcast-dark.png)
+
+### Modular Local Models & Built-In Guide
+Flexible compatibility with any Ollama LLM, Whisper / CTranslate2 model, and Kokoro-82M / Piper local TTS weights directly from **Settings**.
+
+![Built-in guide for modular local models](docs/screenshots/models-guide.png)
 
 ---
 
-## Requisitos
+## Key Features
+
+- **Multi-Source Local Context (`SQLite FTS5`)**:
+  - Combine **Audio recordings** (`.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`, `.mp4`, etc.), **Documents** (`.pdf`, `.pptx` slides + speaker notes, `.docx`, `.txt`, `.md`), and **Images** (`.png`, `.jpg`, `.webp`, `.bmp`) inside the same conversation.
+  - CPU document extraction (`pypdf`, `python-pptx`, `python-docx`) consumes **0 MB of VRAM** and preserves page/slide locators (`p. 4`, `diap. 2`, `sec. 1`).
+  - Images are analyzed **once on upload** using local Ollama vision (or automatic local Windows CPU OCR fallback) and stored in the persistent `SQLite FTS5` index so follow-up chats never reload raw images into VRAM.
+  - Every item in the **Sources** panel has a checkbox to enable or exclude it from context at any time.
+- **100% Local Podcast Studio (Exclusive Performance Mode)**:
+  - Turn selected sources into a two-host **study podcast** (`Conversación`, `Repaso de examen`, `Debate`, or `Paso a paso`, in Spanish or English) with custom topic/focus instructions.
+  - Synthesizes expressive speech **100% locally** using **Kokoro-82M ONNX** neural voices (with automatic **Piper ONNX** and Windows `System.Speech` offline fallbacks) and saves replayable `.wav` episodes + full dialogue scripts.
+  - **Exclusive Resource Lock & Instant Cancel**: generating a podcast automatically unloads Ollama from VRAM after writing the script before loading TTS voices, locks tab switching/competing AI tasks until finished, and supports instant **Cancel** at any moment.
+- **Interactive Cross-Source Citations & Viewer**:
+  - `▶ MM:SS` pills jump straight to the exact second of the matching audio recording.
+  - `📄 file.pdf · p. 4` and `🖼 image.png` pills open the integrated **Source Viewer** at that exact page, slide, or whiteboard photo.
+- **Local Audio Transcription (`faster-whisper`)**:
+  - NVIDIA CUDA acceleration (`int8_float16`) with automatic CPU fallback, bilingual segment detection, and optional `ffmpeg` classroom noise leveling.
+- **Interactive Exam Mode**: Multiple-choice questions with instant grading and open-ended responses evaluated locally against indexed source excerpts.
+- **Smart Memory Management**: Whisper, Ollama, and Podcast TTS take exclusive turns cleanly, with configurable idle VRAM unloading and an instant **Liberar VRAM** button.
+- **Editorial Studio UI in Light & Graphite Dark Modes**: Collapsible Conversations & Sources panels, compact top-bar Telemetry popover, single-card gradient general summary, dedicated verbatim Audio Transcripts tab, surgical DOM updates without UI flicker, native `.md` export, and **Borrar historial** that preserves all sources and summaries.
+
+---
+
+## Requirements
 
 - **Windows 10 / 11** (64-bit)
-- **Python 3.11 o 3.12**
-- **Ollama** instalado localmente ([ollama.com](https://ollama.com)) con al menos un modelo descargado (por ejemplo `ollama pull gemma4:e4b` o `ollama pull qwen3:8b`)
-- **ffmpeg** disponible en el `PATH` del sistema
-- *(Opcional)* GPU NVIDIA compatible con CUDA para acelerar Whisper y Ollama
+- **Python 3.11 or 3.12**
+- **Ollama** installed locally ([ollama.com](https://ollama.com)) with at least one local model pulled (e.g., `ollama pull gemma4:e4b` or `ollama pull qwen3:8b`)
+- **ffmpeg** available on system `PATH`
+- *(Optional)* NVIDIA CUDA-compatible GPU for accelerated Whisper and Ollama inference
 
 ---
 
-## Instalación rápida (al clonar desde GitHub)
+## Quick Setup
 
-1. Clona el repositorio y entra en la carpeta:
+1. Clone the repository and enter the project folder:
    ```powershell
    git clone https://github.com/SalmuleFish/TransCrypting.git
    cd TransCrypting
    ```
-2. Ejecuta **`setup.bat`** (doble clic o desde terminal). El script creará `.venv`, instalará las dependencias de `requirements.txt` y compilará **`TransCrypting.exe`** con su icono `TC`.
-3. Descarga tu primer modelo local en Ollama si aún no tienes uno:
+2. Run **`setup.bat`** (double-click or run from PowerShell/CMD). It creates `.venv`, installs dependencies from `requirements.txt`, and compiles **`TransCrypting.exe`** with the `TC` icon.
+3. Pull an Ollama model if you have not yet:
    ```powershell
    ollama pull gemma4:e4b
    ```
 
 ---
 
-## Cómo usar el programa
+## Usage
 
-### Abrir la aplicación
-- Haz doble clic en **`TransCrypting.exe`** (puedes crear un acceso directo en el Escritorio o anclarlo a la barra de tareas).
-- O desde terminal:
-  - Ventana de escritorio: `.\.venv\Scripts\python.exe run.py`
-  - Navegador local: `.\.venv\Scripts\python.exe run.py --browser`
-  - Solo API local: `.\.venv\Scripts\python.exe run.py --headless`
+### Launching the App
+- Double-click **`TransCrypting.exe`** (uses `pythonw.exe` + Windows AppUserModelID for clean taskbar integration).
+- Or run via terminal:
+  - Desktop window (WebView2): `.\.venv\Scripts\python.exe run.py`
+  - Local browser: `.\.venv\Scripts\python.exe run.py --browser`
+  - Headless API only: `.\.venv\Scripts\python.exe run.py --headless`
 
-### Modelos modulares (instalar los que prefieras)
-Dentro de la app abre **Configuración** (icono de engrane) y pulsa **`¿Cómo instalar modelos?`** para ver la guía interactiva y copiar comandos con un clic:
-- **Ollama (Resumen / Chat / Examen)**: descarga cualquier modelo con `ollama pull <modelo>` (ej. `llama3.2:3b`, `gemma4:e4b`, `qwen3:8b`, `qwen3.5:9b`) y pulsa **Actualizar lista** en Configuración.
-- **Whisper (Transcripción)**: elige entre `tiny`, `base`, `small`, `medium`, `large-v3-turbo` y `large-v3`, o coloca cualquier modelo personalizado en formato **CTranslate2** (`model.bin` + `config.json`) dentro de `data/models/whisper/<tu-modelo>/`.
+### Modular Models (Bring Your Own Models)
+Open **Settings** (gear icon) and click **`¿Cómo instalar modelos?`** for the built-in copyable command guide:
+- **Ollama LLMs (Summaries / Chat / Exams / Podcast Scripts)**: pull any model with `ollama pull <model>` (`llama3.2:3b`, `gemma4:e4b`, `qwen3:8b`, `qwen3.5:9b`, etc.) and click **Actualizar lista**. For image vision analysis, choose a vision-capable model such as `gemma4:e4b`.
+- **Whisper (Audio Transcription)**: switch between `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, and `large-v3`, or drop any custom **CTranslate2** folder (`model.bin` + `config.json`) inside `data/models/whisper/<your-model>/`.
+- **Kokoro-82M / Piper TTS Voices (Podcasts)**: **Kokoro-82M ONNX** weights (`kokoro-v1.0.onnx` and `voices-v1.0.bin`) are downloaded once on demand into `data/models/tts/kokoro/` (with Piper fallback in `data/models/tts/`).
 
 ---
 
-## Estructura del proyecto y privacidad en Git
+## Project Structure & Git Privacy
 
 ```text
 TransCrypting/
-├── backend/                # API FastAPI, gestión exclusiva de VRAM, Whisper, Ollama y RAG BM25
-├── docs/screenshots/       # Capturas de pantalla incluidas en este README
-├── frontend/               # Interfaz Bento 100% offline (HTML/CSS/JS + icon.ico)
-├── launcher/               # Código fuente C# para compilar TransCrypting.exe
-├── tests/                  # Pruebas automatizadas con pytest
-├── data/                   # SOLO LOCAL (ignorado en Git; únicamente se versiona .gitkeep)
-│   ├── audio/              # Grabaciones subidas por el usuario
-│   ├── models/             # Pesos cacheados/personalizados de Whisper
-│   └── transcript.db       # Conversaciones, transcripciones, resúmenes y chat
-├── .gitignore              # Protege data/, .venv/, cachés y compilados locales
+├── backend/                # FastAPI API, exclusive GPU/RAM lock, Whisper, Ollama, FTS5 & Podcast TTS
+├── docs/screenshots/       # README showcase screenshots (demo data only)
+├── frontend/               # 100% offline Bento UI (HTML/CSS/JS + icon.ico)
+├── launcher/               # C# source compiled into TransCrypting.exe
+├── tests/                  # Automated pytest suite
+├── data/                   # LOCAL ONLY (ignored by Git; only .gitkeep is tracked)
+│   ├── audio/              # Uploaded audio recordings
+│   ├── sources/            # Uploaded PDFs, slides, docs & images
+│   ├── podcasts/           # Locally generated podcast .wav episodes
+│   ├── models/             # Whisper & Kokoro-82M / Piper TTS local model caches
+│   └── transcript.db       # SQLite database + FTS5 persistent search index
+├── .gitignore              # Excludes data/, .venv/, caches, weights & local executables
 ├── requirements.txt
-├── setup.bat               # Instalador en Windows
+├── setup.bat               # Windows 1-click setup & launcher compiler
 └── run.py
 ```
 
-Ningún archivo en `data/`, `.venv/`, `__pycache__/`, `.pytest_cache/` o `TransCrypting.exe` se sube a GitHub gracias a `.gitignore`.
+All user recordings, uploaded documents, images, generated podcasts, model caches, databases, and `.venv/` stay 100% on your machine and are excluded via `.gitignore`.
