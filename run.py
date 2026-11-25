@@ -399,6 +399,14 @@ def main() -> None:
     parser.add_argument("--headless", action="store_true", help="Iniciar solo el servidor local sin ventana")
     args = parser.parse_args()
 
+    existing_url = f"http://{HOST}:{args.port}"
+    if not args.headless and wait_for_server(existing_url, timeout_sec=0.4):
+        if args.browser:
+            webbrowser.open(existing_url)
+        else:
+            _launch_edge_app_fallback(existing_url)
+        return
+
     port = find_available_port(args.port)
     url = f"http://{HOST}:{port}"
 

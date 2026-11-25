@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import time
 from typing import Any
@@ -11,11 +13,20 @@ import psutil
 _CACHE_TTL_SEC = 1.5
 _last_snapshot: dict[str, Any] | None = None
 _last_snapshot_ts: float = 0.0
+_NVIDIA_SMI_MISSING: bool | None = None
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _query_nvidia_smi() -> dict[str, Any]:
+    global _NVIDIA_SMI_MISSING
+    if _NVIDIA_SMI_MISSING is True:
+        return {"gpu_available": False}
+    if _NVIDIA_SMI_MISSING is None:
+        if not shutil.which("nvidia-smi"):
+            _NVIDIA_SMI_MISSING = True
+            return {"gpu_available": False}
+        _NVIDIA_SMI_MISSING = False
     try:
         res = subprocess.run(
             [
@@ -66,6 +77,7 @@ def get_system_stats(force_refresh: bool = False) -> dict[str, Any]:
         "ram_total_gb": round(vm.total / (1024**3), 2),
         "ram_percent": round(vm.percent, 1),
         "cpu_percent": round(cpu_percent, 1),
+        "cpu_count": os.cpu_count() or 4,
         "gpu_available": gpu.get("gpu_available", False),
         "gpu_name": gpu.get("gpu_name", "No detectada"),
         "vram_used_mb": gpu.get("vram_used_mb", 0),

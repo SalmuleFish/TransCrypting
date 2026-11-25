@@ -64,6 +64,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "idle_unload_sec": str(DEFAULT_IDLE_UNLOAD_SEC),
     "classroom_audio_enhance": "true",
     "enable_thinking": "false",
+    "eco_mode": "false",
+    "eco_cpu_threads": "2",
     "theme": "light",
 }
 
@@ -1056,12 +1058,14 @@ class Database:
             "idle_unload_sec": int(raw["idle_unload_sec"]),
             "classroom_audio_enhance": self._parse_bool(raw.get("classroom_audio_enhance", "true"), True),
             "enable_thinking": self._parse_bool(raw.get("enable_thinking", "false"), False),
+            "eco_mode": self._parse_bool(raw.get("eco_mode", "false"), False),
+            "eco_cpu_threads": max(1, int(raw.get("eco_cpu_threads", "2"))),
             "theme": "dark" if str(raw.get("theme", "light")).lower() == "dark" else "light",
         }
 
     def update_settings(self, updates: dict[str, Any]) -> dict[str, Any]:
         allowed = set(DEFAULT_SETTINGS.keys())
-        bool_keys = {"classroom_audio_enhance", "enable_thinking"}
+        bool_keys = {"classroom_audio_enhance", "enable_thinking", "eco_mode"}
         with self._lock:
             conn = self._get_conn()
             for key, val in updates.items():

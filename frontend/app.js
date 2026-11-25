@@ -1781,6 +1781,14 @@ function renderSummaryTab(session, animateReveal = false) {
     }),
   ].join("");
 
+  const bodyHtml = summaryMarkdown
+    ? `<div class="md">${renderMarkdown(summaryMarkdown, true)}</div>`
+    : `<div class="chat-placeholder">
+        <h3>Fuentes indexadas y listas</h3>
+        <p>El chat y la búsqueda FTS5 ya están disponibles. Puedes generar el resumen general bajo demanda cuando lo necesites.</p>
+        <button type="button" id="btn-eco-generate-summary" class="pill-btn dark sm">Generar resumen ahora</button>
+      </div>`;
+
   pane.innerHTML = `
     <div class="content-card combined ${revealClass}">
       <div class="content-card-header">
@@ -1788,9 +1796,14 @@ function renderSummaryTab(session, animateReveal = false) {
         <span class="card-badge lime">${totalActive} fuente(s) activa(s)</span>
       </div>
       ${chipsHtml ? `<div class="summary-sources-strip">${chipsHtml}</div>` : ""}
-      <div class="md">${renderMarkdown(summaryMarkdown || "_Sin resumen generado aún._", true)}</div>
+      ${bodyHtml}
     </div>
   `;
+
+  const ecoBtn = document.getElementById("btn-eco-generate-summary");
+  if (ecoBtn) {
+    ecoBtn.onclick = () => document.getElementById("btn-resummarize")?.click();
+  }
 }
 
 function renderTranscriptTab(session) {
@@ -3536,6 +3549,63 @@ function appendChatBubble(role, content, isThinkingPlaceholder = false) {
   return bubble;
 }
 
+function createEcoProgressController(parentEl, phaseLabel = "Leyendo fuentes") {
+  const settings = state.systemStatus?.settings || {};
+  if (!settings.eco_mode || !parentEl) return null;
+
+  const threads = Math.max(1, Number(settings.eco_cpu_threads || 2));
+  const wrap = document.createElement("div");
+  wrap.className = "eco-progress-wrap";
+  const labelEl = document.createElement("div");
+  labelEl.className = "eco-progress-label";
+  const track = document.createElement("div");
+  track.className = "eco-progress-track";
+  const bar = document.createElement("div");
+  bar.className = "eco-progress-bar";
+  track.appendChild(bar);
+  wrap.appendChild(labelEl);
+  wrap.appendChild(track);
+  parentEl.prepend(wrap);
+
+  const startedAt = Date.now();
+  let chunks = 0;
+  let pct = 5;
+  let currentPhase = phaseLabel;
+
+  const renderProgress = () => {
+    const sec = Math.floor((Date.now() - startedAt) / 1000);
+    const timeStr = `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+    bar.style.width = `${pct}%`;
+    labelEl.textContent = `${currentPhase} · Modo Eco (${threads}h) · ${pct}% · ${timeStr}`;
+  };
+  renderProgress();
+  const timer = setInterval(() => {
+    if (chunks === 0 && pct < 35) {
+      // Smoothly advance 5% -> 35% while Ollama evaluates the prompt context
+      pct = Math.min(35, pct + Math.max(1, Math.round((35 - pct) * 0.18)));
+      renderProgress();
+    } else {
+      renderProgress();
+    }
+  }, 500);
+
+  return {
+    onToken() {
+      chunks += 1;
+      currentPhase = "Generando respuesta";
+      const genPct = Math.round(35 + 61 * (1 - Math.exp(-chunks / 140)));
+      pct = Math.max(pct, Math.min(96, genPct));
+      renderProgress();
+    },
+    stop() {
+      clearInterval(timer);
+      pct = 100;
+      renderProgress();
+      setTimeout(() => wrap.remove(), 220);
+    },
+  };
+}
+
 async function sendChatQuestion(questionText) {
   if (state.podcastBusy) {
     showToast("El chat está bloqueado mientras se genera el podcast.", true);
@@ -3557,6 +3627,7 @@ async function sendChatQuestion(questionText) {
 
   appendChatBubble("user", question);
   const assistantBubble = appendChatBubble("assistant", "", true);
+  const ecoProgress = createEcoProgressController(assistantBubble, "Leyendo fuentes");
   const scroll = document.getElementById("center-scroll");
 
   let accumulated = "";
@@ -3630,11 +3701,13 @@ async function sendChatQuestion(questionText) {
               answerContainerEl.className = "md";
               assistantBubble.appendChild(answerContainerEl);
             }
+            ecoProgress?.onToken();
             accumulated += payload.text;
             answerContainerEl.innerHTML =
               renderMarkdown(accumulated, true) + '<span class="stream-cursor"></span>';
             scroll.scrollTop = scroll.scrollHeight;
           } else if (payload.type === "done") {
+            ecoProgress?.stop();
             if (answerContainerEl) {
               answerContainerEl.innerHTML = renderMarkdown(accumulated, true);
             }
@@ -3645,6 +3718,7 @@ async function sendChatQuestion(questionText) {
       }
     }
 
+    ecoProgress?.stop();
     if (answerContainerEl) {
       answerContainerEl.innerHTML = renderMarkdown(accumulated, true);
     }
@@ -3656,9 +3730,11 @@ async function sendChatQuestion(questionText) {
     renderWorkspaceSubtitle(fresh);
     await loadSessions(false);
   } catch (err) {
+    ecoProgress?.stop();
     assistantBubble.innerHTML = `<span style="color:#fca5a5;">${escapeHtml(err.message)}</span>`;
     showToast(err.message, true);
   } finally {
+    ecoProgress?.stop();
     state.isStreaming = false;
     document.getElementById("btn-send-chat").disabled = false;
   }
@@ -3760,12 +3836,32 @@ function populateSettingsFromStatus(status) {
   }
   whisperSelect.value = settings.whisper_model || "large-v3-turbo";
 
-  document.getElementById("set-whisper-device").value = settings.whisper_device || "auto";
+  const whisperDeviceSelect = document.getElementById("set-whisper-device");
+  const hasCuda = Boolean(status?.hardware?.gpu_available);
+  const autoOpt = whisperDeviceSelect.querySelector('option[value="auto"]');
+  const cudaOpt = whisperDeviceSelect.querySelector('option[value="cuda"]');
+  if (autoOpt) {
+    autoOpt.textContent = hasCuda
+      ? "Automático (GPU CUDA con respaldo CPU)"
+      : "Automático (solo CPU en este equipo)";
+  }
+  if (cudaOpt) {
+    cudaOpt.disabled = !hasCuda;
+  }
+  const desiredDevice = settings.whisper_device || "auto";
+  whisperDeviceSelect.value = !hasCuda && desiredDevice === "cuda" ? "cpu" : desiredDevice;
   document.getElementById("set-whisper-lang").value = settings.whisper_language || "auto";
   document.getElementById("set-num-ctx").value = String(settings.num_ctx || 8192);
   document.getElementById("set-idle-unload").value = String(settings.idle_unload_sec || 180);
   document.getElementById("set-classroom-enhance").checked = settings.classroom_audio_enhance !== false;
   document.getElementById("set-enable-thinking").checked = Boolean(settings.enable_thinking);
+  document.getElementById("set-eco-mode").checked = Boolean(settings.eco_mode);
+
+  const cpuCount = Math.max(1, Number(status?.hardware?.cpu_count || 8));
+  const threadsInput = document.getElementById("set-eco-cpu-threads");
+  threadsInput.max = String(cpuCount);
+  threadsInput.value = String(Math.min(cpuCount, Math.max(1, Number(settings.eco_cpu_threads || 2))));
+  syncEcoThreadsUI(cpuCount);
 
   [
     "set-ollama-model",
@@ -3775,6 +3871,19 @@ function populateSettingsFromStatus(status) {
     "set-num-ctx",
     "set-idle-unload",
   ].forEach(refreshCustomSelect);
+}
+
+function syncEcoThreadsUI(cpuCountOverride = null) {
+  const ecoChecked = document.getElementById("set-eco-mode").checked;
+  const field = document.getElementById("eco-threads-field");
+  const input = document.getElementById("set-eco-cpu-threads");
+  const badge = document.getElementById("eco-threads-badge");
+  if (!field || !input || !badge) return;
+  field.classList.toggle("hidden", !ecoChecked);
+  const total = Math.max(1, Number(cpuCountOverride || input.max || state.systemStatus?.hardware?.cpu_count || 8));
+  const val = Math.min(total, Math.max(1, Number(input.value || 2)));
+  const pct = Math.round((val / total) * 100);
+  badge.textContent = `${val} de ${total} (~${pct}% CPU)`;
 }
 
 function openSettingsModal() {
@@ -3805,6 +3914,8 @@ async function saveSettings(e) {
     idle_unload_sec: Number(document.getElementById("set-idle-unload").value),
     classroom_audio_enhance: document.getElementById("set-classroom-enhance").checked,
     enable_thinking: document.getElementById("set-enable-thinking").checked,
+    eco_mode: document.getElementById("set-eco-mode").checked,
+    eco_cpu_threads: Number(document.getElementById("set-eco-cpu-threads").value || 2),
   };
   await api("/api/settings", {
     method: "PUT",
@@ -4007,9 +4118,11 @@ function initEvents() {
       switchTab("summary");
     }
     const modelName = getActiveModelLabel();
-    document.getElementById("tab-summary").innerHTML = buildSkeletonHtml(
+    const summaryPane = document.getElementById("tab-summary");
+    summaryPane.innerHTML = buildSkeletonHtml(
       `${modelName} está recreando el resumen...`
     );
+    const ecoProgress = createEcoProgressController(summaryPane, "Generando resumen");
 
     try {
       const fresh = await api(`/api/sessions/${state.activeSessionId}/resummarize`, {
@@ -4017,13 +4130,16 @@ function initEvents() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
       });
+      ecoProgress?.stop();
       state.activeSession = fresh;
       renderSummaryTab(fresh, true);
       showToast("Resumen actualizado.");
     } catch (err) {
+      ecoProgress?.stop();
       if (state.activeSession) renderSummaryTab(state.activeSession);
       showToast(err.message, true);
     } finally {
+      ecoProgress?.stop();
       state.isResummarizing = false;
       btn.disabled = false;
       btn.innerHTML = prevHtml;
@@ -4070,6 +4186,18 @@ function initEvents() {
   document.getElementById("btn-cancel-settings").onclick = closeSettingsModal;
   document.getElementById("settings-form").onsubmit = (e) =>
     saveSettings(e).catch((err) => showToast(err.message, true));
+
+  document.getElementById("set-eco-mode").onchange = (e) => {
+    syncEcoThreadsUI();
+    if (!e.target.checked) return;
+    document.getElementById("set-whisper-device").value = "cpu";
+    document.getElementById("set-num-ctx").value = "4096";
+    document.getElementById("set-idle-unload").value = "60";
+    document.getElementById("set-enable-thinking").checked = false;
+    ["set-whisper-device", "set-num-ctx", "set-idle-unload"].forEach(refreshCustomSelect);
+  };
+
+  document.getElementById("set-eco-cpu-threads").oninput = () => syncEcoThreadsUI();
 
   document.getElementById("btn-refresh-models").onclick = async () => {
     const btn = document.getElementById("btn-refresh-models");

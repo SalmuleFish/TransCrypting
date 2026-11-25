@@ -196,21 +196,30 @@ class OllamaService:
         num_ctx: int = 8192,
         keep_alive: str = "180s",
         think: bool = False,
+        eco_mode: bool = False,
+        eco_cpu_threads: int = 2,
     ) -> AsyncIterator[tuple[str, str]]:
         """Stream ('thinking', text) and ('token', text) tuples from local Ollama /api/chat."""
         await self.ensure_running()
         self._last_model = model
         has_images = any(bool(m.get("images")) for m in messages)
 
+        options: dict[str, Any] = {
+            "num_ctx": int(num_ctx),
+            "temperature": 0.25 if eco_mode else 0.3,
+        }
+        if eco_mode:
+            options["repeat_penalty"] = 1.18
+            options["repeat_last_n"] = 128
+            options["num_predict"] = 768
+            options["num_thread"] = max(1, min(os.cpu_count() or 16, int(eco_cpu_threads)))
+
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "stream": True,
             "think": False if has_images else think,
-            "options": {
-                "num_ctx": int(num_ctx),
-                "temperature": 0.3,
-            },
+            "options": options,
             "keep_alive": keep_alive,
         }
 
@@ -285,6 +294,8 @@ class OllamaService:
         messages: list[dict[str, Any]],
         num_ctx: int = 8192,
         keep_alive: str = "180s",
+        eco_mode: bool = False,
+        eco_cpu_threads: int = 2,
     ) -> str:
         """Run chat completion and return full text, falling back to thinking if content is empty."""
         parts: list[str] = []
@@ -295,6 +306,8 @@ class OllamaService:
             num_ctx=num_ctx,
             keep_alive=keep_alive,
             think=False,
+            eco_mode=eco_mode,
+            eco_cpu_threads=eco_cpu_threads,
         ):
             if not text:
                 continue

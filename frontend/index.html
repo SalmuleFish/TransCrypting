@@ -3,6 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="darkreader-lock" />
+  <meta name="color-scheme" content="light dark" />
   <title>TransCrypting — Transcripción, Resumen y Chat Local</title>
   <link rel="icon" type="image/x-icon" href="/icon.ico" />
   <link rel="stylesheet" href="/styles.css" />
@@ -349,6 +351,24 @@
         <div class="toggles-group">
           <label class="toggle-row">
             <div class="toggle-copy">
+              <span class="toggle-title">Modo Eco / Laptop (ahorro de batería)</span>
+              <small>Solo transcribe e indexa al subir archivos; genera resúmenes solo cuando tú los pidas y usa OCR CPU en imágenes.</small>
+            </div>
+            <input id="set-eco-mode" type="checkbox" class="bento-switch-input" />
+            <span class="bento-switch" aria-hidden="true"></span>
+          </label>
+
+          <div id="eco-threads-field" class="field eco-sub-field hidden">
+            <div class="field-header-row">
+              <span class="field-label">Núcleos / hilos CPU para Ollama (Modo Eco)</span>
+              <span id="eco-threads-badge" class="card-badge lime">2 de 8 (~25% CPU)</span>
+            </div>
+            <input id="set-eco-cpu-threads" type="range" min="1" max="8" step="1" value="2" class="eco-range" />
+            <small>Menos hilos reducen calor y ventiladores; más hilos aceleran la respuesta.</small>
+          </div>
+
+          <label class="toggle-row">
+            <div class="toggle-copy">
               <span class="toggle-title">Mejora de audio para clases y ruido</span>
               <small>Nivela la voz del profesor y reduce eco/murmullos antes de transcribir.</small>
             </div>
@@ -431,6 +451,20 @@
           <h3>1. Modelos de lenguaje (Resumen, Chat y Examen vía Ollama)</h3>
           <p>TransCrypting detecta automáticamente cualquier modelo que descargues en Ollama. Abre una terminal (PowerShell o CMD) y ejecuta uno según la memoria de tu GPU:</p>
           <div class="guide-cmd-list">
+            <div class="guide-cmd-row">
+              <div class="guide-cmd-main">
+                <span class="guide-badge">Laptop Eco (~1 GB)</span>
+                <code>ollama pull qwen2.5:1.5b</code>
+              </div>
+              <button type="button" class="pill-btn outline xs guide-cmd-copy" data-cmd="ollama pull qwen2.5:1.5b">Copiar</button>
+            </div>
+            <div class="guide-cmd-row">
+              <div class="guide-cmd-main">
+                <span class="guide-badge">Laptop (~2.5 GB)</span>
+                <code>ollama pull gemma4:e2b</code>
+              </div>
+              <button type="button" class="pill-btn outline xs guide-cmd-copy" data-cmd="ollama pull gemma4:e2b">Copiar</button>
+            </div>
             <div class="guide-cmd-row">
               <div class="guide-cmd-main">
                 <span class="guide-badge">4–6 GB VRAM</span>

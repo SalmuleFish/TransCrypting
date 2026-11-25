@@ -110,11 +110,16 @@ class ResourceManager:
                 self.active_model = model_name
                 self.active_device = "gpu/ollama"
                 keep_alive = f"{max(30, int(idle_unload_sec))}s"
+                settings = db.get_settings()
+                eco_mode = bool(settings.get("eco_mode", False))
+                eco_cpu_threads = int(settings.get("eco_cpu_threads") or 2)
                 text = await ollama_service.generate_complete(
                     model=model_name,
                     messages=messages,
                     num_ctx=num_ctx,
                     keep_alive=keep_alive,
+                    eco_mode=eco_mode,
+                    eco_cpu_threads=eco_cpu_threads,
                 )
                 self.touch_activity()
                 return text
@@ -142,6 +147,9 @@ class ResourceManager:
                 self.active_model = model_name
                 self.active_device = "gpu/ollama"
                 keep_alive = f"{max(30, int(idle_unload_sec))}s"
+                settings = db.get_settings()
+                eco_mode = bool(settings.get("eco_mode", False))
+                eco_cpu_threads = int(settings.get("eco_cpu_threads") or 2)
 
                 async for kind, text in ollama_service.stream_chat_events(
                     model=model_name,
@@ -149,6 +157,8 @@ class ResourceManager:
                     num_ctx=num_ctx,
                     keep_alive=keep_alive,
                     think=think,
+                    eco_mode=eco_mode,
+                    eco_cpu_threads=eco_cpu_threads,
                 ):
                     self.touch_activity()
                     yield (kind, text)

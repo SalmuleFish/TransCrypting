@@ -482,7 +482,10 @@ def test_windows_icon_and_taskbar_properties() -> None:
     if sys.platform != "win32":
         return
 
-    import clr
+    try:
+        import clr
+    except (ImportError, OSError, RuntimeError):
+        pytest.skip("pythonnet/clr no disponible en esta arquitectura")
 
     clr.AddReference("System.Windows.Forms")
     import System.Windows.Forms as WinForms
@@ -977,3 +980,45 @@ def test_ollama_generate_complete_falls_back_to_thinking() -> None:
     out = asyncio.run(svc.generate_complete("demo-model", [{"role": "user", "content": "hi"}]))
     assert "SOFIA: Hola." in out
     assert "MATEO: Empezamos." in out
+
+
+def test_eco_mode_skips_auto_summarization(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    import backend.app as app_module
+
+    test_db = Database(
+        db_path=tmp_path / "eco.db",
+        audio_dir=tmp_path / "audio",
+        sources_dir=tmp_path / "sources",
+        podcasts_dir=tmp_path / "podcasts",
+    )
+    test_db.init_db()
+    test_db.update_settings({"eco_mode": True})
+    assert test_db.get_settings()["eco_mode"] is True
+
+    monkeypatch.setattr(app_module, "db", test_db)
+    summarize_mock = AsyncMock(return_value="should not run")
+    monkeypatch.setattr(app_module.resource_manager, "summarize_exclusive", summarize_mock)
+
+    sess = test_db.create_session("Sesión Eco")
+    doc_path = tmp_path / "nota.md"
+    doc_path.write_text("# Tema\nContenido de prueba para FTS5.", encoding="utf-8")
+    src = test_db.create_source(
+        session_id=sess["id"],
+        filename="nota.md",
+        source_type="text",
+        stored_path=str(doc_path),
+        mime_type="text/markdown",
+        size_bytes=doc_path.stat().st_size,
+    )
+
+    asyncio.run(app_module.pipeline._process_source(src["id"]))
+
+    updated = test_db.get_source(src["id"])
+    assert updated is not None
+    assert updated["status"] == "ready"
+    assert updated["summary_text"] == ""
+    assert summarize_mock.await_count == 0
+    assert test_db.search_session_chunks(sess["id"], "FTS5")
+    test_db.close()

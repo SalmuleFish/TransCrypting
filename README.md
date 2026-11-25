@@ -51,17 +51,20 @@ Flexible compatibility with any Ollama LLM, Whisper / CTranslate2 model, and Kok
   - NVIDIA CUDA acceleration (`int8_float16`) with automatic CPU fallback, bilingual segment detection, and optional `ffmpeg` classroom noise leveling.
 - **Interactive Exam Mode**: Multiple-choice questions with instant grading and open-ended responses evaluated locally against indexed source excerpts.
 - **Smart Memory Management**: Whisper, Ollama, and Podcast TTS take exclusive turns cleanly, with configurable idle VRAM unloading and an instant **Liberar VRAM** button.
-- **Editorial Studio UI in Light & Graphite Dark Modes**: Collapsible Conversations & Sources panels, compact top-bar Telemetry popover, single-card gradient general summary, dedicated verbatim Audio Transcripts tab, surgical DOM updates without UI flicker, native `.md` export, and **Borrar historial** that preserves all sources and summaries.
+- **Eco / Laptop Mode (Optional Battery & Thermal Saver)**:
+  - Disabled by default so GPU desktops keep full automatic summaries; when enabled in **Settings**, uploads only index into `SQLite FTS5` (**0 background LLM calls**), images use local CPU OCR, and summaries/suggestions run **on demand**.
+  - Includes a configurable **CPU thread cap** (`eco_cpu_threads`), `num_predict`/`repeat_penalty` guardrails, `num_ctx = 4096`, `idle_unload = 60s`, and a live Eco progress bar with elapsed time.
+- **Editorial Studio UI in Light & Graphite Dark Modes**: Collapsible Conversations & Sources panels, compact top-bar Telemetry popover, single-card gradient general summary, dedicated verbatim Audio Transcripts tab, surgical DOM updates without UI flicker, native `.md` export, and **Borrar historial** that preserves all sources and summaries (protected against forced dark-mode browser extensions).
 
 ---
 
 ## Requirements
 
-- **Windows 10 / 11** (64-bit)
-- **Python 3.11 or 3.12**
-- **Ollama** installed locally ([ollama.com](https://ollama.com)) with at least one local model pulled (e.g., `ollama pull gemma4:e4b` or `ollama pull qwen3:8b`)
+- **Windows 10 / 11** (`x64` or native `ARM64` such as Snapdragon X)
+- **Python 3.11–3.13**
+- **Ollama** installed locally ([ollama.com](https://ollama.com)) with at least one local model pulled (e.g., `ollama pull gemma4:e4b`, `ollama pull qwen3:8b`, or `ollama pull qwen2.5:1.5b` for Eco/laptops)
 - **ffmpeg** available on system `PATH`
-- *(Optional)* NVIDIA CUDA-compatible GPU for accelerated Whisper and Ollama inference
+- *(Optional)* NVIDIA CUDA-compatible GPU for accelerated Whisper and Ollama inference *(on `ARM64`, CUDA packages and `faster-whisper`/`av` are automatically skipped in `requirements.txt` while documents, OCR, FTS5 chat, exams, and TTS run natively)*
 
 ---
 
@@ -91,7 +94,7 @@ Flexible compatibility with any Ollama LLM, Whisper / CTranslate2 model, and Kok
 
 ### Modular Models (Bring Your Own Models)
 Open **Settings** (gear icon) and click **`¿Cómo instalar modelos?`** for the built-in copyable command guide:
-- **Ollama LLMs (Summaries / Chat / Exams / Podcast Scripts)**: pull any model with `ollama pull <model>` (`llama3.2:3b`, `gemma4:e4b`, `qwen3:8b`, `qwen3.5:9b`, etc.) and click **Actualizar lista**. For image vision analysis, choose a vision-capable model such as `gemma4:e4b`.
+- **Ollama LLMs (Summaries / Chat / Exams / Podcast Scripts)**: pull any model with `ollama pull <model>` (`qwen2.5:1.5b`, `gemma4:e2b`, `llama3.2:3b`, `gemma4:e4b`, `qwen3:8b`, `qwen3.5:9b`, etc.) and click **Actualizar lista**. For image vision analysis, choose a vision-capable model such as `gemma4:e4b` or `gemma4:e2b`.
 - **Whisper (Audio Transcription)**: switch between `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, and `large-v3`, or drop any custom **CTranslate2** folder (`model.bin` + `config.json`) inside `data/models/whisper/<your-model>/`.
 - **Kokoro-82M / Piper TTS Voices (Podcasts)**: **Kokoro-82M ONNX** weights (`kokoro-v1.0.onnx` and `voices-v1.0.bin`) are downloaded once on demand into `data/models/tts/kokoro/` (with Piper fallback in `data/models/tts/`).
 

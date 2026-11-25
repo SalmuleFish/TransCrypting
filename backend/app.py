@@ -82,6 +82,8 @@ class SettingsUpdateRequest(BaseModel):
     idle_unload_sec: int | None = None
     classroom_audio_enhance: bool | None = None
     enable_thinking: bool | None = None
+    eco_mode: bool | None = None
+    eco_cpu_threads: int | None = None
     theme: str | None = None
 
 
@@ -276,6 +278,16 @@ class ProcessingPipeline:
                 chunks=rec_chunks,
             )
 
+        if bool(settings.get("eco_mode", False)):
+            db.update_recording_summary(
+                rec_id=rec_id,
+                summary_text="",
+                status="ready",
+                progress=1.0,
+                stage="Indexado (Modo Eco)",
+            )
+            return
+
         # 3. Summarize with local Ollama LLM
         db.update_recording_progress(
             rec_id,
@@ -358,13 +370,16 @@ class ProcessingPipeline:
         settings = db.get_settings()
         num_ctx = int(settings.get("num_ctx") or 8192)
         idle_unload_sec = int(settings.get("idle_unload_sec") or 180)
+        eco_mode = bool(settings.get("eco_mode", False))
         source_type = src.get("source_type") or detect_source_type(src["filename"])
 
-        ollama_model = await ollama_service.resolve_default_model(
-            settings.get("ollama_model", "")
-        )
-        if not settings.get("ollama_model") and ollama_model:
-            db.update_settings({"ollama_model": ollama_model})
+        ollama_model = ""
+        if not eco_mode:
+            ollama_model = await ollama_service.resolve_default_model(
+                settings.get("ollama_model", "")
+            )
+            if not settings.get("ollama_model") and ollama_model:
+                db.update_settings({"ollama_model": ollama_model})
 
         if source_type == "image":
             db.update_source_progress(
@@ -378,7 +393,7 @@ class ProcessingPipeline:
 
             extracted_text = ""
             used_vision = False
-            if ollama_model:
+            if not eco_mode and ollama_model:
                 try:
                     vision_msgs = build_image_analysis_messages(src["filename"], image_b64)
                     extracted_text = await resource_manager.summarize_exclusive(
@@ -453,6 +468,16 @@ class ProcessingPipeline:
             )
 
         if not db.get_source(source_id):
+            return
+
+        if eco_mode:
+            db.update_source_summary(
+                source_id=source_id,
+                summary_text="",
+                status="ready",
+                progress=1.0,
+                stage="Indexado (Modo Eco)",
+            )
             return
 
         # Generate concise Markdown summary for this source
@@ -678,6 +703,8 @@ async def update_settings(payload: SettingsUpdateRequest) -> dict[str, Any]:
         updates["num_ctx"] = max(2048, min(32768, int(updates["num_ctx"])))
     if "idle_unload_sec" in updates:
         updates["idle_unload_sec"] = max(30, min(3600, int(updates["idle_unload_sec"])))
+    if "eco_cpu_threads" in updates:
+        updates["eco_cpu_threads"] = max(1, min(os.cpu_count() or 16, int(updates["eco_cpu_threads"])))
     return db.update_settings(updates)
 
 
@@ -978,10 +1005,11 @@ async def toggle_recording_enabled(
     if not rec or rec["session_id"] != session_id:
         raise HTTPException(status_code=404, detail="Grabación no encontrada.")
     db.set_recording_enabled(rec_id, payload.enabled)
-    try:
-        await regenerate_combined_summary_if_needed(session_id)
-    except Exception:
-        pass
+    if not bool(db.get_settings().get("eco_mode", False)):
+        try:
+            await regenerate_combined_summary_if_needed(session_id)
+        except Exception:
+            pass
     return _build_session_response(session_id)
 
 
@@ -992,10 +1020,11 @@ async def delete_recording(session_id: str, rec_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Grabación no encontrada.")
     db.delete_recording(rec_id)
 
-    try:
-        await regenerate_combined_summary_if_needed(session_id)
-    except Exception:
-        pass
+    if not bool(db.get_settings().get("eco_mode", False)):
+        try:
+            await regenerate_combined_summary_if_needed(session_id)
+        except Exception:
+            pass
     return {"deleted": True}
 
 
@@ -1071,10 +1100,11 @@ async def toggle_source_enabled(
     if not src or src["session_id"] != session_id:
         raise HTTPException(status_code=404, detail="Fuente no encontrada.")
     db.set_source_enabled(source_id, payload.enabled)
-    try:
-        await regenerate_combined_summary_if_needed(session_id)
-    except Exception:
-        pass
+    if not bool(db.get_settings().get("eco_mode", False)):
+        try:
+            await regenerate_combined_summary_if_needed(session_id)
+        except Exception:
+            pass
     return _build_session_response(session_id)
 
 
@@ -1097,10 +1127,11 @@ async def delete_source(session_id: str, source_id: str) -> dict[str, Any]:
     if not src or src["session_id"] != session_id:
         raise HTTPException(status_code=404, detail="Fuente no encontrada.")
     db.delete_source(source_id)
-    try:
-        await regenerate_combined_summary_if_needed(session_id)
-    except Exception:
-        pass
+    if not bool(db.get_settings().get("eco_mode", False)):
+        try:
+            await regenerate_combined_summary_if_needed(session_id)
+        except Exception:
+            pass
     return {"deleted": True}
 
 
