@@ -2408,3 +2408,83 @@ def test_rename_recording_and_source_updates_db_and_fts5(
     assert any(h["item_id"] == src["id"] and h["filename"] == "Guia TCP-IP.pdf" for h in src_hits)
 
     test_db.close()
+
+
+def test_synthesize_podcast_audio_records_turn_timestamps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+    import types
+    import numpy as np
+    from backend import podcast_service
+
+    class FakeKokoro:
+        def __init__(self, model_path: str, voices_path: str) -> None:
+            pass
+
+        def create(self, text: str, voice: str, speed: float = 1.0, lang: str = "es"):
+            # Return exact 1.0 second at 24 kHz for deterministic timestamps
+            return np.full(24000, 0.1, dtype=np.float32), 24000
+
+    fake_mod = types.SimpleNamespace(Kokoro=FakeKokoro)
+    monkeypatch.setitem(sys.modules, "kokoro_onnx", fake_mod)
+    monkeypatch.setattr(
+        podcast_service,
+        "ensure_kokoro_models",
+        lambda **kwargs: (tmp_path / "m.onnx", tmp_path / "v.bin"),
+    )
+
+    turns = [
+        {"speaker": "A", "name": "Sofía", "text": "Hola bienvenidos al episodio."},
+        {"speaker": "B", "name": "Mateo", "text": "Gracias por acompañarnos hoy."},
+        {"speaker": "B", "name": "Mateo", "text": "Vamos directo al tema principal."},
+    ]
+    out_wav = tmp_path / "episode.wav"
+    dur, engine = podcast_service.synthesize_podcast_audio(
+        turns=turns,
+        output_path=out_wav,
+        language="es",
+        models_dir=tmp_path,
+    )
+
+    assert engine == "kokoro-82m-onnx"
+    assert out_wav.is_file()
+    assert turns[0]["start"] == pytest.approx(0.0, abs=0.002)
+    assert turns[0]["end"] == pytest.approx(1.0, abs=0.002)
+    # A -> B inserts 0.34s gap
+    assert turns[1]["start"] == pytest.approx(1.34, abs=0.002)
+    assert turns[1]["end"] == pytest.approx(2.34, abs=0.002)
+    # B -> B inserts 0.16s gap
+    assert turns[2]["start"] == pytest.approx(2.50, abs=0.002)
+    assert turns[2]["end"] == pytest.approx(3.50, abs=0.002)
+    assert dur == pytest.approx(3.50, abs=0.01)
+
+
+def test_theme_persists_across_database_restarts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+    import backend.app as app_mod
+
+    db_path = tmp_path / "theme_persist.db"
+    db1 = Database(db_path=db_path, audio_dir=tmp_path / "audio")
+    db1.init_db()
+    monkeypatch.setattr(app_mod, "db", db1)
+
+    res_dark = TestClient(app_mod.app).put("/api/settings", json={"theme": "dark"})
+    assert res_dark.status_code == 200
+    assert res_dark.json()["theme"] == "dark"
+    db1.close()
+
+    # Re-open fresh DB instance to simulate closing & reopening the desktop app
+    db2 = Database(db_path=db_path, audio_dir=tmp_path / "audio")
+    db2.init_db()
+    monkeypatch.setattr(app_mod, "db", db2)
+    status = TestClient(app_mod.app).get("/api/system/status")
+    assert status.status_code == 200
+    assert status.json()["settings"]["theme"] == "dark"
+
+    res_light = TestClient(app_mod.app).put("/api/settings", json={"theme": "light"})
+    assert res_light.status_code == 200
+    assert db2.get_settings()["theme"] == "light"
+    db2.close()

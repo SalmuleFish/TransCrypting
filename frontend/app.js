@@ -28,6 +28,8 @@ const state = {
   stoppingAI: false,
   lastContextMode: "full",
   theme: "light",
+  themeSyncedFromServer: false,
+  themeUserToggled: false,
   accentColor: "#c8ee26",
   fontScale: 1.0,
   appearancePreviewBackup: null,
@@ -39,6 +41,10 @@ const state = {
   podcastStartedAt: null,
   podcastElapsedTimer: null,
   cancellingPodcastId: null,
+  podcastViewMode: "listen",
+  activePodcastId: null,
+  podcastAutoScroll: true,
+  lastLockedPodId: null,
   transcriptRecFilter: null,
   transcriptSpeakerFilter: null,
   collapsedRecSummaries: new Set(),
@@ -58,6 +64,7 @@ let microphoneCapture = null;
 let systemCaptureState = null;
 let microphonePreview = null;
 let transcriptPlayback = null;
+let podcastPlayback = null;
 
 function memoChanged(key, sig) {
   if (renderMemo.get(key) === sig) return false;
@@ -540,7 +547,7 @@ const ICON_STOP_SQUARE = `<svg viewBox="0 0 24 24" width="13" height="13" fill="
 
 // --- Theme (Light / Soft Graphite Dark) ---
 
-function applyTheme(theme, persist = false) {
+function applyTheme(theme, persist = false, syncLocal = persist) {
   const normalized = theme === "dark" ? "dark" : "light";
   state.theme = normalized;
   document.documentElement.dataset.theme = normalized;
@@ -552,15 +559,20 @@ function applyTheme(theme, persist = false) {
     sun.classList.toggle("hidden", normalized !== "dark");
   }
 
-  try {
-    localStorage.setItem("transcript_theme", normalized);
-  } catch (_) {}
+  if (syncLocal) {
+    try {
+      localStorage.setItem("transcript_theme", normalized);
+    } catch (_) {}
+  }
 
   if (window.pywebview?.api?.set_titlebar_theme) {
     window.pywebview.api.set_titlebar_theme(normalized).catch(() => {});
   }
 
   if (persist) {
+    if (state.systemStatus?.settings) {
+      state.systemStatus.settings.theme = normalized;
+    }
     api("/api/settings", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -1104,8 +1116,9 @@ async function refreshSystemStatus(options = {}) {
     state.systemStatus = data;
     renderTelemetry(data);
     syncCaptureModeBar();
-    if (data.settings?.theme && !localStorage.getItem("transcript_theme")) {
-      applyTheme(data.settings.theme, false);
+    if (data.settings?.theme && !state.themeSyncedFromServer && !state.themeUserToggled) {
+      state.themeSyncedFromServer = true;
+      applyTheme(data.settings.theme, false, true);
     }
     if (data.settings && !state.appearancePreviewBackup) {
       const hasLocalAccent = Boolean(localStorage.getItem("transcript_accent_color"));
@@ -1546,6 +1559,10 @@ async function selectSession(sessionId) {
     }
     stopAllOtherAudio(null);
     state.activeRecordingId = null;
+    state.activePodcastId = null;
+    state.podcastViewMode = "listen";
+    state.lastLockedPodId = null;
+    podcastPlayback = null;
     state.transcriptRecFilter = null;
     state.transcriptSpeakerFilter = null;
   }
@@ -4346,27 +4363,165 @@ function getPodcastFormState(session) {
   return st;
 }
 
+function computePodcastTurnTimings(script, totalDurationSec) {
+  const turns = Array.isArray(script) ? script : [];
+  const hasExact =
+    turns.length > 0 &&
+    turns.every(
+      (t) => Number.isFinite(Number(t.start)) && Number.isFinite(Number(t.end)) && Number(t.end) > Number(t.start)
+    );
+
+  const buildWordTimings = (text, startSec, endSec) => {
+    const clean = String(text || "");
+    const parts = Array.from(clean.matchAll(/\S+/g));
+    const span = Math.max(0.05, endSec - startSec);
+    if (parts.length === 0) return { parts, words: [] };
+
+    const weights = parts.map((m) => {
+      const w = m[0];
+      let wt = Math.max(2, w.length);
+      if (/[,;:]$/.test(w)) wt += 2;
+      else if (/[.!?…]$/.test(w)) wt += 4;
+      return wt;
+    });
+    const totalW = weights.reduce((a, b) => a + b, 0) || parts.length;
+    let cur = startSec;
+    const words = parts.map((m, i) => {
+      const dur = (weights[i] / totalW) * span;
+      const wStart = cur;
+      const wEnd = i === parts.length - 1 ? endSec : cur + dur;
+      cur = wEnd;
+      return { start: wStart, end: wEnd, index: m.index, text: m[0] };
+    });
+    return { parts, words };
+  };
+
+  if (hasExact) {
+    return {
+      estimated: false,
+      turns: turns.map((t) => {
+        const start = Number(t.start);
+        const end = Number(t.end);
+        const { parts, words } = buildWordTimings(t.text, start, end);
+        return { ...t, start, end, parts, words };
+      }),
+    };
+  }
+
+  // Fallback for previously generated episodes without stored per-turn timestamps
+  const pauses = turns.map((t, i) =>
+    i === 0 ? 0 : (turns[i - 1].speaker !== t.speaker ? 0.34 : 0.16)
+  );
+  const pauseSum = pauses.reduce((a, b) => a + b, 0);
+  const dur = Math.max(1, Number(totalDurationSec) || turns.length * 4);
+  const speechBudget = Math.max(1, dur - pauseSum);
+  const charWeights = turns.map((t) => Math.max(12, String(t.text || "").length));
+  const totalChars = charWeights.reduce((a, b) => a + b, 0) || 1;
+
+  let cursor = 0;
+  return {
+    estimated: true,
+    turns: turns.map((t, i) => {
+      cursor += pauses[i];
+      const start = cursor;
+      const turnDur = (charWeights[i] / totalChars) * speechBudget;
+      const end = i === turns.length - 1 ? Math.max(start + 0.1, dur) : start + turnDur;
+      cursor = end;
+      const { parts, words } = buildWordTimings(t.text, start, end);
+      return { ...t, start, end, parts, words };
+    }),
+  };
+}
+
+function seekPodcastTurn(podId, seconds, autoPlay = true) {
+  const audio = podcastAudioPlayers.get(podId);
+  if (!audio) return;
+  const target = Math.max(0, Number(seconds) || 0);
+  const jump = () => {
+    audio.currentTime = target;
+    if (autoPlay) {
+      stopAllOtherAudio(podId);
+      audio.play().catch((err) => showToast(`No se pudo reproducir: ${err.message}`, true));
+    }
+    syncPodcastAudioCardDOM(podId);
+    syncPodcastPlayback(audio, true);
+  };
+  if (audio.readyState >= 1) {
+    jump();
+  } else {
+    audio.addEventListener("loadedmetadata", jump, { once: true });
+    audio.load();
+  }
+}
+
 function getOrCreatePodcastAudio(pod) {
   let audio = podcastAudioPlayers.get(pod.id);
   if (!audio) {
     audio = new Audio(`/api/podcasts/${pod.id}/audio`);
     audio.preload = "metadata";
-    audio.addEventListener("timeupdate", () => syncPodcastAudioCardDOM(pod.id));
-    audio.addEventListener("play", () => syncPodcastAudioCardDOM(pod.id));
-    audio.addEventListener("pause", () => syncPodcastAudioCardDOM(pod.id));
-    audio.addEventListener("ended", () => syncPodcastAudioCardDOM(pod.id));
-    audio.addEventListener("loadedmetadata", () => syncPodcastAudioCardDOM(pod.id));
+    audio.dataset.podId = pod.id;
+
+    let frameId = 0;
+    const syncAll = () => {
+      syncPodcastAudioCardDOM(pod.id);
+      syncPodcastPlayback(audio);
+    };
+    const followWords = () => {
+      frameId = 0;
+      if (audio.paused || audio.ended) return;
+      syncPodcastPlayback(audio);
+      frameId = requestAnimationFrame(followWords);
+    };
+
+    audio.addEventListener("timeupdate", syncAll);
+    audio.addEventListener("play", () => {
+      syncAll();
+      if (!frameId) frameId = requestAnimationFrame(followWords);
+    });
+    audio.addEventListener("seeked", syncAll);
+    audio.addEventListener("pause", syncAll);
+    audio.addEventListener("ended", syncAll);
+    audio.addEventListener("loadedmetadata", () => {
+      syncPodcastAudioCardDOM(pod.id);
+      if (
+        podcastPlayback?.podId === pod.id &&
+        podcastPlayback.estimated &&
+        Number.isFinite(audio.duration) &&
+        audio.duration > 0
+      ) {
+        const recomputed = computePodcastTurnTimings(
+          podcastPlayback.rows.map((r) => r.rawTurn),
+          audio.duration
+        );
+        podcastPlayback.estimated = false;
+        podcastPlayback.rows.forEach((rowObj, idx) => {
+          const t = recomputed.turns[idx];
+          if (!t) return;
+          rowObj.start = t.start;
+          rowObj.end = t.end;
+          if (rowObj.tsBtn) rowObj.tsBtn.textContent = formatDuration(t.start);
+          rowObj.words.forEach((wObj, wi) => {
+            if (t.words[wi]) {
+              wObj.start = t.words[wi].start;
+              wObj.end = t.words[wi].end;
+            }
+          });
+        });
+      }
+      syncPodcastPlayback(audio);
+    });
     podcastAudioPlayers.set(pod.id, audio);
   }
   return audio;
 }
 
 function syncPodcastAudioCardDOM(podId) {
-  const card = document.querySelector(`.podcast-episode-card[data-pod-id="${podId}"]`);
+  const card = document.querySelector(`.podcast-listen-deck[data-pod-id="${podId}"]`);
   const audio = podcastAudioPlayers.get(podId);
   if (!card || !audio) return;
 
-  const playBtn = card.querySelector(".play-circle");
+  card.classList.toggle("is-playing", !audio.paused && !audio.ended);
+  const playBtn = card.querySelector(".podcast-play-btn");
   if (playBtn) playBtn.innerHTML = audio.paused ? ICON_PLAY : ICON_PAUSE;
 
   const dur = Number.isFinite(audio.duration) && audio.duration > 0
@@ -4378,11 +4533,87 @@ function syncPodcastAudioCardDOM(podId) {
   const fill = card.querySelector(".scrubber-fill");
   if (fill) fill.style.width = `${pct}%`;
 
-  const timeEl = card.querySelector(".pod-time");
-  if (timeEl) timeEl.textContent = `${formatDuration(cur)} / ${formatDuration(dur)}`;
+  const curEl = card.querySelector(".pod-cur-time");
+  if (curEl) curEl.textContent = formatDuration(cur);
+  const durEl = card.querySelector(".pod-dur-time");
+  if (durEl) durEl.textContent = formatDuration(dur);
 
   const speedBtn = card.querySelector(".pod-speed-btn");
   if (speedBtn) speedBtn.textContent = `${audio.playbackRate || 1}x`;
+}
+
+function syncPodcastPlayback(audio, reveal = false) {
+  const playback = podcastPlayback;
+  const deck = playback?.podId
+    ? document.querySelector(`.podcast-listen-deck[data-pod-id="${playback.podId}"]`)
+    : null;
+  if (!audio || !playback || playback.podId !== audio.dataset.podId) {
+    return;
+  }
+
+  const time = audio.currentTime || 0;
+  const isPlaying = !audio.paused && !audio.ended;
+  let activeSeg = playback.rows.find((item) => time >= item.start && time < item.end) || null;
+  if (!activeSeg && isPlaying && playback.rows.length > 0) {
+    // Keep the most recent active turn highlighted subtly across the short 0.16-0.34s pause
+    activeSeg = playback.rows.find((item) => time >= item.start - 0.35 && time <= item.end + 0.35) || null;
+  }
+
+  const row = activeSeg?.element || null;
+  const word = activeSeg?.words.find((item) => time >= item.start && time < item.end)?.element || null;
+
+  if (deck) {
+    const activeSpeaker = isPlaying && activeSeg ? activeSeg.speaker : "";
+    deck.querySelectorAll(".podcast-host-pill[data-host]").forEach((pill) => {
+      pill.classList.toggle("is-speaking", pill.dataset.host === activeSpeaker);
+    });
+  }
+
+  if (!state.podcastAutoScroll) {
+    playback.currentRow?.removeAttribute("aria-current");
+    playback.currentRow = null;
+    playback.currentWord?.classList.remove("is-speaking");
+    playback.currentWord = null;
+    return;
+  }
+
+  const rowChanged = row !== playback.currentRow;
+  if (!rowChanged && word === playback.currentWord && !reveal) return;
+  if (rowChanged) {
+    playback.currentRow?.removeAttribute("aria-current");
+    row?.setAttribute("aria-current", "true");
+    playback.currentRow = row;
+  }
+  playback.currentWord?.classList.remove("is-speaking");
+  word?.classList.add("is-speaking");
+  playback.currentWord = word;
+
+  if (state.activeTab !== "podcast") return;
+  const scrollBox = document.querySelector(".podcast-transcript-body");
+  if (!row) return;
+  if (rowChanged || reveal) {
+    if (scrollBox && scrollBox.scrollHeight > scrollBox.clientHeight + 4) {
+      const boxRect = scrollBox.getBoundingClientRect();
+      const rowRect = row.getBoundingClientRect();
+      const pad = 28;
+      if (rowRect.top < boxRect.top + pad || rowRect.bottom > boxRect.bottom - pad) {
+        const targetTop = scrollBox.scrollTop + (rowRect.top - boxRect.top) - scrollBox.clientHeight * 0.32;
+        scrollBox.scrollTo({ top: Math.max(0, targetTop), behavior: reveal ? "smooth" : "auto" });
+      }
+    } else {
+      const centerScroll = document.getElementById("center-scroll");
+      if (centerScroll) {
+        const vp = centerScroll.getBoundingClientRect();
+        const rowRect = row.getBoundingClientRect();
+        if (rowRect.top < vp.top + 24 || rowRect.bottom > vp.bottom - 24) {
+          centerScroll.scrollTo({
+            top: Math.max(0, centerScroll.scrollTop + (rowRect.top - vp.top) - centerScroll.clientHeight * 0.33),
+            behavior: "smooth",
+          });
+        }
+      }
+    }
+  }
 }
 
 function getPodcastStageHeadline(activePod) {
@@ -4524,15 +4755,37 @@ function renderPodcastTab(session) {
   const activePod = podcasts.find((p) =>
     ["queued", "scripting", "synthesizing", "mixing"].includes(p.status)
   );
+  const readyPods = podcasts.filter((p) => p.status === "ready");
+  const errorPods = podcasts.filter((p) => p.status === "error");
   const st = session ? getPodcastFormState(session) : null;
   const isLocked = Boolean(state.podcastBusy || activePod || st?.submitting);
   const activeScriptLen = activePod ? (activePod.script || []).length : 0;
+
+  if (isLocked && activePod?.id) {
+    state.lastLockedPodId = activePod.id;
+  } else if (!isLocked && state.lastLockedPodId) {
+    if (readyPods.some((p) => p.id === state.lastLockedPodId)) {
+      state.activePodcastId = state.lastLockedPodId;
+      state.podcastViewMode = "listen";
+    }
+    state.lastLockedPodId = null;
+  }
+
+  let selectedPod = readyPods.find((p) => p.id === state.activePodcastId) || readyPods[0] || null;
+  state.activePodcastId = selectedPod?.id || null;
+  const effectiveViewMode = isLocked
+    ? "live"
+    : readyPods.length === 0
+      ? "studio"
+      : (state.podcastViewMode === "studio" ? "studio" : "listen");
 
   const structSig = [
     session?.id || "",
     readyRecs.map((r) => `${r.id}:${r.filename}`).join(","),
     readySrcs.map((s) => `${s.id}:${s.filename}`).join(","),
     isLocked ? 1 : 0,
+    effectiveViewMode,
+    selectedPod?.id || "",
     activePod ? activePod.id : "",
     activeScriptLen,
     podcasts.map((p) => `${p.id}:${p.status === "ready" || p.status === "error" ? p.status : "working"}:${(p.script || []).length}:${p.error_message || ""}`).join(","),
@@ -4564,17 +4817,38 @@ function renderPodcastTab(session) {
           el.classList.toggle("active", idx === stepIdx);
         });
       }
-    } else if (session && st && (readyRecs.length > 0 || readySrcs.length > 0)) {
+    } else if (effectiveViewMode === "studio" && session && st && (readyRecs.length > 0 || readySrcs.length > 0)) {
       syncPodcastSetupDOM(pane, session, st);
     }
     return;
   }
 
+  podcastPlayback = null;
   pane.innerHTML = "";
 
-  if (!session || (readyRecs.length === 0 && readySrcs.length === 0)) {
+  if (!session || (readyRecs.length === 0 && readySrcs.length === 0 && readyPods.length === 0 && errorPods.length === 0)) {
     pane.innerHTML = `<div class="chat-placeholder"><h3>Podcast Studio local</h3><p>Procesa al menos una grabación, PDF, presentación o imagen para generar un podcast de repaso con dos conductores 100% en tu equipo.</p></div>`;
     return;
+  }
+
+  if (!isLocked && readyPods.length > 0) {
+    const modeBar = document.createElement("div");
+    modeBar.className = "podcast-mode-bar";
+    modeBar.innerHTML = `
+      <div class="podcast-mode-tabs" role="tablist" aria-label="Vista de podcast">
+        <button type="button" class="podcast-mode-tab ${effectiveViewMode === "listen" ? "active" : ""}" data-pod-view="listen">🎧 Escuchar (${readyPods.length})</button>
+        <button type="button" class="podcast-mode-tab ${effectiveViewMode === "studio" ? "active" : ""}" data-pod-view="studio" ${readyRecs.length === 0 && readySrcs.length === 0 ? "disabled" : ""}>+ Nuevo episodio</button>
+      </div>
+    `;
+    modeBar.querySelectorAll("[data-pod-view]").forEach((btn) => {
+      btn.onclick = () => {
+        const nextView = btn.dataset.podView;
+        if (!nextView || state.podcastViewMode === nextView) return;
+        state.podcastViewMode = nextView;
+        renderPodcastTab(session);
+      };
+    });
+    pane.appendChild(modeBar);
   }
 
   if (isLocked) {
@@ -4645,7 +4919,7 @@ function renderPodcastTab(session) {
     }
 
     pane.appendChild(stage);
-  } else {
+  } else if (effectiveViewMode === "studio") {
     const sourceTilesHtml = buildSourceTilesHtml(readyRecs, readySrcs, st.selectedRecIds, st.selectedSrcIds, "pod");
     const styleCards = [
       { id: "conversation", title: "Conversación natural", desc: "Charla amena conectando ideas y ejemplos" },
@@ -4808,16 +5082,7 @@ function renderPodcastTab(session) {
     studio.querySelector(".pod-start-btn").onclick = () => generatePodcastForSession(session);
     pane.appendChild(studio);
     syncPodcastSetupDOM(pane, session, st);
-  }
-
-  // Completed / Errored Episodes
-  const finishedPods = podcasts.filter((p) => p.status === "ready" || p.status === "error");
-  for (const pod of finishedPods) {
-    const ep = document.createElement("div");
-    ep.className = "podcast-episode-card";
-    ep.dataset.podId = pod.id;
-    ep.dataset.durationSec = String(pod.duration_sec || 0);
-
+  } else if (selectedPod) {
     const styleNames = {
       conversation: "Conversación",
       exam_review: "Repaso examen",
@@ -4825,101 +5090,269 @@ function renderPodcastTab(session) {
       step_by_step: "Paso a paso",
     };
 
-    if (pod.status === "ready") {
-      const audio = getOrCreatePodcastAudio(pod);
-      const top = document.createElement("div");
-      top.className = "podcast-episode-top";
+    if (readyPods.length >= 2) {
+      const switcher = document.createElement("div");
+      switcher.className = "podcast-episode-pills";
+      readyPods.forEach((p, idx) => {
+        const epBtn = document.createElement("button");
+        epBtn.type = "button";
+        epBtn.className = `podcast-ep-pill ${p.id === selectedPod.id ? "active" : ""}`;
+        epBtn.title = p.title;
+        epBtn.innerHTML = `<span>${idx + 1}. ${escapeHtml(p.title)}</span><small>${formatDuration(p.duration_sec)}</small>`;
+        epBtn.onclick = () => {
+          if (state.activePodcastId === p.id) return;
+          state.activePodcastId = p.id;
+          renderPodcastTab(session);
+        };
+        switcher.appendChild(epBtn);
+      });
+      pane.appendChild(switcher);
+    }
 
-      const playBtn = document.createElement("button");
-      playBtn.type = "button";
-      playBtn.className = "play-circle";
-      playBtn.innerHTML = audio.paused ? ICON_PLAY : ICON_PAUSE;
-      playBtn.onclick = () => {
-        if (audio.paused) {
-          stopAllOtherAudio(pod.id);
-          audio.play().catch((err) => showToast(`No se pudo reproducir: ${err.message}`, true));
-        } else {
-          audio.pause();
-        }
-        syncPodcastAudioCardDOM(pod.id);
+    const audio = getOrCreatePodcastAudio(selectedPod);
+    const dur = Number.isFinite(audio.duration) && audio.duration > 0
+      ? audio.duration
+      : (selectedPod.duration_sec || 0);
+    const isEn = String(selectedPod.language || "es").toLowerCase().startsWith("en");
+    const scriptTurns = Array.isArray(selectedPod.script) ? selectedPod.script : [];
+    const hostAName = scriptTurns.find((t) => t.speaker !== "B")?.name || (isEn ? "Claire" : "Sofía");
+    const hostBName = scriptTurns.find((t) => t.speaker === "B")?.name || (isEn ? "Ryan" : "Mateo");
+
+    const listenShell = document.createElement("div");
+    listenShell.className = "podcast-listen-shell";
+
+    const deck = document.createElement("div");
+    deck.className = `podcast-listen-deck ${!audio.paused && !audio.ended ? "is-playing" : ""}`;
+    deck.dataset.podId = selectedPod.id;
+    deck.dataset.durationSec = String(selectedPod.duration_sec || 0);
+
+    const pct = dur > 0 ? Math.min(100, ((audio.currentTime || 0) / dur) * 100) : 0;
+    deck.innerHTML = `
+      <div class="podcast-deck-top">
+        <div class="podcast-deck-info">
+          <div class="podcast-deck-eyebrow">
+            <span class="card-badge">${escapeHtml(styleNames[selectedPod.style] || selectedPod.style)} · ${(selectedPod.language || "es").toUpperCase()}</span>
+            <span class="podcast-host-pill host-a" data-host="A"><span class="podcast-host-dot"></span>${escapeHtml(hostAName)}</span>
+            <span class="podcast-host-pill host-b" data-host="B"><span class="podcast-host-dot"></span>${escapeHtml(hostBName)}</span>
+          </div>
+          <h2 class="podcast-deck-title">${escapeHtml(selectedPod.title)}</h2>
+        </div>
+        <div class="podcast-deck-actions">
+          <a class="pill-btn outline xs pod-dl-link" href="/api/podcasts/${encodeURIComponent(selectedPod.id)}/audio" download="${escapeHtml(selectedPod.title || "podcast")}.wav" title="Descargar audio WAV">Descargar .wav</a>
+          <button type="button" class="pill-btn danger-soft xs pod-del-btn" title="Eliminar episodio">Eliminar</button>
+        </div>
+      </div>
+      <div class="podcast-transport">
+        <button type="button" class="podcast-skip-btn" data-pod-skip="-10" title="Retroceder 10 segundos">-10s</button>
+        <button type="button" class="podcast-play-btn" title="Reproducir o pausar">${audio.paused ? ICON_PLAY : ICON_PAUSE}</button>
+        <button type="button" class="podcast-skip-btn" data-pod-skip="10" title="Adelantar 10 segundos">+10s</button>
+        <div class="podcast-scrubber-col">
+          <div class="scrubber-track" title="Haz clic para saltar a cualquier momento">
+            <div class="scrubber-fill" style="width:${pct}%"></div>
+          </div>
+          <div class="podcast-time-row">
+            <span class="pod-cur-time">${formatDuration(audio.currentTime || 0)}</span>
+            <span class="pod-dur-time">${formatDuration(dur)}</span>
+          </div>
+        </div>
+        <button type="button" class="pill-btn outline xs pod-speed-btn" title="Cambiar velocidad de reproducción">${audio.playbackRate || 1}x</button>
+      </div>
+    `;
+
+    deck.querySelector(".podcast-play-btn").onclick = () => {
+      if (audio.paused) {
+        stopAllOtherAudio(selectedPod.id);
+        audio.play().catch((err) => showToast(`No se pudo reproducir: ${err.message}`, true));
+      } else {
+        audio.pause();
+      }
+      syncPodcastAudioCardDOM(selectedPod.id);
+      syncPodcastPlayback(audio);
+    };
+
+    deck.querySelectorAll("[data-pod-skip]").forEach((btn) => {
+      btn.onclick = () => {
+        const delta = Number(btn.dataset.podSkip || 0);
+        const targetDur = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : (selectedPod.duration_sec || 0);
+        const nextTime = Math.max(0, Math.min(targetDur || Infinity, (audio.currentTime || 0) + delta));
+        seekPodcastTurn(selectedPod.id, nextTime, !audio.paused);
       };
+    });
 
-      const meta = document.createElement("div");
-      meta.className = "podcast-episode-meta";
-      const dur = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : (pod.duration_sec || 0);
-      meta.innerHTML = `
-        <div class="podcast-episode-title">${escapeHtml(pod.title)}</div>
-        <div class="podcast-episode-sub">
-          <span class="pod-time">${formatDuration(audio.currentTime || 0)} / ${formatDuration(dur)}</span>
-          · ${escapeHtml(styleNames[pod.style] || pod.style)} · ${(pod.language || "es").toUpperCase()}
-          · ${escapeHtml(pod.tts_engine || "piper-onnx")}
+    const track = deck.querySelector(".scrubber-track");
+    track.onclick = (e) => {
+      const rect = track.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const targetDur = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : (selectedPod.duration_sec || 0);
+      if (targetDur > 0) {
+        seekPodcastTurn(selectedPod.id, ratio * targetDur, !audio.paused);
+      }
+    };
+
+    deck.querySelector(".pod-speed-btn").onclick = () => {
+      const speeds = [1, 1.25, 1.5, 2];
+      audio.playbackRate = speeds[(speeds.indexOf(audio.playbackRate) + 1) % speeds.length];
+      syncPodcastAudioCardDOM(selectedPod.id);
+    };
+
+    deck.querySelector(".pod-del-btn").onclick = () => {
+      openConfirm("Eliminar podcast", `¿Eliminar "${selectedPod.title}"?`, async () => {
+        audio.pause();
+        podcastAudioPlayers.delete(selectedPod.id);
+        if (state.activePodcastId === selectedPod.id) state.activePodcastId = null;
+        await api(`/api/sessions/${session.id}/podcasts/${selectedPod.id}`, { method: "DELETE" });
+        await selectSession(session.id);
+        showToast("Podcast eliminado.");
+      });
+    };
+
+    listenShell.appendChild(deck);
+
+    if (scriptTurns.length > 0) {
+      const scriptCard = document.createElement("div");
+      scriptCard.className = "podcast-transcript-card";
+
+      const head = document.createElement("div");
+      head.className = "podcast-transcript-head";
+      head.innerHTML = `
+        <div class="podcast-transcript-title">
+          <span>Guion sincronizado</span>
+          <span class="card-badge">${scriptTurns.length} intervenciones · Pulsa cualquier frase para saltar</span>
+        </div>
+        <div class="podcast-transcript-actions">
+          <button type="button" class="pill-btn outline xs podcast-follow-btn" title="Activar o desactivar seguimiento del texto en vivo"></button>
+          <button type="button" class="pill-btn outline xs podcast-copy-btn" title="Copiar guion completo">Copiar</button>
         </div>
       `;
-
-      const actions = document.createElement("div");
-      actions.className = "podcast-episode-actions";
-
-      const speedBtn = document.createElement("button");
-      speedBtn.type = "button";
-      speedBtn.className = "pill-btn outline xs pod-speed-btn";
-      speedBtn.textContent = `${audio.playbackRate || 1}x`;
-      speedBtn.onclick = () => {
-        const speeds = [1, 1.25, 1.5, 2];
-        audio.playbackRate = speeds[(speeds.indexOf(audio.playbackRate) + 1) % speeds.length];
-        syncPodcastAudioCardDOM(pod.id);
+      const followBtn = head.querySelector(".podcast-follow-btn");
+      const syncFollowBtn = () => {
+        const on = Boolean(state.podcastAutoScroll);
+        followBtn.classList.toggle("active", on);
+        followBtn.setAttribute("aria-pressed", String(on));
+        followBtn.textContent = on ? "✓ Siguiendo texto" : "Seguir texto";
       };
+      syncFollowBtn();
+      followBtn.onclick = () => {
+        state.podcastAutoScroll = !state.podcastAutoScroll;
+        syncFollowBtn();
+        syncPodcastPlayback(audio, state.podcastAutoScroll);
+      };
+      const copyBtn = head.querySelector(".podcast-copy-btn");
+      copyBtn.onclick = async () => {
+        if (!navigator.clipboard?.writeText) return;
+        const plain = scriptTurns
+          .map((t) => `${t.name || t.speaker}: ${t.text}`)
+          .join("\n\n");
+        await navigator.clipboard.writeText(plain);
+        const prev = copyBtn.textContent;
+        copyBtn.textContent = "✓ Copiado";
+        copyBtn.classList.add("is-confirmed");
+        showToast("Guion copiado.");
+        setTimeout(() => {
+          copyBtn.classList.remove("is-confirmed");
+          copyBtn.textContent = prev;
+        }, 1600);
+      };
+      scriptCard.appendChild(head);
 
-      const dlLink = document.createElement("a");
-      dlLink.className = "pill-btn outline xs";
-      dlLink.href = `/api/podcasts/${pod.id}/audio`;
-      dlLink.download = `${pod.title || "podcast"}.wav`;
-      dlLink.textContent = "Descargar .wav";
-      dlLink.style.textDecoration = "none";
+      const body = document.createElement("div");
+      body.className = "podcast-transcript-body";
 
-      const delBtn = document.createElement("button");
-      delBtn.type = "button";
-      delBtn.className = "pill-btn danger-soft xs";
-      delBtn.textContent = "Eliminar";
-      delBtn.onclick = () => {
-        openConfirm("Eliminar podcast", `¿Eliminar "${pod.title}"?`, async () => {
-          audio.pause();
-          podcastAudioPlayers.delete(pod.id);
-          await api(`/api/sessions/${session.id}/podcasts/${pod.id}`, { method: "DELETE" });
-          await selectSession(session.id);
-          showToast("Podcast eliminado.");
+      const { estimated, turns } = computePodcastTurnTimings(scriptTurns, dur);
+      const rows = [];
+
+      for (const turn of turns) {
+        const isHostB = turn.speaker === "B";
+        const rowEl = document.createElement("div");
+        rowEl.className = `podcast-turn-row ${isHostB ? "host-b" : "host-a"}`;
+
+        const metaCol = document.createElement("div");
+        metaCol.className = "podcast-turn-meta";
+
+        const tsBtn = document.createElement("button");
+        tsBtn.type = "button";
+        tsBtn.className = "timestamp-btn podcast-turn-ts";
+        tsBtn.textContent = formatDuration(turn.start);
+        tsBtn.title = "Reproducir desde esta intervención";
+        tsBtn.onclick = (e) => {
+          e.stopPropagation();
+          seekPodcastTurn(selectedPod.id, turn.start, true);
+        };
+
+        const spkEl = document.createElement("span");
+        spkEl.className = `podcast-turn-speaker-chip ${isHostB ? "host-b" : "host-a"}`;
+        spkEl.textContent = turn.name || turn.speaker;
+
+        metaCol.appendChild(tsBtn);
+        metaCol.appendChild(spkEl);
+
+        const textCol = document.createElement("div");
+        textCol.className = "podcast-turn-text segment-words";
+
+        const clean = String(turn.text || "");
+        let offset = 0;
+        const timedWords = turn.words.map((w) => {
+          if (w.index > offset) {
+            textCol.appendChild(document.createTextNode(clean.slice(offset, w.index)));
+          }
+          const span = document.createElement("span");
+          span.className = "segment-word";
+          span.textContent = w.text;
+          span.onclick = (e) => {
+            if (window.getSelection()?.isCollapsed === false) return;
+            e.stopPropagation();
+            seekPodcastTurn(selectedPod.id, w.start, true);
+          };
+          textCol.appendChild(span);
+          offset = w.index + w.text.length;
+          return { start: w.start, end: w.end, element: span };
         });
-      };
-
-      actions.appendChild(speedBtn);
-      actions.appendChild(dlLink);
-      actions.appendChild(delBtn);
-
-      top.appendChild(playBtn);
-      top.appendChild(meta);
-      top.appendChild(actions);
-      ep.appendChild(top);
-
-      const scrubWrap = document.createElement("div");
-      scrubWrap.className = "scrubber-wrap";
-      const track = document.createElement("div");
-      track.className = "scrubber-track";
-      const fill = document.createElement("div");
-      fill.className = "scrubber-fill";
-      const pct = dur > 0 ? Math.min(100, ((audio.currentTime || 0) / dur) * 100) : 0;
-      fill.style.width = `${pct}%`;
-      track.appendChild(fill);
-      track.onclick = (e) => {
-        const rect = track.getBoundingClientRect();
-        const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-        const targetDur = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : (pod.duration_sec || 0);
-        if (targetDur > 0) {
-          audio.currentTime = ratio * targetDur;
-          syncPodcastAudioCardDOM(pod.id);
+        if (offset < clean.length) {
+          textCol.appendChild(document.createTextNode(clean.slice(offset)));
         }
+
+        rowEl.onclick = () => {
+          if (window.getSelection()?.isCollapsed !== false) {
+            seekPodcastTurn(selectedPod.id, turn.start, true);
+          }
+        };
+
+        rowEl.appendChild(metaCol);
+        rowEl.appendChild(textCol);
+        body.appendChild(rowEl);
+        rows.push({
+          rawTurn: turn,
+          speaker: isHostB ? "B" : "A",
+          start: turn.start,
+          end: turn.end,
+          tsBtn,
+          element: rowEl,
+          words: timedWords,
+        });
+      }
+
+      scriptCard.appendChild(body);
+      listenShell.appendChild(scriptCard);
+
+      podcastPlayback = {
+        podId: selectedPod.id,
+        estimated,
+        rows,
+        currentRow: null,
+        currentWord: null,
       };
-      scrubWrap.appendChild(track);
-      ep.appendChild(scrubWrap);
-    } else {
+      syncPodcastPlayback(audio, false);
+    }
+
+    pane.appendChild(listenShell);
+    syncPodcastAudioCardDOM(selectedPod.id);
+  }
+
+  // Failed podcast jobs (compact dismissible banners)
+  if (!isLocked && errorPods.length > 0) {
+    for (const pod of errorPods) {
+      const ep = document.createElement("div");
+      ep.className = "podcast-episode-card is-error";
       ep.innerHTML = `
         <div class="podcast-episode-top">
           <div class="podcast-episode-meta">
@@ -4933,27 +5366,8 @@ function renderPodcastTab(session) {
         await api(`/api/sessions/${session.id}/podcasts/${pod.id}`, { method: "DELETE" });
         await selectSession(session.id);
       };
+      pane.appendChild(ep);
     }
-
-    if (Array.isArray(pod.script) && pod.script.length > 0) {
-      const details = document.createElement("details");
-      details.className = "podcast-script-details";
-      const sum = document.createElement("summary");
-      sum.textContent = `Ver guion del episodio (${pod.script.length} intervenciones)`;
-      const listEl = document.createElement("div");
-      listEl.className = "podcast-script-list";
-      for (const turn of pod.script) {
-        const turnEl = document.createElement("div");
-        turnEl.className = `podcast-turn ${turn.speaker === "B" ? "host-b" : "host-a"}`;
-        turnEl.innerHTML = `<span class="podcast-turn-speaker">${escapeHtml(turn.name || turn.speaker)}</span><span>${escapeHtml(turn.text)}</span>`;
-        listEl.appendChild(turnEl);
-      }
-      details.appendChild(sum);
-      details.appendChild(listEl);
-      ep.appendChild(details);
-    }
-
-    pane.appendChild(ep);
   }
 }
 
@@ -6247,7 +6661,9 @@ async function triggerUnloadVram() {
 function initEvents() {
   document.getElementById("btn-toggle-theme").onclick = () => {
     const next = state.theme === "dark" ? "light" : "dark";
-    applyTheme(next, true);
+    state.themeUserToggled = true;
+    state.themeSyncedFromServer = true;
+    applyTheme(next, true, true);
   };
 
   const studioBody = document.getElementById("studio-body");
@@ -6827,12 +7243,12 @@ function initEvents() {
 async function initApp() {
   const savedTheme = (() => {
     try {
-      return localStorage.getItem("transcript_theme") || "light";
+      return localStorage.getItem("transcript_theme");
     } catch (_) {
-      return "light";
+      return null;
     }
   })();
-  applyTheme(savedTheme, false);
+  applyTheme(savedTheme || "light", false, false);
 
   try {
     const savedAccent = localStorage.getItem("transcript_accent_color");

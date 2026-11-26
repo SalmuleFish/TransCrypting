@@ -2238,7 +2238,7 @@ async def _run_podcast_job(
 
             eco_mode = bool(settings.get("eco_mode", False))
             eco_cpu_threads = int(settings.get("eco_cpu_threads") or 2)
-            return synthesize_podcast_audio(
+            dur, eng = synthesize_podcast_audio(
                 turns=turns,
                 output_path=out_path,
                 language=language,
@@ -2247,6 +2247,8 @@ async def _run_podcast_job(
                 cancel_event=cancel_event,
                 cpu_threads=eco_cpu_threads if eco_mode else 0,
             )
+            db.update_podcast_script(podcast_id, turns)
+            return dur, eng
 
         duration_sec, tts_engine = await resource_manager.run_podcast_exclusive(
             podcast_id=podcast_id,

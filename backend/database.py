@@ -1549,7 +1549,7 @@ class Database:
     def update_podcast_script(
         self,
         podcast_id: str,
-        script: list[dict[str, str]],
+        script: list[dict[str, Any]],
     ) -> None:
         with self._lock:
             conn = self._get_conn()

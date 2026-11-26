@@ -648,6 +648,7 @@ def synthesize_podcast_audio(
 
     audio_segments: list[np.ndarray] = []
     prev_speaker = ""
+    cursor_samples = 0
 
     try:
         with tempfile.TemporaryDirectory(prefix="podcast_tts_") as tmp_dir:
@@ -689,7 +690,12 @@ def synthesize_podcast_audio(
                 if len(pcm) > 0:
                     if audio_segments:
                         gap_sec = 0.34 if speaker != prev_speaker else 0.16
-                        audio_segments.append(np.zeros(int(target_rate * gap_sec), dtype=np.float32))
+                        gap_samples = int(target_rate * gap_sec)
+                        audio_segments.append(np.zeros(gap_samples, dtype=np.float32))
+                        cursor_samples += gap_samples
+                    turn["start"] = round(cursor_samples / float(target_rate), 3)
+                    cursor_samples += len(pcm)
+                    turn["end"] = round(cursor_samples / float(target_rate), 3)
                     audio_segments.append(pcm)
                     prev_speaker = speaker
 
