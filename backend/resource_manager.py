@@ -6,10 +6,12 @@ import asyncio
 import gc
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
+from uuid import uuid4
 
-from backend.config import PARAKEET_MODEL_ID
+from backend.config import MLX_ASR_MODELS, PARAKEET_MODEL_ID
 from backend.database import db
 from backend.ollama_service import ollama_service
 from backend.whisper_service import WhisperCancelledError, whisper_service
@@ -36,6 +38,34 @@ class ResourceManager:
         self._watchdog_task: asyncio.Task[None] | None = None
         self._active_tasks: set[asyncio.Task[Any]] = set()
         self._active_cancel_events: set[threading.Event] = set()
+        self._operation: tuple[dict[str, str], asyncio.Task[Any], threading.Event | None] | None = None
+
+    @asynccontextmanager
+    async def _run_operation(
+        self,
+        kind: str,
+        *,
+        label: str = "",
+        cancel_event: threading.Event | None = None,
+    ) -> AsyncIterator[None]:
+        async with self._gpu_lock:
+            task = asyncio.current_task()
+            if task is not None:
+                self._operation = ({"id": uuid4().hex, "kind": kind, "label": label}, task, cancel_event)
+            try:
+                yield
+            finally:
+                self._operation = None
+
+    def stop_operation(self, operation_id: str) -> bool:
+        if self._operation is None:
+            return False
+        info, task, cancel_event = self._operation
+        if info["id"] != operation_id or task.done() or task.cancelling():
+            return False
+        if cancel_event is not None:
+            cancel_event.set()
+        return task.cancel()
 
     def _register_current_task(self) -> asyncio.Task[Any] | None:
         task = asyncio.current_task()
@@ -54,10 +84,15 @@ class ResourceManager:
         return bool(self.podcast_active)
 
     def get_state(self) -> dict[str, Any]:
+        operation = None
+        if self._operation is not None:
+            info, task, _ = self._operation
+            operation = {**info, "stopping": bool(task.cancelling())}
         return {
             "phase": self.phase,
             "active_model": self.active_model,
             "active_device": self.active_device,
+            "active_operation": operation,
             "whisper_loaded": whisper_service.is_loaded,
             "idle_seconds": int(max(0.0, time.monotonic() - self.last_activity_ts)),
             "podcast_active": self.podcast_active,
@@ -81,12 +116,12 @@ class ResourceManager:
         cancel_ev = threading.Event()
         self._active_cancel_events.add(cancel_ev)
         try:
-            async with self._gpu_lock:
+            async with self._run_operation("audio", cancel_event=cancel_ev):
                 if cancel_ev.is_set():
                     raise WhisperCancelledError("Transcripción detenida por el usuario.")
                 try:
                     self.phase = "unloading"
-                    self.active_model = ""
+                    self.active_model = model_name if model_name == PARAKEET_MODEL_ID or model_name in MLX_ASR_MODELS else f"whisper-{model_name}"
                     self.active_device = ""
                     await ollama_service.unload_all()
 
@@ -94,7 +129,6 @@ class ResourceManager:
                         raise WhisperCancelledError("Transcripción detenida por el usuario.")
 
                     self.phase = "whisper"
-                    self.active_model = model_name if model_name == PARAKEET_MODEL_ID else f"whisper-{model_name}"
 
                     def _run_transcription() -> dict[str, Any]:
                         if cancel_ev.is_set():
@@ -139,11 +173,13 @@ class ResourceManager:
         model_name: str,
         num_ctx: int,
         idle_unload_sec: int,
+        num_predict: int | None = None,
+        operation_label: str = "",
     ) -> str:
         """Ensure Whisper is unloaded, then run Ollama summary generation."""
         task = self._register_current_task()
         try:
-            async with self._gpu_lock:
+            async with self._run_operation("text", label=operation_label):
                 try:
                     if whisper_service.is_loaded:
                         self.phase = "unloading"
@@ -156,6 +192,8 @@ class ResourceManager:
                     settings = db.get_settings()
                     eco_mode = bool(settings.get("eco_mode", False))
                     eco_cpu_threads = int(settings.get("eco_cpu_threads") or 2)
+                    if eco_mode and num_predict is not None:
+                        num_predict = min(768, num_predict)
                     text = await ollama_service.generate_complete(
                         model=model_name,
                         messages=messages,
@@ -163,6 +201,7 @@ class ResourceManager:
                         keep_alive=keep_alive,
                         eco_mode=eco_mode,
                         eco_cpu_threads=eco_cpu_threads,
+                        num_predict=num_predict,
                     )
                     self.touch_activity()
                     return text
@@ -184,7 +223,7 @@ class ResourceManager:
         """Acquire GPU lock, ensure Whisper is unloaded, and stream ('thinking'|'token', text)."""
         task = self._register_current_task()
         try:
-            async with self._gpu_lock:
+            async with self._run_operation("text", label="Chat"):
                 try:
                     if whisper_service.is_loaded:
                         self.phase = "unloading"
@@ -261,7 +300,7 @@ class ResourceManager:
             on_stage("queued", 0.05, self.podcast_stage)
 
         try:
-            async with self._gpu_lock:
+            async with self._run_operation("podcast", cancel_event=cancel_event):
                 try:
                     if cancel_event is not None and cancel_event.is_set():
                         raise asyncio.CancelledError()

@@ -10,9 +10,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend import app as app_module
-from backend.config import list_available_whisper_models
+from backend.config import MLX_ASR_SUPPORTED, NEMOTRON_MODEL_ID, list_available_whisper_models
 from backend.context_manager import (
     build_chat_messages,
+    build_combined_summary_messages,
     estimate_session_context_usage,
     format_transcript_for_llm,
     parse_grade_json,
@@ -21,6 +22,24 @@ from backend.context_manager import (
 )
 from backend.database import Database
 from backend.resource_manager import ResourceManager
+
+
+def test_combined_summary_limits_large_inputs_and_keeps_each_active_source() -> None:
+    recordings = [
+        {"filename": "clase.wav", "summary_text": "Inicio " + " detalle " * 3000 + " Cierre"},
+        {"filename": "reunion.wav", "transcript_text": "Acuerdo de la reunión"},
+    ]
+    sources = [
+        {"filename": "notas.pdf", "extracted_text": "Notas complementarias"},
+        {"filename": "oculto.pdf", "summary_text": "Fuente desactivada", "enabled": False},
+    ]
+    prompt = build_combined_summary_messages(recordings, sources, max_input_chars=600)[-1]["content"]
+    assert "clase.wav" in prompt and "Inicio " in prompt and " Cierre" in prompt
+    excerpt = prompt.split(" ===\n", 1)[1].split("\n\n=== Grabación 2", 1)[0]
+    assert len(excerpt) == 200
+    assert "reunion.wav" in prompt and "Acuerdo de la reunión" in prompt
+    assert "notas.pdf" in prompt and "Notas complementarias" in prompt
+    assert "oculto.pdf" not in prompt
 
 
 def test_clear_chat_history_preserves_recordings_transcripts_and_summaries(tmp_path: Path) -> None:
@@ -136,6 +155,7 @@ def test_resource_manager_unloads_ollama_before_whisper_and_frees_whisper() -> N
         events.append("ollama_unloaded")
 
     def fake_load(model_name: str, device_pref: str = "auto") -> str:
+        assert rm.get_state()["active_operation"]["kind"] == "audio"
         events.append(f"whisper_loaded:{model_name}:{device_pref}")
         return "cuda"
 
@@ -153,6 +173,7 @@ def test_resource_manager_unloads_ollama_before_whisper_and_frees_whisper() -> N
         events.append("whisper_unloaded")
 
     with (
+        patch("backend.resource_manager.db.get_settings", return_value={}),
         patch("backend.resource_manager.ollama_service.unload_all", side_effect=fake_unload_ollama),
         patch("backend.resource_manager.whisper_service.load", side_effect=fake_load),
         patch("backend.resource_manager.whisper_service.transcribe", side_effect=fake_transcribe),
@@ -167,6 +188,48 @@ def test_resource_manager_unloads_ollama_before_whisper_and_frees_whisper() -> N
             "whisper_unloaded",
         ]
         assert rm.phase == "idle"
+
+
+def test_stop_active_operation_keeps_waiting_generation_and_rejects_stale_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = ResourceManager()
+    monkeypatch.setattr(app_module, "resource_manager", manager)
+    monkeypatch.setattr("backend.resource_manager.db.get_settings", lambda: {})
+
+    async def run() -> None:
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        finish_second = asyncio.Event()
+
+        async def generate(model, **_kwargs):
+            if model == "first":
+                first_started.set()
+                await asyncio.Future()
+            second_started.set()
+            await finish_second.wait()
+            return "Segundo resumen"
+
+        monkeypatch.setattr(app_module.ollama_service, "generate_complete", generate)
+        first = asyncio.create_task(manager.summarize_exclusive([], "first", 8192, 180))
+        await first_started.wait()
+        operation = manager.get_state()["active_operation"]
+        assert operation["kind"] == "text"
+
+        second = asyncio.create_task(manager.summarize_exclusive([], "second", 8192, 180))
+        await asyncio.sleep(0)
+        assert not second_started.is_set()
+        assert await app_module.system_stop_active(operation["id"]) == {"stopped": True}
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        await second_started.wait()
+        assert await app_module.system_stop_active(operation["id"]) == {"stopped": False}
+        finish_second.set()
+        assert await second == "Segundo resumen"
+        assert manager.get_state()["active_operation"] is None
+
+    asyncio.run(asyncio.wait_for(run(), 2))
 
 
 def test_api_clear_messages_and_multi_upload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1025,6 +1088,73 @@ def test_eco_mode_skips_auto_summarization(tmp_path: Path, monkeypatch) -> None:
     test_db.close()
 
 
+def test_auto_summaries_off_keeps_indexing_and_manual_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_db = Database(
+        db_path=tmp_path / "manual.db",
+        audio_dir=tmp_path / "audio",
+        sources_dir=tmp_path / "sources",
+        podcasts_dir=tmp_path / "podcasts",
+    )
+    test_db.init_db()
+    test_db.update_settings({"ollama_model": "demo"})
+    monkeypatch.setattr(app_module, "db", test_db)
+    resolve_model = AsyncMock(return_value="demo")
+    summarize = AsyncMock(return_value="Resumen solicitado")
+    monkeypatch.setattr(app_module.ollama_service, "resolve_default_model", resolve_model)
+    monkeypatch.setattr(app_module.resource_manager, "summarize_exclusive", summarize)
+
+    sid = test_db.create_session("Resúmenes bajo demanda")["id"]
+    audio = tmp_path / "clase.wav"
+    audio.touch()
+    rec = test_db.create_recording(sid, audio.name, str(audio), str(audio))
+    monkeypatch.setattr(app_module, "prepare_audio_file", lambda *_args: (4.0, audio))
+    transcript = "La grabación explica la fotosíntesis y cómo crecen las plantas."
+    monkeypatch.setattr(app_module.resource_manager, "transcribe_exclusive", AsyncMock(
+        return_value={
+            "text": transcript,
+            "segments": [{"start": 0.0, "end": 4.0, "text": transcript}],
+            "language": "es",
+            "duration_sec": 4.0,
+        }
+    ))
+    doc = tmp_path / "apuntes.md"
+    doc.write_text("El documento explica las raíces de las plantas.", encoding="utf-8")
+    src = test_db.create_source(sid, doc.name, "text", str(doc))
+
+    client = TestClient(app_module.app)
+    try:
+        assert test_db.get_settings()["auto_summarize"] is True
+        response = client.put("/api/settings", json={"auto_summarize": False})
+        assert response.status_code == 200
+        assert response.json()["auto_summarize"] is False
+        assert response.json()["eco_mode"] is False
+        assert client.get("/api/settings").json()["auto_summarize"] is False
+
+        asyncio.run(app_module.pipeline._process_recording(rec["id"]))
+        asyncio.run(app_module.pipeline._process_source(src["id"]))
+        for item in (test_db.get_recording(rec["id"]), test_db.get_source(src["id"])):
+            assert item["status"] == "ready"
+            assert item["summary_text"] == ""
+        assert test_db.search_session_chunks(sid, "fotosíntesis")
+        assert test_db.search_session_chunks(sid, "raíces")
+        assert client.patch(
+            f"/api/sessions/{sid}/sources/{src['id']}", json={"enabled": True}
+        ).json()["combined_summary"] == ""
+        assert not app_module._combined_summary_tasks
+        assert client.post(f"/api/sessions/{sid}/suggestions").json()["suggested_prompts"] == []
+        resolve_model.assert_not_awaited()
+        summarize.assert_not_awaited()
+
+        manual = client.post(f"/api/sessions/{sid}/resummarize").json()
+        assert manual["combined_summary"] == "Resumen solicitado"
+        assert summarize.await_count == 3
+    finally:
+        client.close()
+        test_db.close()
+
+
 def test_desktop_default_settings_save_and_no_eco_throttle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1041,6 +1171,12 @@ def test_desktop_default_settings_save_and_no_eco_throttle(
     test_db.init_db()
     defaults = test_db.get_settings()
     assert defaults["eco_mode"] is False
+    if MLX_ASR_SUPPORTED:
+        assert defaults["whisper_model"] == NEMOTRON_MODEL_ID
+        assert defaults["whisper_language"] == "es"
+    assert test_db.update_settings({"whisper_model": NEMOTRON_MODEL_ID})["whisper_language"] == "es"
+    assert test_db.update_settings({"whisper_language": "en"})["whisper_language"] == "en"
+    assert test_db.update_settings({"whisper_model": "large-v3-turbo", "whisper_language": "auto"})["whisper_language"] == "auto"
 
     monkeypatch.setattr(app_module, "db", test_db)
     monkeypatch.setattr("backend.resource_manager.db", test_db)
@@ -1111,6 +1247,15 @@ def test_desktop_default_settings_save_and_no_eco_throttle(
     assert opts == {"num_ctx": 8192, "temperature": 0.3}
     assert "num_thread" not in opts
     assert "num_predict" not in opts
+
+    messages = [{"role": "user", "content": "hi"}]
+    monkeypatch.setattr("backend.resource_manager.ollama_service", svc)
+    manager = ResourceManager()
+    assert asyncio.run(manager.summarize_exclusive(messages, "demo", 8192, 180, num_predict=512)) == "ok"
+    assert captured_payloads[1]["options"] == {**opts, "num_predict": 512}
+    test_db.update_settings({"eco_mode": True})
+    asyncio.run(manager.summarize_exclusive(messages, "demo", 8192, 180, num_predict=1024))
+    assert captured_payloads[2]["options"]["num_predict"] == 768
     test_db.close()
 
 

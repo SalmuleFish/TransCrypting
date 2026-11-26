@@ -529,6 +529,7 @@ function initCustomSelect(selectEl) {
     for (const opt of Array.from(selectEl.options)) {
       const item = document.createElement("button");
       item.type = "button";
+      item.disabled = opt.disabled;
       item.className = `bento-select-option ${opt.value === selectEl.value ? "selected" : ""}`;
 
       const lbl = document.createElement("span");
@@ -623,38 +624,37 @@ function isAbortError(err) {
   return /abort|detenid|cancel/i.test(msg);
 }
 
-function isAnyAIWorkActive() {
-  if (state.isStreaming || state.isResummarizing || state.podcastBusy) return true;
-  const phase = state.systemStatus?.resources?.phase;
-  if (phase && ["llm", "whisper", "podcast"].includes(phase)) return true;
-
-  if (state.activeSessionId) {
-    const qs = sessionQuizzes.get(state.activeSessionId);
-    if (qs) {
-      if (qs.loading || qs.submittingExam) return true;
-      if (Object.values(qs.answers || {}).some((a) => a && a.grading)) return true;
-    }
-  }
-
-  const sess = state.activeSession;
-  if (sess) {
-    const workingRec = (sess.recordings || []).some((r) =>
-      ["queued", "preparing", "transcribing", "summarizing"].includes(r.status)
-    );
-    const workingSrc = (sess.sources || []).some((s) =>
-      ["queued", "extracting", "indexing", "summarizing"].includes(s.status)
-    );
-    if (workingRec || workingSrc) return true;
-  }
-  return false;
-}
-
 function syncGlobalStopButton() {
   const btn = document.getElementById("btn-stop-ai");
   if (!btn) return;
-  const active = isAnyAIWorkActive();
-  btn.classList.toggle("hidden", !active);
-  btn.disabled = Boolean(state.stoppingAI);
+  const operation = state.systemStatus?.resources?.active_operation;
+  const task = {
+    audio: "transcripción de audio",
+    text: "generación de texto",
+    podcast: "generación del podcast",
+  }[operation?.kind];
+  btn.classList.toggle("hidden", !operation);
+  btn.disabled = Boolean(state.stoppingAI || operation?.stopping);
+  btn.title = task ? `Detener ${task}` : "Detener la tarea activa";
+  btn.setAttribute("aria-label", btn.title);
+}
+
+async function stopActiveAIOperation() {
+  const operation = state.systemStatus?.resources?.active_operation;
+  if (!operation || operation.stopping || state.stoppingAI) return;
+  state.stoppingAI = true;
+  syncGlobalStopButton();
+  try {
+    const result = await api(`/api/system/stop-active/${operation.id}`, { method: "POST" });
+    showToast(result.stopped ? "Deteniendo la tarea activa…" : "Esa tarea ya terminó.");
+    schedulePollingIfProcessing();
+  } catch (err) {
+    showToast(err.message, true);
+  } finally {
+    await refreshSystemStatus();
+    state.stoppingAI = false;
+    syncGlobalStopButton();
+  }
 }
 
 async function stopBackendAIGeneration() {
@@ -797,7 +797,7 @@ function renderTelemetry(data) {
   document.getElementById("ram-text").textContent = `${hw.ram_used_gb} / ${hw.ram_total_gb} GB`;
   document.getElementById("ram-bar").style.width = `${Math.min(100, hw.ram_percent || 0)}%`;
   const activeLabel = getActiveModelLabel();
-  document.getElementById("active-model-name").textContent = activeLabel;
+  document.getElementById("active-model-name").textContent = res.active_model || runningOllama[0]?.name || "—";
 
   const pill = document.getElementById("model-state-pill");
   const pillText = document.getElementById("model-state-text");
@@ -809,17 +809,17 @@ function renderTelemetry(data) {
     vramChip.textContent = hw.gpu_available ? `VRAM ${vramPct}%` : hasMetal ? "Metal" : "CPU";
   }
 
-  if (res.phase === "podcast" || res.podcast_active) {
+  if (res.active_operation?.kind === "audio" || res.phase === "whisper") {
+    pill.className = "mini-status active";
+    const engine = data.whisper_models?.find((model) => model.id === res.active_model)?.engine || "Whisper";
+    pillText.textContent = `Audio · ${engine}`;
+  } else if (res.phase === "llm") {
+    pill.className = "mini-status active";
+    pillText.textContent = `Texto · ${res.active_operation?.label || res.active_model || activeLabel}`;
+  } else if (res.phase === "podcast" || res.podcast_active) {
     pill.className = "mini-status active";
     const podPct = Math.max(8, Math.round((res.podcast_progress || 0) * 100));
     pillText.textContent = `Podcast ${podPct}%`;
-  } else if (res.phase === "whisper") {
-    pill.className = "mini-status active";
-    const engine = res.active_model === PARAKEET_MODEL_ID ? "Parakeet" : "Whisper";
-    pillText.textContent = [engine, res.active_device?.toUpperCase()].filter(Boolean).join(" ");
-  } else if (res.phase === "llm") {
-    pill.className = "mini-status active";
-    pillText.textContent = `IA ${res.active_model || activeLabel}`;
   } else if (res.phase === "unloading") {
     pill.className = "mini-status active";
     pillText.textContent = "Liberando...";
@@ -2157,8 +2157,7 @@ function renderSummaryTab(session, animateReveal = false) {
 
   if (readyRecs.length === 0 && readySrcs.length === 0) {
     if (workingItem) {
-      const modelName = getActiveModelLabel();
-      const stageMsg = `${workingItem.stage || "Procesando"} (${Math.round((workingItem.progress || 0) * 100)}%) — ${modelName} preparará el resumen...`;
+      const stageMsg = `${workingItem.stage || "Procesando"} (${Math.round((workingItem.progress || 0) * 100)}%)`;
       const existingLabel = pane.querySelector(".summary-skeleton-card .think-label");
       if (existingLabel && memoChanged("summary-pane", `${session.id}:skel:${stageMsg}`)) {
         existingLabel.textContent = stageMsg;
@@ -4288,6 +4287,8 @@ async function uploadFiles(fileList) {
 
 async function ensureDynamicSuggestions(session) {
   if (!session) return;
+  const settings = state.systemStatus?.settings;
+  if (settings?.auto_summarize === false || settings?.eco_mode) return;
   const readyCount =
     (session.recordings || []).filter((r) => r.status === "ready" && r.enabled !== false).length +
     (session.sources || []).filter((s) => s.status === "ready" && s.enabled !== false).length;
@@ -4799,10 +4800,20 @@ function populateSettingsFromStatus(status) {
     whisperSelect.appendChild(opt);
   }
   whisperSelect.value = settings.whisper_model || "large-v3-turbo";
+  const langSelect = document.getElementById("set-whisper-lang");
+  const autoLangOpt = langSelect.querySelector('option[value="auto"]');
+  langSelect.value = settings.whisper_language || "auto";
   whisperSelect.onchange = () => {
     document.getElementById("parakeet-language-hint").classList.toggle(
       "hidden", whisperSelect.value !== PARAKEET_MODEL_ID
     );
+    const requiresLanguage = Boolean(whisperModels.find((model) => model.id === whisperSelect.value)?.requires_language);
+    document.getElementById("nemotron-language-hint").classList.toggle("hidden", !requiresLanguage);
+    autoLangOpt.disabled = requiresLanguage;
+    if (requiresLanguage && langSelect.value === "auto") {
+      langSelect.value = "es";
+      refreshCustomSelect(langSelect.id);
+    }
   };
   whisperSelect.onchange();
 
@@ -4821,12 +4832,12 @@ function populateSettingsFromStatus(status) {
   }
   const desiredDevice = settings.whisper_device || "auto";
   whisperDeviceSelect.value = !hasCuda && desiredDevice === "cuda" ? "cpu" : desiredDevice;
-  document.getElementById("set-whisper-lang").value = settings.whisper_language || "auto";
   document.getElementById("set-num-ctx").value = String(settings.num_ctx || 8192);
   document.getElementById("set-idle-unload").value = String(settings.idle_unload_sec || 180);
   document.getElementById("set-classroom-enhance").checked = settings.classroom_audio_enhance !== false;
   document.getElementById("set-enable-thinking").checked = Boolean(settings.enable_thinking);
   document.getElementById("set-eco-mode").checked = Boolean(settings.eco_mode);
+  document.getElementById("set-auto-summarize").checked = settings.auto_summarize !== false;
 
   const cpuCount = Math.max(1, Number(status?.hardware?.cpu_count || 8));
   const threadsInput = document.getElementById("set-eco-cpu-threads");
@@ -4886,6 +4897,7 @@ async function saveSettings(e) {
     classroom_audio_enhance: document.getElementById("set-classroom-enhance").checked,
     enable_thinking: document.getElementById("set-enable-thinking").checked,
     eco_mode: document.getElementById("set-eco-mode").checked,
+    auto_summarize: document.getElementById("set-auto-summarize").checked,
     eco_cpu_threads: Number(document.getElementById("set-eco-cpu-threads").value || 2),
   };
   await api("/api/settings", {
@@ -5198,7 +5210,7 @@ function initEvents() {
     }
   });
 
-  document.getElementById("btn-stop-ai").onclick = () => forceStopAllAI();
+  document.getElementById("btn-stop-ai").onclick = stopActiveAIOperation;
 
   document.getElementById("btn-send-chat").onclick = (e) => {
     if (state.isStreaming) {
