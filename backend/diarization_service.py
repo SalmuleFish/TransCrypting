@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 from importlib.util import find_spec
+import json
 import logging
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -234,6 +237,27 @@ def diarize_audio(
     return turns
 
 
+async def diarize_audio_async(audio_path: Path, num_threads: int) -> list[dict[str, Any]]:
+    # Sherpa holds the GIL during inference, including when called from a worker thread.
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "backend.diarization_service", str(audio_path.resolve()), str(num_threads),
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        stdout, stderr = await process.communicate()
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+        raise
+    if process.returncode != 0:
+        raise RuntimeError(stderr.decode(errors="replace").strip() or f"El analizador terminó con código {process.returncode}.")
+    return json.loads(stdout)
+
+
 def _best_speaker_for_span(
     start: float,
     end: float,
@@ -455,3 +479,7 @@ def format_segments_plain_text(segments: list[dict[str, Any]]) -> str:
         lines.append(f"{prefix}{' '.join(cur_buf)}")
 
     return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    print(json.dumps(diarize_audio(Path(sys.argv[1]), int(sys.argv[2])), ensure_ascii=False))

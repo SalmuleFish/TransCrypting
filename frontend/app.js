@@ -8,6 +8,7 @@ const SOURCE_EXTENSIONS = new Set([
 ]);
 const TAB_ORDER = ["summary", "transcript", "chat", "quiz", "podcast"];
 const PARAKEET_MODEL_ID = "parakeet-tdt-0.6b-v3";
+const NEMOTRON_MODEL_ID = "nemotron-labs-unified-asr-0.6b";
 
 const state = {
   sessions: [],
@@ -4678,11 +4679,16 @@ function syncMicrophonePreview(session) {
   if (microphonePreview?.sessionId === session?.id && microphonePreview?.recordingId) {
     const recording = session.recordings?.find((item) => item.id === microphonePreview.recordingId);
     if (recording?.transcript_text) {
-      state.transcriptRecFilter ||= recording.id;
+      if (audioPlayers.get(state.transcriptRecFilter)?.paused !== false) {
+        state.transcriptRecFilter = recording.id;
+        state.transcriptSpeakerFilter = null;
+      }
       microphonePreview = null;
     } else if (recording?.status === "ready" || recording?.status === "error") {
       document.getElementById("microphone-live-status").textContent =
         recording.error_message || "La transcripción final quedó sin texto.";
+    } else if (recording?.stage) {
+      document.getElementById("microphone-live-status").textContent = recording.stage;
     }
   }
   document.getElementById("microphone-live-panel").classList.toggle(
@@ -4690,7 +4696,8 @@ function syncMicrophonePreview(session) {
   );
 }
 
-async function transcribeMicrophoneFragment(capture, parts, startSec) {
+async function transcribeMicrophoneFragment(capture, fragment, partial = false) {
+  const { parts, startSec } = fragment;
   if (capture.previewRequest || capture.recorder.state !== "recording" || !parts.length) return;
 
   const controller = new AbortController();
@@ -4708,21 +4715,30 @@ async function transcribeMicrophoneFragment(capture, parts, startSec) {
     if (controller.signal.aborted) return;
     if (text) {
       const follow = preview.scrollHeight - preview.scrollTop - preview.clientHeight <= 24;
-      const row = document.createElement("div");
-      row.className = "segment-row";
-      const stamp = document.createElement("span");
-      stamp.className = "timestamp-btn";
-      stamp.textContent = formatDuration(startSec);
-      const words = document.createElement("div");
-      words.className = "segment-text";
-      words.textContent = text;
-      row.append(stamp, words);
-      preview.append(row);
+      if (!fragment.row) {
+        fragment.row = document.createElement("div");
+        fragment.row.className = "segment-row";
+        const stamp = document.createElement("span");
+        stamp.className = "timestamp-btn";
+        stamp.textContent = formatDuration(startSec);
+        fragment.words = document.createElement("div");
+        fragment.words.className = "segment-text";
+        fragment.row.append(stamp, fragment.words);
+        preview.append(fragment.row);
+      }
+      fragment.row.classList.toggle("live-preview-partial", partial);
+      fragment.words.textContent = text;
       if (follow) preview.scrollTop = preview.scrollHeight;
+    } else if (!partial) {
+      fragment.row?.remove();
     }
-    status.textContent = preview.textContent ? "Grabando…" : "Esperando voz…";
+    if (partial && text) {
+      status.textContent = "Grabando… · texto provisional";
+    } else if (!partial) {
+      status.textContent = preview.textContent ? "Grabando…" : "Esperando voz…";
+    }
   } catch (err) {
-    if (!controller.signal.aborted) status.textContent = err.message;
+    if (!partial && !controller.signal.aborted) status.textContent = err.message;
   } finally {
     capture.previewRequest = null;
   }
@@ -4733,16 +4749,30 @@ function startMicrophoneFragment(capture) {
 
   try {
     const recorder = new MediaRecorder(capture.stream, { mimeType: capture.recorder.mimeType });
-    const startSec = (performance.now() - capture.startedAt) / 1000;
-    const parts = [];
+    const fragmentStartedAt = performance.now();
+    const fragment = { startSec: (fragmentStartedAt - capture.startedAt) / 1000, parts: [] };
     capture.previewRecorder = recorder;
-    recorder.ondataavailable = ({ data }) => { if (data.size) parts.push(data); };
-    recorder.onstop = () => transcribeMicrophoneFragment(capture, parts, startSec);
-    recorder.start();
-    capture.previewTimer = setTimeout(() => {
-      if (recorder.state === "recording") recorder.stop();
+    recorder.ondataavailable = ({ data }) => {
+      if (!data.size) return;
+      fragment.parts.push(data);
+      if (capture.previewPartials && recorder.state === "recording"
+          && performance.now() - fragmentStartedAt < capture.previewIntervalMs) {
+        transcribeMicrophoneFragment(capture, fragment, true);
+      }
+    };
+    recorder.onstop = () => transcribeMicrophoneFragment(capture, fragment);
+    recorder.start(capture.previewPartials ? 1500 : undefined);
+    const finishFragment = () => {
+      if (capture.recorder.state !== "recording" || recorder.state !== "recording") return;
+      // Leave room for timer jitter before the server's 15-second audio limit.
+      if (capture.previewRequest && performance.now() - fragmentStartedAt < 14000) {
+        capture.previewTimer = setTimeout(finishFragment, 250);
+        return;
+      }
+      recorder.stop();
       startMicrophoneFragment(capture);
-    }, capture.previewIntervalMs);
+    };
+    capture.previewTimer = setTimeout(finishFragment, capture.previewIntervalMs);
   } catch (_) {
     document.getElementById("microphone-live-status").textContent =
       "La vista previa no está disponible. El audio se transcribirá al detener la grabación.";
@@ -4777,7 +4807,7 @@ async function saveMicrophoneCapture(capture, parts) {
     status.textContent = "Guardando grabación…";
     if (liveStatus) liveStatus.textContent = status.textContent;
     const [recording] = await uploadRecordingFiles(capture.sessionId, [file]);
-    status.textContent = "Grabación guardada. Transcripción en cola.";
+    status.textContent = liveStatus ? "" : "Grabación guardada. Transcripción en cola.";
     if (liveStatus) {
       microphonePreview.recordingId = recording.id;
       liveStatus.textContent = "Preparando la transcripción completa…";
@@ -4893,7 +4923,7 @@ async function stopNativeSystemCapture() {
 
   try {
     const res = await api("/api/recordings/system-capture/stop", { method: "POST" });
-    status.textContent = "Audio del equipo guardado. Transcripción en cola.";
+    status.textContent = liveStatus && res.recording?.id ? "" : "Audio del equipo guardado. Transcripción en cola.";
     if (liveStatus && res.recording?.id) {
       microphonePreview.recordingId = res.recording.id;
       liveStatus.textContent = "Preparando la transcripción completa…";
@@ -5008,11 +5038,13 @@ async function toggleMicrophoneCapture() {
   }
 
   const settings = state.systemStatus?.settings;
+  const fastPreview = [NEMOTRON_MODEL_ID, PARAKEET_MODEL_ID].includes(settings?.whisper_model)
+    && ["auto", "metal"].includes(settings.whisper_device);
   const capture = {
     sessionId: state.activeSessionId,
     mode: state.captureMode,
     live: document.getElementById("microphone-live").checked,
-    previewIntervalMs: settings?.whisper_model === PARAKEET_MODEL_ID && settings.whisper_device === "auto" ? 4000 : 8000,
+    previewIntervalMs: fastPreview ? 4000 : 8000,
     extraStreams: [],
   };
   microphoneCapture = capture;
@@ -5062,6 +5094,8 @@ async function toggleMicrophoneCapture() {
     recorder.onerror = () => showToast("Se interrumpió la grabación de audio.", true);
     recorder.start();
     const container = recorder.mimeType.split(";")[0];
+    capture.previewPartials = fastPreview && settings.whisper_model === NEMOTRON_MODEL_ID
+      && container === "audio/webm";
     capture.extension = { "audio/mp4": "m4a", "video/mp4": "mp4", "audio/ogg": "ogg" }[container] || "webm";
 
     capture.startedAt = performance.now();

@@ -1880,6 +1880,69 @@ def test_system_capture_endpoints_lifecycle(tmp_path: Path, monkeypatch: pytest.
     test_db.close()
 
 
+def test_live_preview_omits_silence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app_module.subprocess, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app_module.db, "get_settings", lambda: {})
+    transcribe = AsyncMock(return_value={
+        "text": "[No se detectó voz comprensible en la grabación]",
+        "segments": [],
+    })
+    monkeypatch.setattr(app_module.resource_manager, "transcribe_exclusive", transcribe)
+    response = TestClient(app_module.app).post(
+        "/api/recordings/live-transcript", files={"file": ("silencio.webm", b"audio", "audio/webm")},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"text": ""}
+    transcribe.assert_awaited_once()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_recording_text_available_during_speaker_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel: bool,
+) -> None:
+    test_db = Database(db_path=tmp_path / "test.db", audio_dir=tmp_path / "audio")
+    test_db.init_db()
+    test_db.update_settings({"auto_summarize": False, "enable_diarization": True})
+    session = test_db.create_session("Grabación")
+    audio = tmp_path / "grabacion.wav"
+    audio.touch()
+    rec = test_db.create_recording(
+        session_id=session["id"], filename=audio.name, stored_path=str(audio), playable_path=str(audio),
+    )
+    rec_id = rec["id"]
+    text = "La transcripción está lista."
+    segments = [{"start": 0.0, "end": 4.0, "text": text}]
+    monkeypatch.setattr(app_module, "db", test_db)
+    monkeypatch.setattr(app_module, "prepare_audio_file", lambda *_: (4.0, audio))
+    monkeypatch.setattr(app_module, "is_diarization_runtime_available", lambda: True)
+    monkeypatch.setattr(app_module.resource_manager, "transcribe_exclusive", AsyncMock(return_value={
+        "text": text, "segments": segments, "language": "es", "duration_sec": 4.0,
+    }))
+
+    snapshots = []
+
+    async def identify(*_):
+        snapshots.append(test_db.get_recording(rec_id))
+        if cancel:
+            raise asyncio.CancelledError
+        return [{"start": 0.0, "end": 4.0, "speaker": "Hablante 1"}]
+
+    identify_speakers = AsyncMock(side_effect=identify)
+    monkeypatch.setattr(app_module, "diarize_audio_async", identify_speakers)
+    try:
+        asyncio.run(app_module.ProcessingPipeline()._process_recording(rec_id))
+        identify_speakers.assert_awaited_once()
+        assert snapshots[0]["status"] == "transcribing"
+        assert snapshots[0]["transcript_text"] == text
+        assert snapshots[0]["segments"] == segments
+        saved = test_db.get_recording(rec_id)
+        assert saved["status"] == "ready"
+        assert saved["transcript_text"] == (text if cancel else f"Hablante 1: {text}")
+        assert test_db.search_session_chunks(session["id"], "transcripción", limit=1)
+    finally:
+        test_db.close()
+
+
 def test_diarization_assign_merge_bleed_and_format() -> None:
     from backend.context_manager import format_transcript_for_llm
     from backend.diarization_service import (

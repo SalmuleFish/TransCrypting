@@ -75,6 +75,7 @@ from backend.audio_capture import (
 from backend.diarization_service import (
     assign_speakers_to_segments,
     diarize_audio,
+    diarize_audio_async,
     format_segments_plain_text,
     has_speech_energy,
     is_diarization_runtime_available,
@@ -363,6 +364,7 @@ class ProcessingPipeline:
         detected_lang = whisper_lang
         final_duration = duration_sec
         used_dual_track = False
+        speaker_analysis_cancelled = False
 
         tracks_path_str = str(rec.get("tracks_path") or "").strip()
         tracks_path = Path(tracks_path_str) if tracks_path_str else None
@@ -493,19 +495,26 @@ class ProcessingPipeline:
             final_duration = transcript_result["duration_sec"] or duration_sec
 
             if enable_diarization and segments and is_diarization_runtime_available():
+                db.update_recording_transcript(
+                    rec_id, transcript_text, segments, detected_lang, final_duration, whisper_model,
+                )
                 db.update_recording_progress(
                     rec_id,
                     "transcribing",
                     0.76,
-                    "Identificando hablantes...",
+                    "Transcripción lista · identificando hablantes...",
                 )
                 try:
-                    diar_turns = await asyncio.to_thread(diarize_audio, src_path, diar_threads)
+                    diar_turns = await diarize_audio_async(src_path, diar_threads)
                     if diar_turns:
                         segments = assign_speakers_to_segments(segments, diar_turns)
                         formatted = format_segments_plain_text(segments)
                         if formatted:
                             transcript_text = formatted
+                except asyncio.CancelledError:
+                    if self._stopping:
+                        raise
+                    speaker_analysis_cancelled = True
                 except Exception as diar_exc:
                     _logger.warning("Diarización omitida para %s: %s", rec_id, diar_exc)
 
@@ -535,13 +544,16 @@ class ProcessingPipeline:
             )
 
         settings = db.get_settings()
-        if not _auto_summaries_enabled(settings):
+        if speaker_analysis_cancelled or not _auto_summaries_enabled(settings):
+            stage = "Indexado (Modo Eco)" if settings.get("eco_mode", False) else "Transcripción lista"
+            if speaker_analysis_cancelled:
+                stage = "Transcripción lista (identificación de voces detenida)"
             db.update_recording_summary(
                 rec_id=rec_id,
                 summary_text=(rec_indexed or {}).get("summary_text", ""),
                 status="ready",
                 progress=1.0,
-                stage="Indexado (Modo Eco)" if settings.get("eco_mode", False) else "Transcripción lista",
+                stage=stage,
             )
             return
 
@@ -1497,7 +1509,7 @@ async def transcribe_live_recording(file: UploadFile = File(...)) -> dict[str, s
             raise HTTPException(status_code=499, detail="Vista previa detenida.") from exc
         except Exception as exc:
             raise HTTPException(status_code=503, detail="No se pudo transcribir el fragmento del micrófono.") from exc
-    return {"text": result["text"]}
+    return {"text": result["text"] if result["segments"] else ""}
 
 
 @app.post("/api/sessions/{session_id}/recordings/system-capture/start")
@@ -1564,7 +1576,7 @@ async def transcribe_system_capture_live() -> dict[str, str]:
             raise HTTPException(status_code=499, detail="Vista previa detenida.") from exc
         except Exception as exc:
             raise HTTPException(status_code=503, detail="No se pudo transcribir la vista previa.") from exc
-    return {"text": result["text"]}
+    return {"text": result["text"] if result["segments"] else ""}
 
 
 @app.post("/api/recordings/system-capture/stop")
