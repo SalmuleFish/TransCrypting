@@ -51,14 +51,18 @@ Flexible compatibility with any Ollama LLM, Whisper / CTranslate2 model, and Kok
 - **Interactive Cross-Source Citations & Viewer**:
   - `▶ MM:SS` pills jump straight to the exact second of the matching audio recording.
   - `📄 file.pdf · p. 4` and `🖼 image.png` pills open the integrated **Source Viewer** at that exact page, slide, or whiteboard photo.
-- **Local Audio Transcription (`faster-whisper`)**:
-  - NVIDIA CUDA acceleration (`int8_float16`) with automatic CPU fallback, bilingual segment detection, and optional `ffmpeg` classroom noise leveling.
-- **Interactive Exam Mode**: Multiple-choice questions with instant grading and open-ended responses evaluated locally against indexed source excerpts.
-- **Smart Memory Management**: Whisper, Ollama, and Podcast TTS take exclusive turns cleanly, with configurable idle VRAM unloading and an instant **Liberar VRAM** button.
+- **Local Audio Transcription & Modular ASR (`Whisper`, `Parakeet v3`, `Canary 1B v2`, `Qwen3-ASR`)**:
+  - Choose which ASR engine runtime to install during `setup.bat` (lightweight ONNX, Whisper CUDA, Balanced, or Full + Qwen3-ASR PyTorch CUDA) instead of downloading everything up front.
+  - **Settings** shows exact per-model status (`✓ Descargado en disco` vs `↓ Sin descargar`), letting you explicitly **download or remove individual model weights** on demand (`Parakeet TDT 0.6B v3`, `Canary 1B v2`, `Qwen3-ASR 0.6B/1.7B`, `Whisper`, or custom `CTranslate2` folders).
+- **Opt-In Desktop & Call Audio Capture (`Mic` / `Equipo` / `Ambos`) + Speaker Diarization (`sherpa-onnx`)**:
+  - Record strictly your microphone by default, or opt into **`Equipo`** (Windows WASAPI loopback with zero screen-share prompts) or **`Ambos`** (call mode with a live VU meter and live preview).
+  - **100% Local Speaker Diarization** (`Pyannote Segmentation 3.0 ONNX` + `NeMo TitaNet Small ONNX`): separates uploaded/desktop audio into `Hablante 1`, `Hablante 2`, … and uses synchronized dual-track WAV separation in `Ambos` mode to distinguish **`Tú`** from remote speakers, complete with speaker filter pills and inline renaming synced to FTS5.
+- **Interactive Exam Studio**: Studio-grade two-column composer with source tiles, format cards (`Mixto`, `Opción múltiple`, balanced `Verdadero / Falso`, `Respuesta abierta`), difficulty/cognitive style, hints, countdown timer, and Real Exam Mode.
+- **Smart Memory Management**: ASR engines, Ollama, and Podcast TTS take exclusive turns cleanly, with configurable idle VRAM unloading and an instant **Liberar VRAM** button.
 - **Eco / Laptop Mode (Optional Battery & Thermal Saver)**:
   - Disabled by default so GPU desktops keep full automatic summaries; when enabled in **Settings**, uploads only index into `SQLite FTS5` (**0 background LLM calls**), images use local CPU OCR, and summaries/suggestions run **on demand**.
   - Includes a configurable **CPU thread cap** (`eco_cpu_threads`), `num_predict`/`repeat_penalty` guardrails, `num_ctx = 4096`, `idle_unload = 60s`, and a live Eco progress bar with elapsed time.
-- **Editorial Studio UI in Light & Graphite Dark Modes**: Collapsible Conversations & Sources panels, compact top-bar Telemetry popover, single-card gradient general summary, dedicated verbatim Audio Transcripts tab, surgical DOM updates without UI flicker, native `.md` export, and **Borrar historial** that preserves all sources and summaries (protected against forced dark-mode browser extensions).
+- **Fluid Responsive Studio & Appearance Personalization**: Container-query responsive layouts, slide-over drawers on compact windows, Light & Soft Graphite Dark themes, live **accent color & font size** customization in Settings, per-audio transcript cards with multi-audio timestamp citation matching, native `.md` export, and **Borrar historial**.
 
 ---
 
@@ -79,7 +83,7 @@ Flexible compatibility with any Ollama LLM, Whisper / CTranslate2 model, and Kok
    git clone https://github.com/SalmuleFish/TransCrypting.git
    cd TransCrypting
    ```
-2. Run **`setup.bat`** (double-click or run from PowerShell/CMD). It creates `.venv`, installs dependencies from `requirements.txt`, and compiles **`TransCrypting.exe`** with the `TC` icon.
+2. Run **`setup.bat`** (double-click or run from PowerShell/CMD). It creates `.venv`, lets you choose your **speech-to-text engine profile (`1–4`)** — Lightweight ONNX, Whisper CUDA, Balanced, or Full + Qwen3-ASR PyTorch CUDA — installs dependencies (`requirements-base.txt` + selected profile), and compiles **`TransCrypting.exe`** with the `TC` icon. Model weights are never pre-downloaded during setup; you choose inside **Settings**.
 3. Pull an Ollama model if you have not yet:
    ```powershell
    ollama pull gemma4:e4b
@@ -108,20 +112,21 @@ Open **Settings** (gear icon) and click **`¿Cómo instalar modelos?`** for the 
 
 ```text
 TransCrypting/
-├── backend/                # FastAPI API, exclusive GPU/RAM lock, Whisper, Ollama, FTS5 & Podcast TTS
+├── backend/                # FastAPI API, WASAPI capture, ONNX diarization, ASR, Ollama, FTS5 & Podcast TTS
 ├── docs/screenshots/       # README showcase screenshots (demo data only)
-├── frontend/               # 100% offline Bento UI (HTML/CSS/JS + icon.ico)
+├── frontend/               # 100% offline responsive Studio UI (HTML/CSS/JS + icon.ico)
 ├── launcher/               # C# source compiled into TransCrypting.exe
 ├── tests/                  # Automated pytest suite
 ├── data/                   # LOCAL ONLY (ignored by Git; only .gitkeep is tracked)
-│   ├── audio/              # Uploaded audio recordings
+│   ├── audio/              # Uploaded & captured audio recordings
 │   ├── sources/            # Uploaded PDFs, slides, docs & images
 │   ├── podcasts/           # Locally generated podcast .wav episodes
-│   ├── models/             # Whisper & Kokoro-82M / Piper TTS local model caches
+│   ├── models/             # Whisper, ASR, ONNX diarization & Kokoro/Piper TTS model caches
 │   └── transcript.db       # SQLite database + FTS5 persistent search index
 ├── .gitignore              # Excludes data/, .venv/, caches, weights & local executables
-├── requirements.txt
-├── setup.bat               # Windows 1-click setup & launcher compiler
+├── requirements-base.txt   # Core local dependencies (without optional heavy ASR engines)
+├── requirements.txt        # Full cross-platform dependency manifest
+├── setup.bat               # Windows 1-click modular setup (profile selector 1-4) & launcher compiler
 └── run.py
 ```
 

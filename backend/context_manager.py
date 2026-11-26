@@ -42,8 +42,10 @@ def format_transcript_with_timestamps(rec: dict[str, Any]) -> str:
         for seg in segments:
             ts = format_timestamp(float(seg.get("start", 0.0)))
             text = (seg.get("text") or "").strip()
+            spk = (seg.get("speaker") or "").strip()
             if text:
-                lines.append(f"[{ts}] {text}")
+                prefix = f"{spk}: " if spk else ""
+                lines.append(f"[{ts}] {prefix}{text}")
         if lines:
             return "\n".join(lines)
     return (rec.get("transcript_text") or "").strip()
@@ -63,28 +65,36 @@ def format_transcript_for_llm(
     buf: list[str] = []
     buf_len = 0
     block_start = float(segments[0].get("start", 0.0))
+    block_speaker = (segments[0].get("speaker") or "").strip()
 
     for seg in segments:
         text = (seg.get("text") or "").strip()
         if not text:
             continue
         seg_start = float(seg.get("start", 0.0))
+        seg_speaker = (seg.get("speaker") or "").strip()
+        speaker_changed = bool(buf) and seg_speaker != block_speaker
         if buf and (
-            buf_len + len(text) + 1 > max_block_chars
+            speaker_changed
+            or buf_len + len(text) + 1 > max_block_chars
             or (seg_start - block_start) >= max_block_sec
         ):
-            paragraphs.append(f"[{format_timestamp(block_start)}] {' '.join(buf)}")
+            spk_prefix = f"{block_speaker}: " if block_speaker else ""
+            paragraphs.append(f"[{format_timestamp(block_start)}] {spk_prefix}{' '.join(buf)}")
             buf = [text]
             buf_len = len(text)
             block_start = seg_start
+            block_speaker = seg_speaker
         else:
             if not buf:
                 block_start = seg_start
+                block_speaker = seg_speaker
             buf.append(text)
             buf_len += len(text) + 1
 
     if buf:
-        paragraphs.append(f"[{format_timestamp(block_start)}] {' '.join(buf)}")
+        spk_prefix = f"{block_speaker}: " if block_speaker else ""
+        paragraphs.append(f"[{format_timestamp(block_start)}] {spk_prefix}{' '.join(buf)}")
 
     return "\n".join(paragraphs) if paragraphs else (rec.get("transcript_text") or "").strip()
 
@@ -112,7 +122,9 @@ def _chunk_recording(rec: dict[str, Any], chunk_chars: int = 1100) -> list[dict[
         start_ts = format_timestamp(float(segments[0].get("start", 0.0)))
         for seg in segments:
             ts = format_timestamp(float(seg.get("start", 0.0)))
-            line = f"[{ts}] {(seg.get('text') or '').strip()}"
+            spk = (seg.get("speaker") or "").strip()
+            spk_prefix = f"{spk}: " if spk else ""
+            line = f"[{ts}] {spk_prefix}{(seg.get('text') or '').strip()}"
             if buf and buf_len + len(line) > chunk_chars:
                 chunks.append(
                     {

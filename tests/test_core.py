@@ -1720,3 +1720,380 @@ def test_system_stop_endpoint_cancels_active_jobs_and_resets_state(
         assert body["resources"]["phase"] == "idle"
 
     test_db.close()
+
+
+def test_windows_asr_presets_discovery_and_canary_language_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+    from backend import config as cfg
+
+    if sys.platform == "darwin":
+        pytest.skip("Windows/Linux ONNX & Torch preset check")
+
+    models = cfg.list_available_whisper_models(models_dir=tmp_path)
+    ids = {m["id"]: m for m in models}
+    if cfg.PARAKEET_ONNX_SUPPORTED:
+        assert cfg.PARAKEET_MODEL_ID in ids
+        assert ids[cfg.PARAKEET_MODEL_ID]["engine"] == "Parakeet"
+    if cfg.CANARY_ONNX_SUPPORTED:
+        assert cfg.CANARY_MODEL_ID in ids
+        assert ids[cfg.CANARY_MODEL_ID].get("requires_language") is True
+    if cfg.QWEN_TORCH_SUPPORTED:
+        assert "qwen3-asr-0.6b" in ids
+        assert "qwen3-asr-1.7b" in ids
+
+    test_db = Database(db_path=tmp_path / "canary.db", audio_dir=tmp_path / "audio")
+    test_db.init_db()
+    test_db.update_settings({"whisper_model": cfg.CANARY_MODEL_ID, "whisper_language": "auto"})
+    assert test_db.get_settings()["whisper_language"] == "es"
+    test_db.close()
+
+
+def test_qwen_chunk_builder_splits_long_audio_cleanly() -> None:
+    import numpy as np
+    from backend.whisper_service import WhisperService
+
+    sr = 16000
+    # 60s of speech with a quiet gap around 24s and 48s
+    audio = np.full(60 * sr, 0.25, dtype=np.float32)
+    audio[int(23.5 * sr) : int(24.5 * sr)] = 0.0
+    audio[int(47.5 * sr) : int(48.5 * sr)] = 0.0
+
+    chunks = WhisperService._build_qwen_chunks(audio, sr)
+    assert len(chunks) == 3
+    assert chunks[0][0] == 0.0
+    assert 23.4 <= chunks[0][1] <= 24.6
+    assert 47.4 <= chunks[1][1] <= 48.6
+    assert chunks[-1][1] == pytest.approx(60.0, abs=0.05)
+
+
+def test_audio_capture_mix_and_resample() -> None:
+    import numpy as np
+    from backend.audio_capture import mix_pcm_frames, resample_mono
+
+    # Stereo 48kHz PCM (left=1000, right=3000 -> mono=2000) resampled to 44.1kHz
+    frames_48k = np.tile(np.array([1000, 3000], dtype=np.int16), 480)
+    mono_44k = resample_mono(frames_48k.tobytes(), src_rate=48000, channels=2, dst_rate=44100)
+    assert mono_44k.dtype == np.int16
+    assert len(mono_44k) == 441
+    assert int(np.mean(mono_44k)) == pytest.approx(2000, abs=5)
+
+    # Mixing with clipping protection & asymmetric length padding
+    a = np.array([20000, -25000, 1000], dtype=np.int16)
+    b = np.array([20000, -20000], dtype=np.int16)
+    mixed = mix_pcm_frames(a, b)
+    assert mixed.tolist() == [32767, -32768, 1000]
+
+
+def test_system_capture_endpoints_lifecycle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import wave
+    from fastapi.testclient import TestClient
+    import backend.app as app_mod
+
+    test_db = Database(db_path=tmp_path / "syscap.db", audio_dir=tmp_path / "audio")
+    test_db.init_db()
+    test_audio_dir = tmp_path / "audio"
+    test_audio_dir.mkdir(parents=True, exist_ok=True)
+    sess = test_db.create_session("Nueva conversación")
+    enqueued: list[str] = []
+
+    class FakeRecorder:
+        def __init__(self) -> None:
+            self.active = False
+            self.session_id: str | None = None
+            self.rec_id: str | None = None
+            self.wav_path: Path | None = None
+            self.mode = "system"
+
+        def get_status(self):
+            return {
+                "recording": self.active,
+                "available": True,
+                "mode": self.mode if self.active else None,
+                "session_id": self.session_id if self.active else None,
+                "rec_id": self.rec_id if self.active else None,
+                "elapsed_sec": 1.25 if self.active else 0.0,
+                "level": 0.42 if self.active else 0.0,
+                "device_name": "Speakers (WASAPI)" if self.active else "",
+            }
+
+        def start(self, session_id: str, rec_id: str, output_path: Path, mode: str = "system"):
+            self.active = True
+            self.session_id = session_id
+            self.rec_id = rec_id
+            self.wav_path = output_path
+            self.mode = mode
+            return self.get_status()
+
+        def stop(self):
+            if not self.active or not self.wav_path:
+                return {"recording": False, "session_id": None, "rec_id": None, "wav_path": None, "duration_sec": 0.0}
+            self.wav_path.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(self.wav_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(44100)
+                wf.writeframes(b"\x01\x00" * 4410)
+            out = {
+                "recording": False,
+                "session_id": self.session_id,
+                "rec_id": self.rec_id,
+                "mode": self.mode,
+                "wav_path": self.wav_path,
+                "duration_sec": 0.1,
+            }
+            self.active = False
+            return out
+
+    fake = FakeRecorder()
+    monkeypatch.setattr(app_mod, "db", test_db)
+    monkeypatch.setattr(app_mod, "AUDIO_DIR", test_audio_dir)
+    monkeypatch.setattr(app_mod, "system_audio_recorder", fake)
+    monkeypatch.setattr(app_mod, "is_system_audio_available", lambda: True)
+    monkeypatch.setattr(app_mod.pipeline, "enqueue", lambda rid: enqueued.append(rid))
+
+    client = TestClient(app_mod.app)
+
+    res_status_sys = client.get("/api/system/status")
+    assert res_status_sys.status_code == 200
+    assert res_status_sys.json()["system_audio_available"] is True
+
+    res_bad = client.post(f"/api/sessions/{sess['id']}/recordings/system-capture/start", json={"mode": "invalid"})
+    assert res_bad.status_code == 400
+
+    res_start = client.post(f"/api/sessions/{sess['id']}/recordings/system-capture/start", json={"mode": "both"})
+    assert res_start.status_code == 200
+    assert res_start.json()["recording"] is True
+    assert res_start.json()["mode"] == "both"
+
+    res_poll = client.get("/api/recordings/system-capture/status")
+    assert res_poll.status_code == 200
+    assert res_poll.json()["level"] == pytest.approx(0.42)
+
+    res_stop = client.post("/api/recordings/system-capture/stop")
+    assert res_stop.status_code == 200
+    payload = res_stop.json()
+    assert payload["recording"]["id"] in enqueued
+    assert payload["recording"]["filename"].startswith("Equipo + Mic ")
+    assert test_db.get_session(sess["id"])["title"].startswith("Equipo + Mic ")
+    test_db.close()
+
+
+def test_diarization_assign_merge_bleed_and_format() -> None:
+    from backend.context_manager import format_transcript_for_llm
+    from backend.diarization_service import (
+        assign_speakers_to_segments,
+        dedupe_call_bleed,
+        format_segments_plain_text,
+        merge_call_segments,
+    )
+    from backend.source_service import chunk_recording_for_index
+
+    # Word-level split when a single ASR block spans a clean speaker switch (>= 3 words, >= 1.0s each)
+    asr_segs = [
+        {
+            "start": 0.0,
+            "end": 5.0,
+            "text": "Hola buenos días amigos Perfecto muchas gracias por venir",
+            "words": [
+                {"start": 0.0, "end": 0.4},
+                {"start": 0.5, "end": 0.9},
+                {"start": 1.0, "end": 1.4},
+                {"start": 1.5, "end": 1.9},
+                {"start": 2.0, "end": 2.4},
+                {"start": 2.6, "end": 3.1},
+                {"start": 3.2, "end": 3.7},
+                {"start": 3.8, "end": 4.3},
+                {"start": 4.4, "end": 4.9},
+            ],
+        },
+        {"start": 5.5, "end": 8.0, "text": "Revisemos la agenda completa."},
+    ]
+    turns = [
+        {"start": 0.0, "end": 2.5, "speaker": "Hablante 2", "speaker_key": "spk_2"},
+        {"start": 2.5, "end": 8.2, "speaker": "Hablante 5", "speaker_key": "spk_5"},
+    ]
+    assigned = assign_speakers_to_segments(asr_segs, turns)
+    assert len(assigned) == 3
+    # First-appearance renormalization produces Hablante 1, Hablante 2 (no gaps)
+    assert assigned[0]["speaker"] == "Hablante 1"
+    assert assigned[1]["speaker"] == "Hablante 2"
+    assert assigned[2]["speaker"] == "Hablante 2"
+
+    # Acoustic bleed suppression when mic picks up speaker output simultaneously
+    mic_segs = [
+        {"start": 2.6, "end": 4.9, "text": "Perfecto muchas gracias por venir."},
+        {"start": 8.5, "end": 11.0, "text": "Sí, aquí tengo los datos listos."},
+    ]
+    clean_mic = dedupe_call_bleed(mic_segs, assigned)
+    assert len(clean_mic) == 1
+    assert "tengo los datos" in clean_mic[0]["text"]
+
+    merged = merge_call_segments(mic_segs, assigned)
+    assert merged[-1]["speaker"] == "Tú"
+    assert merged[0]["speaker"] == "Hablante 1"
+
+    plain = format_segments_plain_text(merged)
+    assert "Hablante 1:" in plain
+    assert "Hablante 2:" in plain
+    assert "Tú:" in plain
+
+    rec_mock = {"filename": "Llamada.wav", "segments": merged, "transcript_text": plain}
+    llm_fmt = format_transcript_for_llm(rec_mock)
+    assert "[00:00] Hablante 1:" in llm_fmt
+    assert "[00:08] Tú:" in llm_fmt or "[00:09] Tú:" in llm_fmt
+    chunks = chunk_recording_for_index(rec_mock)
+    assert any("Tú:" in c["content"] for c in chunks)
+
+
+def test_dual_track_split_and_speaker_rename_endpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import wave
+    import numpy as np
+    from fastapi.testclient import TestClient
+    import backend.app as app_mod
+    from backend.audio_capture import split_dual_track_wav
+
+    tracks_wav = tmp_path / "call.tracks.wav"
+    sr = 16000
+    ch0_mic = np.full(sr // 2, 1200, dtype=np.int16)
+    ch1_sys = np.full(sr // 2, -2400, dtype=np.int16)
+    stereo = np.column_stack([ch0_mic, ch1_sys])
+    with wave.open(str(tracks_wav), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(stereo.tobytes())
+
+    mic_path, sys_path = split_dual_track_wav(tracks_wav, tmp_path / "split")
+    with wave.open(str(mic_path), "rb") as wf_m, wave.open(str(sys_path), "rb") as wf_s:
+        m_arr = np.frombuffer(wf_m.readframes(wf_m.getnframes()), dtype=np.int16)
+        s_arr = np.frombuffer(wf_s.readframes(wf_s.getnframes()), dtype=np.int16)
+    assert int(np.mean(m_arr)) == 1200
+    assert int(np.mean(s_arr)) == -2400
+
+    # Test speaker rename endpoint updates segments, transcript_text & FTS5 chunks
+    test_db = Database(db_path=tmp_path / "rename.db", audio_dir=tmp_path / "audio")
+    test_db.init_db()
+    sess = test_db.create_session("Reunión de prueba")
+    rec = test_db.create_recording(
+        session_id=sess["id"],
+        filename="Equipo + Mic.wav",
+        stored_path=str(tmp_path / "x.wav"),
+        playable_path=str(tmp_path / "x.wav"),
+        capture_mode="both",
+        tracks_path=str(tracks_wav),
+    )
+    segs = [
+        {"start": 0.0, "end": 2.0, "text": "Hola equipo", "speaker": "Tú", "speaker_key": "me"},
+        {"start": 2.2, "end": 5.0, "text": "Revisemos el presupuesto", "speaker": "Hablante 1", "speaker_key": "spk_1"},
+    ]
+    test_db.update_recording_transcript(rec["id"], "Tú: Hola equipo\nHablante 1: Revisemos el presupuesto", segs, "es", 5.0, "parakeet-tdt-0.6b-v3")
+    test_db.update_recording_summary(rec["id"], "Resumen", status="ready", progress=1.0, stage="Listo")
+
+    monkeypatch.setattr(app_mod, "db", test_db)
+    client = TestClient(app_mod.app)
+
+    res = client.patch(
+        f"/api/sessions/{sess['id']}/recordings/{rec['id']}/speakers",
+        json={"mapping": {"Hablante 1": "Ana"}},
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["segments"][1]["speaker"] == "Ana"
+    assert "Ana: Revisemos el presupuesto" in data["transcript_text"]
+    hits = test_db.search_session_chunks(sess["id"], "presupuesto", limit=5)
+    assert hits and "Ana:" in hits[0]["content"]
+    test_db.close()
+
+
+def test_appearance_settings_validation_and_persistence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi.testclient import TestClient
+    import backend.app as app_mod
+
+    test_db = Database(db_path=tmp_path / "appearance.db", audio_dir=tmp_path / "audio")
+    test_db.init_db()
+    defaults = test_db.get_settings()
+    assert defaults["accent_color"] == "#c8ee26"
+    assert defaults["font_scale"] == pytest.approx(1.0)
+
+    monkeypatch.setattr(app_mod, "db", test_db)
+    client = TestClient(app_mod.app)
+
+    res = client.put(
+        "/api/settings",
+        json={"accent_color": "#3B82F6", "font_scale": 1.15},
+    )
+    assert res.status_code == 200
+    assert res.json()["accent_color"] == "#3b82f6"
+    assert res.json()["font_scale"] == pytest.approx(1.15)
+
+    res_clamp = client.put(
+        "/api/settings",
+        json={"accent_color": "not-a-hex", "font_scale": 3.0},
+    )
+    assert res_clamp.status_code == 200
+    assert res_clamp.json()["accent_color"] == "#c8ee26"
+    assert res_clamp.json()["font_scale"] == pytest.approx(1.25)
+
+    res_low = client.put("/api/settings", json={"font_scale": 0.2})
+    assert res_low.status_code == 200
+    assert res_low.json()["font_scale"] == pytest.approx(0.85)
+    test_db.close()
+
+
+def test_asr_model_status_and_modular_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi.testclient import TestClient
+    import backend.app as app_mod
+    from backend import config as cfg
+
+    models_dir = tmp_path / "whisper"
+    asr_dir = tmp_path / "asr"
+    hf_cache = tmp_path / "hf_hub"
+
+    # Simulate ONLY small Whisper, Parakeet ONNX, and Qwen3 0.6B installed
+    turbo_snap = models_dir / "models--mobiuslabsgmbh--faster-whisper-large-v3-turbo" / "snapshots" / "rev1"
+    turbo_snap.mkdir(parents=True)
+    (turbo_snap / "model.bin").write_bytes(b"ok")
+
+    parakeet_snap = hf_cache / "models--istupakov--parakeet-tdt-0.6b-v3-onnx" / "snapshots" / "rev1"
+    parakeet_snap.mkdir(parents=True)
+    (parakeet_snap / "encoder.onnx").write_bytes(b"onnx")
+
+    qwen_dir = asr_dir / "qwen3-asr-0.6b"
+    qwen_dir.mkdir(parents=True)
+    (qwen_dir / "config.json").write_text("{}", encoding="utf-8")
+    (qwen_dir / "model.safetensors").write_bytes(b"weights")
+
+    # Precise suffix check: large-v3-turbo must NOT mark large-v3 as installed
+    assert cfg.is_asr_model_installed("large-v3-turbo", models_dir=models_dir, asr_dir=asr_dir, hf_cache_dir=hf_cache) is True
+    assert cfg.is_asr_model_installed("large-v3", models_dir=models_dir, asr_dir=asr_dir, hf_cache_dir=hf_cache) is False
+    assert cfg.is_asr_model_installed(cfg.PARAKEET_MODEL_ID, models_dir=models_dir, asr_dir=asr_dir, hf_cache_dir=hf_cache) is True
+    assert cfg.is_asr_model_installed(cfg.CANARY_MODEL_ID, models_dir=models_dir, asr_dir=asr_dir, hf_cache_dir=hf_cache) is False
+    assert cfg.is_asr_model_installed("qwen3-asr-0.6b", models_dir=models_dir, asr_dir=asr_dir, hf_cache_dir=hf_cache) is True
+    assert cfg.is_asr_model_installed("qwen3-asr-1.7b", models_dir=models_dir, asr_dir=asr_dir, hf_cache_dir=hf_cache) is False
+
+    listed = {
+        m["id"]: m
+        for m in cfg.list_available_whisper_models(models_dir=models_dir, asr_dir=asr_dir, hf_cache_dir=hf_cache)
+    }
+    assert listed["large-v3-turbo"]["installed"] is True
+    assert listed["large-v3-turbo"]["can_delete"] is True
+    assert listed["large-v3"]["installed"] is False
+    assert listed["large-v3"]["can_download"] is True
+
+    # Endpoint wiring check with mocked download/delete functions
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(app_mod, "download_asr_model", lambda mid: (calls.append(("dl", mid)), {"id": mid, "installed": True})[1])
+    monkeypatch.setattr(app_mod, "delete_asr_model", lambda mid: (calls.append(("rm", mid)), True)[1])
+
+    client = TestClient(app_mod.app)
+    res_dl = client.post("/api/whisper/models/small/download")
+    assert res_dl.status_code == 200
+    assert res_dl.json()["status"] == "downloaded"
+    assert ("dl", "small") in calls
+
+    res_rm = client.delete("/api/whisper/models/small")
+    assert res_rm.status_code == 200
+    assert res_rm.json()["deleted"] is True
+    assert ("rm", "small") in calls

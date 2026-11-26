@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import subprocess
@@ -11,6 +12,7 @@ import tempfile
 import threading
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,11 +23,13 @@ from pydantic import BaseModel
 
 from backend.config import (
     AUDIO_DIR,
+    CANARY_MODEL_ID,
     DEFAULT_WHISPER_MODEL,
     FRONTEND_DIR,
     MLX_ASR_MODELS,
     PARAKEET_MODEL_ID,
     PODCASTS_DIR,
+    QWEN_TORCH_MODELS,
     SOURCES_DIR,
     SUPPORTED_AUDIO_EXTENSIONS,
     SUPPORTED_SOURCE_EXTENSIONS,
@@ -61,6 +65,20 @@ from backend.podcast_service import (
     parse_podcast_script_json,
     synthesize_podcast_audio,
 )
+from backend.audio_capture import (
+    is_system_audio_available,
+    split_dual_track_wav,
+    system_audio_recorder,
+)
+from backend.diarization_service import (
+    assign_speakers_to_segments,
+    diarize_audio,
+    format_segments_plain_text,
+    has_speech_energy,
+    is_diarization_runtime_available,
+    load_audio_mono_16k,
+    merge_call_segments,
+)
 from backend.resource_manager import resource_manager
 from backend.source_service import (
     build_image_analysis_messages,
@@ -73,10 +91,19 @@ from backend.source_service import (
     pages_to_full_text,
     prepare_image_base64,
 )
-from backend.whisper_service import WhisperCancelledError, _find_ffmpeg_exe, prepare_audio_file
+from backend.whisper_service import (
+    WhisperCancelledError,
+    _find_ffmpeg_exe,
+    delete_asr_model,
+    download_asr_model,
+    prepare_audio_file,
+)
 
 
 RECORDING_SUMMARY_MAX_TOKENS = 768
+_logger = logging.getLogger(__name__)
+_model_download_lock = asyncio.Lock()
+_downloading_model_id: str | None = None
 
 
 class SessionCreateRequest(BaseModel):
@@ -95,11 +122,14 @@ class SettingsUpdateRequest(BaseModel):
     num_ctx: int | None = None
     idle_unload_sec: int | None = None
     classroom_audio_enhance: bool | None = None
+    enable_diarization: bool | None = None
     enable_thinking: bool | None = None
     eco_mode: bool | None = None
     auto_summarize: bool | None = None
     eco_cpu_threads: int | None = None
     theme: str | None = None
+    accent_color: str | None = None
+    font_scale: float | None = None
 
 
 class ChatRequest(BaseModel):
@@ -113,6 +143,14 @@ class ResummarizeRequest(BaseModel):
 
 class EnableToggleRequest(BaseModel):
     enabled: bool
+
+
+class SystemCaptureStartRequest(BaseModel):
+    mode: str = "system"
+
+
+class SpeakerRenameRequest(BaseModel):
+    mapping: dict[str, str]
 
 
 class PodcastCreateRequest(BaseModel):
@@ -280,12 +318,26 @@ class ProcessingPipeline:
 
         settings = db.get_settings()
         whisper_model = settings.get("whisper_model") or DEFAULT_WHISPER_MODEL
-        engine_label = MLX_ASR_MODELS.get(whisper_model, {}).get("engine") or (
-            "Parakeet v3" if whisper_model == PARAKEET_MODEL_ID else f"Whisper ({whisper_model})"
+        engine_label = (
+            MLX_ASR_MODELS.get(whisper_model, {}).get("engine")
+            or QWEN_TORCH_MODELS.get(whisper_model, {}).get("engine")
+            or (
+                "Parakeet v3"
+                if whisper_model == PARAKEET_MODEL_ID
+                else "Canary 1B v2"
+                if whisper_model == CANARY_MODEL_ID
+                else f"Whisper ({whisper_model})"
+            )
         )
         whisper_device = settings.get("whisper_device") or "auto"
         whisper_lang = settings.get("whisper_language") or "auto"
         classroom_enhance = bool(settings.get("classroom_audio_enhance", True))
+        enable_diarization = bool(settings.get("enable_diarization", True))
+        diar_threads = (
+            max(1, int(settings.get("eco_cpu_threads") or 2))
+            if settings.get("eco_mode")
+            else min(4, max(2, (os.cpu_count() or 4) // 2))
+        )
         num_ctx = int(settings.get("num_ctx") or 8192)
         idle_unload_sec = int(settings.get("idle_unload_sec") or 180)
 
@@ -303,46 +355,161 @@ class ProcessingPipeline:
             playable_path=str(playable_path),
         )
 
-        # 2. Exclusive transcription
-        last_reported = 0.08
+        # 2. Exclusive transcription (+ optional call dual-track & speaker diarization)
+        transcript_text = ""
+        segments: list[dict[str, Any]] = []
+        detected_lang = whisper_lang
+        final_duration = duration_sec
+        used_dual_track = False
 
-        def _on_progress(ratio: float, detected_lang: str) -> None:
-            nonlocal last_reported
-            mapped = 0.10 + ratio * 0.65
-            if mapped - last_reported >= 0.03:
-                last_reported = mapped
-                pct = int(ratio * 100)
+        tracks_path_str = str(rec.get("tracks_path") or "").strip()
+        tracks_path = Path(tracks_path_str) if tracks_path_str else None
+
+        if (
+            enable_diarization
+            and rec.get("capture_mode") == "both"
+            and tracks_path is not None
+            and tracks_path.is_file()
+        ):
+            try:
+                with tempfile.TemporaryDirectory(prefix="transcrypting-call-") as call_dir_str:
+                    mic_wav, sys_wav = await asyncio.to_thread(
+                        split_dual_track_wav, tracks_path, Path(call_dir_str)
+                    )
+                    mic_samples = await asyncio.to_thread(load_audio_mono_16k, mic_wav)
+                    sys_samples = await asyncio.to_thread(load_audio_mono_16k, sys_wav)
+                    mic_has_voice = has_speech_energy(mic_samples)
+                    sys_has_voice = has_speech_energy(sys_samples)
+
+                    mic_segments: list[dict[str, Any]] = []
+                    sys_segments: list[dict[str, Any]] = []
+
+                    if mic_has_voice:
+                        def _on_mic_prog(ratio: float, _lang: str) -> None:
+                            mapped = 0.10 + ratio * 0.30
+                            db.update_recording_progress(
+                                rec_id,
+                                "transcribing",
+                                mapped,
+                                f"Transcribiendo tu micrófono ({int(ratio * 100)}%)...",
+                            )
+
+                        mic_res = await resource_manager.transcribe_exclusive(
+                            audio_path=mic_wav,
+                            model_name=whisper_model,
+                            device_pref=whisper_device,
+                            language=whisper_lang,
+                            progress_callback=_on_mic_prog,
+                            classroom_enhance=False,
+                            keep_loaded=sys_has_voice,
+                        )
+                        mic_segments = mic_res["segments"]
+                        detected_lang = mic_res["language"] or detected_lang
+                        final_duration = max(final_duration, mic_res.get("duration_sec") or 0.0)
+
+                    if sys_has_voice:
+                        def _on_sys_prog(ratio: float, _lang: str) -> None:
+                            mapped = 0.40 + ratio * 0.30
+                            db.update_recording_progress(
+                                rec_id,
+                                "transcribing",
+                                mapped,
+                                f"Transcribiendo llamada ({int(ratio * 100)}%)...",
+                            )
+
+                        sys_res = await resource_manager.transcribe_exclusive(
+                            audio_path=sys_wav,
+                            model_name=whisper_model,
+                            device_pref=whisper_device,
+                            language=whisper_lang,
+                            progress_callback=_on_sys_prog,
+                            classroom_enhance=False,
+                        )
+                        sys_segments = sys_res["segments"]
+                        if sys_res.get("language"):
+                            detected_lang = sys_res["language"]
+                        final_duration = max(final_duration, sys_res.get("duration_sec") or 0.0)
+
+                    if sys_segments and is_diarization_runtime_available():
+                        db.update_recording_progress(
+                            rec_id,
+                            "transcribing",
+                            0.74,
+                            "Identificando hablantes de la llamada...",
+                        )
+                        try:
+                            diar_turns = await asyncio.to_thread(diarize_audio, sys_wav, diar_threads)
+                            sys_segments = assign_speakers_to_segments(sys_segments, diar_turns)
+                        except Exception as diar_exc:
+                            _logger.warning("Diarización de pista del sistema omitida: %s", diar_exc)
+
+                    if mic_segments or sys_segments:
+                        segments = merge_call_segments(mic_segments, sys_segments)
+                        transcript_text = format_segments_plain_text(segments)
+                        used_dual_track = True
+            except (WhisperCancelledError, asyncio.CancelledError):
+                db.update_recording_error(rec_id, "Transcripción detenida manualmente.")
+                return
+            except Exception as call_exc:
+                _logger.warning("Fallo en separación dual-track, usando mezcla mono: %s", call_exc)
+
+        if not used_dual_track:
+            last_reported = 0.08
+
+            def _on_progress(ratio: float, _detected_lang: str) -> None:
+                nonlocal last_reported
+                mapped = 0.10 + ratio * 0.62
+                if mapped - last_reported >= 0.03:
+                    last_reported = mapped
+                    pct = int(ratio * 100)
+                    db.update_recording_progress(
+                        rec_id,
+                        "transcribing",
+                        mapped,
+                        f"Transcribiendo audio ({pct}%)...",
+                    )
+
+            try:
+                transcript_result = await resource_manager.transcribe_exclusive(
+                    audio_path=src_path,
+                    model_name=whisper_model,
+                    device_pref=whisper_device,
+                    language=whisper_lang,
+                    progress_callback=_on_progress,
+                    classroom_enhance=classroom_enhance,
+                )
+            except (WhisperCancelledError, asyncio.CancelledError):
+                db.update_recording_error(rec_id, "Transcripción detenida manualmente.")
+                return
+            except Exception as exc:
+                db.update_recording_error(rec_id, f"Error al transcribir con {engine_label}: {exc}")
+                return
+
+            transcript_text = transcript_result["text"]
+            segments = transcript_result["segments"]
+            detected_lang = transcript_result["language"]
+            final_duration = transcript_result["duration_sec"] or duration_sec
+
+            if enable_diarization and segments and is_diarization_runtime_available():
                 db.update_recording_progress(
                     rec_id,
                     "transcribing",
-                    mapped,
-                    f"Transcribiendo audio ({pct}%)...",
+                    0.76,
+                    "Identificando hablantes...",
                 )
-
-        try:
-            transcript_result = await resource_manager.transcribe_exclusive(
-                audio_path=src_path,
-                model_name=whisper_model,
-                device_pref=whisper_device,
-                language=whisper_lang,
-                progress_callback=_on_progress,
-                classroom_enhance=classroom_enhance,
-            )
-        except (WhisperCancelledError, asyncio.CancelledError):
-            db.update_recording_error(rec_id, "Transcripción detenida manualmente.")
-            return
-        except Exception as exc:
-            db.update_recording_error(rec_id, f"Error al transcribir con {engine_label}: {exc}")
-            return
+                try:
+                    diar_turns = await asyncio.to_thread(diarize_audio, src_path, diar_threads)
+                    if diar_turns:
+                        segments = assign_speakers_to_segments(segments, diar_turns)
+                        formatted = format_segments_plain_text(segments)
+                        if formatted:
+                            transcript_text = formatted
+                except Exception as diar_exc:
+                    _logger.warning("Diarización omitida para %s: %s", rec_id, diar_exc)
 
         # Re-check recording still exists (user might have deleted it while processing)
         if not db.get_recording(rec_id):
             return
-
-        transcript_text = transcript_result["text"]
-        segments = transcript_result["segments"]
-        detected_lang = transcript_result["language"]
-        final_duration = transcript_result["duration_sec"] or duration_sec
 
         db.update_recording_transcript(
             rec_id=rec_id,
@@ -838,6 +1005,8 @@ async def lifespan(_app: FastAPI):
     for task, cancel_ev in list(_podcast_jobs.values()):
         cancel_ev.set()
         task.cancel()
+    if system_audio_recorder.get_status()["recording"]:
+        await asyncio.to_thread(system_audio_recorder.stop)
     await pipeline.stop()
     await resource_manager.stop_idle_watchdog()
     await resource_manager.unload_everything()
@@ -875,7 +1044,10 @@ async def system_status(refresh_models: bool = False) -> dict[str, Any]:
         "ollama_models": ollama_models,
         "running_ollama_models": running_ollama,
         "whisper_models": list_available_whisper_models(),
+        "downloading_whisper_model": _downloading_model_id,
         "whisper_metal_supported": WHISPER_METAL_SUPPORTED,
+        "system_audio_available": await asyncio.to_thread(is_system_audio_available),
+        "diarization_available": is_diarization_runtime_available(),
         "settings": settings,
     }
 
@@ -885,6 +1057,54 @@ async def system_unload() -> dict[str, Any]:
     await resource_manager.unload_everything()
     stats = await asyncio.to_thread(get_system_stats, True)
     return {"status": "unloaded", "hardware": stats, "resources": resource_manager.get_state()}
+
+
+@app.post("/api/whisper/models/{model_id:path}/download")
+async def api_download_whisper_model(model_id: str) -> dict[str, Any]:
+    global _downloading_model_id
+    _require_not_podcast_busy()
+    if _model_download_lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ya se está descargando '{_downloading_model_id}'. Espera a que termine.",
+        )
+
+    async with _model_download_lock:
+        _downloading_model_id = model_id
+        try:
+            await asyncio.to_thread(download_asr_model, model_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"No se pudo descargar '{model_id}': {exc}") from exc
+        finally:
+            _downloading_model_id = None
+
+    return {
+        "status": "downloaded",
+        "model_id": model_id,
+        "whisper_models": list_available_whisper_models(),
+    }
+
+
+@app.delete("/api/whisper/models/{model_id:path}")
+async def api_delete_whisper_model(model_id: str) -> dict[str, Any]:
+    _require_not_podcast_busy()
+    if _model_download_lock.locked():
+        raise HTTPException(status_code=409, detail="Hay una descarga de modelo en curso.")
+    await resource_manager.unload_everything()
+    try:
+        deleted = await asyncio.to_thread(delete_asr_model, model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "status": "deleted",
+        "deleted": deleted,
+        "model_id": model_id,
+        "whisper_models": list_available_whisper_models(),
+    }
 
 
 @app.post("/api/system/stop")
@@ -1257,6 +1477,115 @@ async def transcribe_live_recording(file: UploadFile = File(...)) -> dict[str, s
     return {"text": result["text"]}
 
 
+@app.post("/api/sessions/{session_id}/recordings/system-capture/start")
+async def start_system_capture(
+    session_id: str,
+    req: SystemCaptureStartRequest,
+) -> dict[str, Any]:
+    _require_not_podcast_busy()
+    session = db.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Conversación no encontrada.")
+    mode = (req.mode or "system").strip().lower()
+    if mode not in ("system", "both"):
+        raise HTTPException(status_code=400, detail="Modo de captura inválido. Usa 'system' o 'both'.")
+
+    rec_id = uuid.uuid4().hex[:12]
+    dest_path = AUDIO_DIR / session_id / f"{rec_id}.wav"
+    try:
+        return await asyncio.to_thread(
+            system_audio_recorder.start,
+            session_id,
+            rec_id,
+            dest_path,
+            mode,  # type: ignore[arg-type]
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        detail = str(exc)
+        code = 409 if "en curso" in detail.lower() else 503
+        raise HTTPException(status_code=code, detail=detail) from exc
+
+
+@app.get("/api/recordings/system-capture/status")
+async def get_system_capture_status() -> dict[str, Any]:
+    return system_audio_recorder.get_status()
+
+
+@app.post("/api/recordings/system-capture/live-transcript")
+async def transcribe_system_capture_live() -> dict[str, str]:
+    _require_not_podcast_busy()
+    if not system_audio_recorder.get_status()["recording"]:
+        raise HTTPException(status_code=409, detail="No hay captura del equipo activa.")
+    if resource_manager.phase != "idle":
+        raise HTTPException(status_code=409, detail="La IA está ocupada. La captura continúa.")
+
+    with tempfile.TemporaryDirectory(prefix="transcrypting-syscap-live-") as directory:
+        audio = Path(directory) / "fragment.wav"
+        exported = await asyncio.to_thread(system_audio_recorder.export_live_fragment, audio)
+        if not exported or not audio.exists():
+            return {"text": ""}
+
+        settings = db.get_settings()
+        try:
+            result = await resource_manager.transcribe_exclusive(
+                audio_path=audio,
+                model_name=settings.get("whisper_model") or DEFAULT_WHISPER_MODEL,
+                device_pref=settings.get("whisper_device") or "auto",
+                language=settings.get("whisper_language") or "auto",
+                classroom_enhance=False,
+                keep_loaded=True,
+            )
+        except (WhisperCancelledError, asyncio.CancelledError) as exc:
+            raise HTTPException(status_code=499, detail="Vista previa detenida.") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="No se pudo transcribir la vista previa.") from exc
+    return {"text": result["text"]}
+
+
+@app.post("/api/recordings/system-capture/stop")
+async def stop_system_capture() -> dict[str, Any]:
+    meta = await asyncio.to_thread(system_audio_recorder.stop)
+    wav_path: Path | None = meta.get("wav_path")
+    session_id: str | None = meta.get("session_id")
+    rec_id: str | None = meta.get("rec_id")
+    if not wav_path or not session_id or not rec_id:
+        raise HTTPException(status_code=409, detail="No había captura del equipo en curso.")
+
+    if not wav_path.exists() or wav_path.stat().st_size <= 44:
+        wav_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="No se grabó audio válido del equipo.")
+
+    session = db.get_session(session_id)
+    if not session:
+        wav_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=404, detail="La conversación ya no existe.")
+
+    mode_label = "Equipo + Mic" if meta.get("mode") == "both" else "Audio equipo"
+    stamp = datetime.now().strftime("%Y-%m-%d %H-%M")
+    filename = f"{mode_label} {stamp}.wav"
+    settings = db.get_settings()
+    whisper_model = settings.get("whisper_model") or DEFAULT_WHISPER_MODEL
+
+    rec = db.create_recording(
+        session_id=session_id,
+        filename=filename,
+        stored_path=str(wav_path),
+        playable_path=str(wav_path),
+        whisper_model=whisper_model,
+        rec_id=rec_id,
+        capture_mode=str(meta.get("mode") or "system"),
+        tracks_path=str(meta["tracks_path"]) if meta.get("tracks_path") else "",
+    )
+    pipeline.enqueue(rec_id)
+
+    if session.get("title") == "Nueva conversación":
+        db.update_session_title(session_id, f"{mode_label} {datetime.now().strftime('%H-%M')}"[:80])
+
+    return {"recording": rec, "duration_sec": meta.get("duration_sec", 0.0)}
+
+
 def _sanitize_filename(name: str) -> str:
     base = Path(name or "audio.wav").name
     cleaned = re.sub(r"[^A-Za-z0-9áéíóúÁÉÍÓÚñÑüÜ._\- ]+", "_", base).strip()
@@ -1347,6 +1676,29 @@ async def toggle_recording_enabled(
     db.set_recording_enabled(rec_id, payload.enabled)
     _schedule_combined_summary_refresh(session_id)
     return _build_session_response(session_id)
+
+
+@app.patch("/api/sessions/{session_id}/recordings/{rec_id}/speakers")
+async def rename_recording_speakers(
+    session_id: str,
+    rec_id: str,
+    req: SpeakerRenameRequest,
+) -> dict[str, Any]:
+    rec = db.get_recording(rec_id)
+    if not rec or rec["session_id"] != session_id:
+        raise HTTPException(status_code=404, detail="Grabación no encontrada.")
+    updated = db.update_recording_speakers(rec_id, req.mapping)
+    if updated:
+        chunks = chunk_recording_for_index(updated)
+        db.replace_item_chunks(
+            session_id=session_id,
+            item_kind="recording",
+            item_id=rec_id,
+            filename=updated["filename"],
+            source_type="audio",
+            chunks=chunks,
+        )
+    return updated or rec
 
 
 @app.delete("/api/sessions/{session_id}/recordings/{rec_id}")

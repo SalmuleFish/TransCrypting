@@ -346,7 +346,9 @@ def chunk_recording_for_index(
         if not seg_text:
             continue
         ts = _format_ts(float(seg.get("start", 0.0)))
-        line = f"[{ts}] {seg_text}"
+        spk = (seg.get("speaker") or "").strip()
+        spk_prefix = f"{spk}: " if spk else ""
+        line = f"[{ts}] {spk_prefix}{seg_text}"
         if buf and buf_len + len(line) + 1 > max_chars:
             chunks.append({"locator": chunk_start_ts, "content": "\n".join(buf)})
             buf = [line]

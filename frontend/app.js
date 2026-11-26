@@ -25,6 +25,9 @@ const state = {
   stoppingAI: false,
   lastContextMode: "full",
   theme: "light",
+  accentColor: "#c8ee26",
+  fontScale: 1.0,
+  appearancePreviewBackup: null,
   confirmCallback: null,
   pollTimer: null,
   fetchingSuggestionsFor: new Set(),
@@ -34,6 +37,8 @@ const state = {
   podcastElapsedTimer: null,
   cancellingPodcastId: null,
   transcriptRecFilter: null,
+  transcriptSpeakerFilter: null,
+  captureMode: "mic",
 };
 
 const audioPlayers = new Map();
@@ -45,6 +50,7 @@ const customSelectControllers = new Map();
 let activeDropdownMenu = null;
 let activeDropdownWrapper = null;
 let microphoneCapture = null;
+let systemCaptureState = null;
 let microphonePreview = null;
 let transcriptPlayback = null;
 
@@ -454,6 +460,103 @@ function applyTheme(theme, persist = false) {
   }
 }
 
+function normalizeHexColor(hex) {
+  const clean = String(hex || "").trim().toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(clean) ? clean : "#c8ee26";
+}
+
+function hexToRgb(hex) {
+  const clean = normalizeHexColor(hex).slice(1);
+  return {
+    r: parseInt(clean.slice(0, 2), 16),
+    g: parseInt(clean.slice(2, 4), 16),
+    b: parseInt(clean.slice(4, 6), 16),
+  };
+}
+
+function rgbToHex(r, g, b) {
+  const clamp = (n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0");
+  return `#${clamp(r)}${clamp(g)}${clamp(b)}`;
+}
+
+function computeAccentInk(r, g, b) {
+  const toLinear = (v) => {
+    const c = v / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  };
+  const lum = 0.2126 * toLinear(r) + 0.7152 * toLinear(g) + 0.0722 * toLinear(b);
+  return lum > 0.42 ? "#141716" : "#ffffff";
+}
+
+function normalizeFontScale(val) {
+  const num = Number(val);
+  if (!Number.isFinite(num)) return 1.0;
+  return Math.round(Math.max(0.85, Math.min(1.25, num)) * 100) / 100;
+}
+
+function getFontScaleLabel(scale) {
+  if (scale <= 0.92) return "Pequeña";
+  if (scale <= 1.03) return "Normal";
+  if (scale <= 1.14) return "Grande";
+  return "Extra grande";
+}
+
+function syncAppearanceUI(accentColor, fontScale) {
+  const hex = normalizeHexColor(accentColor);
+  const scale = normalizeFontScale(fontScale);
+  const customInput = document.getElementById("set-accent-custom");
+  const hexLabel = document.getElementById("accent-hex-label");
+  if (customInput && customInput.value.toLowerCase() !== hex) customInput.value = hex;
+  if (hexLabel) hexLabel.textContent = hex.toUpperCase();
+
+  document.querySelectorAll("#accent-swatches .accent-swatch").forEach((btn) => {
+    const on = btn.dataset.accent?.toLowerCase() === hex;
+    btn.classList.toggle("active", on);
+    btn.setAttribute("aria-checked", String(on));
+  });
+
+  const slider = document.getElementById("set-font-scale");
+  const badge = document.getElementById("font-scale-badge");
+  if (slider && Number(slider.value) !== scale) slider.value = String(scale);
+  if (badge) badge.textContent = `${Math.round(scale * 100)}% · ${getFontScaleLabel(scale)}`;
+
+  document.querySelectorAll("#font-scale-group .seg-control-item").forEach((btn) => {
+    const on = Math.abs(Number(btn.dataset.fontScale) - scale) < 0.025;
+    btn.classList.toggle("active", on);
+    btn.setAttribute("aria-pressed", String(on));
+  });
+}
+
+function applyAppearance({ accentColor, fontScale }, persistLocal = true) {
+  const hex = normalizeHexColor(accentColor ?? state.accentColor);
+  const scale = normalizeFontScale(fontScale ?? state.fontScale);
+  state.accentColor = hex;
+  state.fontScale = scale;
+
+  const { r, g, b } = hexToRgb(hex);
+  const hoverHex = rgbToHex(r * 0.88, g * 0.88, b * 0.88);
+  const tintHex = rgbToHex(r + (255 - r) * 0.8, g + (255 - g) * 0.8, b + (255 - b) * 0.8);
+  const ink = computeAccentInk(r, g, b);
+
+  const root = document.documentElement;
+  root.style.setProperty("--lime", hex);
+  root.style.setProperty("--lime-hover", hoverHex);
+  root.style.setProperty("--lime-tint", tintHex);
+  root.style.setProperty("--accent-rgb", `${r}, ${g}, ${b}`);
+  root.style.setProperty("--accent-ink", ink);
+  root.style.setProperty("--font-scale", String(scale));
+
+  if (persistLocal) {
+    try {
+      localStorage.setItem("transcript_accent_color", hex);
+      localStorage.setItem("transcript_font_scale", String(scale));
+    } catch (_) {}
+  }
+
+  syncAppearanceUI(hex, scale);
+  requestAnimationFrame(updateTabIndicator);
+}
+
 // --- Modal Open/Close Helpers ---
 
 function openModal(modalId) {
@@ -794,8 +897,20 @@ async function refreshSystemStatus(options = {}) {
     const data = await api("/api/system/status");
     state.systemStatus = data;
     renderTelemetry(data);
+    syncCaptureModeBar();
     if (data.settings?.theme && !localStorage.getItem("transcript_theme")) {
       applyTheme(data.settings.theme, false);
+    }
+    if (data.settings && !state.appearancePreviewBackup) {
+      const hasLocalAccent = Boolean(localStorage.getItem("transcript_accent_color"));
+      const hasLocalScale = Boolean(localStorage.getItem("transcript_font_scale"));
+      applyAppearance(
+        {
+          accentColor: hasLocalAccent ? state.accentColor : (data.settings.accent_color || "#c8ee26"),
+          fontScale: hasLocalScale ? state.fontScale : (data.settings.font_scale || 1.0),
+        },
+        false
+      );
     }
     if (options.syncSettingsModal && isModalOpen("settings-modal") && !activeDropdownMenu) {
       populateSettingsFromStatus(data);
@@ -1226,6 +1341,7 @@ async function selectSession(sessionId) {
     stopAllOtherAudio(null);
     state.activeRecordingId = null;
     state.transcriptRecFilter = null;
+    state.transcriptSpeakerFilter = null;
   }
   state.activeSessionId = sessionId;
   renderSessionList();
@@ -1728,7 +1844,6 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     meta.appendChild(statusPill);
 
     info.appendChild(nameRow);
-    info.appendChild(meta);
 
     const rightBtns = document.createElement("div");
     rightBtns.className = "rec-controls-right";
@@ -1826,8 +1941,13 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     top.appendChild(chk);
     top.appendChild(playBtn);
     top.appendChild(info);
-    top.appendChild(rightBtns);
     card.appendChild(top);
+
+    const footRow = document.createElement("div");
+    footRow.className = "rec-foot-row";
+    footRow.appendChild(meta);
+    footRow.appendChild(rightBtns);
+    card.appendChild(footRow);
 
     if (isWorking) {
       const stageLine = document.createElement("div");
@@ -1954,7 +2074,6 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     meta.appendChild(statusPill);
 
     info.appendChild(nameRow);
-    info.appendChild(meta);
 
     const rightBtns = document.createElement("div");
     rightBtns.className = "rec-controls-right";
@@ -2034,8 +2153,13 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     top.appendChild(chk);
     top.appendChild(iconEl);
     top.appendChild(info);
-    top.appendChild(rightBtns);
     card.appendChild(top);
+
+    const footRow = document.createElement("div");
+    footRow.className = "rec-foot-row";
+    footRow.appendChild(meta);
+    footRow.appendChild(rightBtns);
+    card.appendChild(footRow);
 
     if (isWorking) {
       const stageLine = document.createElement("div");
@@ -2268,6 +2392,14 @@ function renderSummaryTab(session, animateReveal = false) {
   }
 }
 
+function getSpeakerToneClass(speaker, orderedSpeakers) {
+  if (speaker === "Tú") return "spk-me";
+  const others = orderedSpeakers.filter((s) => s !== "Tú");
+  const idx = others.indexOf(speaker);
+  const slot = (idx >= 0 ? idx : 0) % 6 + 1;
+  return `spk-${slot}`;
+}
+
 function renderTranscriptTab(session) {
   syncMicrophonePreview(session);
   const pane = document.getElementById("transcript-content");
@@ -2279,17 +2411,27 @@ function renderTranscriptTab(session) {
   const sources = (session.sources || []).filter((s) => s.extracted_text && s.enabled !== false);
 
   state.transcriptRecFilter = activeRec?.id || null;
+  if (!activeRec) state.transcriptSpeakerFilter = null;
 
   const copyBtn = document.getElementById("btn-copy-transcript");
   if (copyBtn && !copyBtn.classList.contains("is-confirmed")) {
     copyBtn.textContent = state.transcriptRecFilter ? "Copiar audio" : "Copiar todo";
   }
 
+  const activeSpkList = activeRec
+    ? Array.from(new Set((activeRec.segments || []).map((s) => (s.speaker || "").trim()).filter(Boolean)))
+    : [];
+  if (state.transcriptSpeakerFilter && !activeSpkList.includes(state.transcriptSpeakerFilter)) {
+    state.transcriptSpeakerFilter = null;
+  }
+
   const contentSig = [
     session.id,
     query,
     state.transcriptRecFilter || "grid",
+    state.transcriptSpeakerFilter || "",
     activeRec?.status || "",
+    activeSpkList.join(","),
     recordings.map((r) => `${r.id}:${(r.transcript_text || "").length}:${(r.segments || []).length}:${r.whisper_model || ""}`).join(","),
     sources.map((s) => s.id).join(","),
   ].join("|");
@@ -2472,6 +2614,7 @@ function renderTranscriptTab(session) {
   backBtn.textContent = "← Todos los audios";
   backBtn.onclick = () => {
     state.transcriptRecFilter = null;
+    state.transcriptSpeakerFilter = null;
     renderTranscriptTab(session);
   };
   navBar.appendChild(backBtn);
@@ -2486,6 +2629,7 @@ function renderTranscriptTab(session) {
       pillBtn.textContent = `🎙 ${r.filename}`;
       pillBtn.onclick = () => {
         state.transcriptRecFilter = r.id;
+        state.transcriptSpeakerFilter = null;
         renderTranscriptTab(session);
       };
       switcher.appendChild(pillBtn);
@@ -2526,22 +2670,142 @@ function renderTranscriptTab(session) {
   }
 
   const segs = activeRec.segments || [];
+  const speakerCounts = new Map();
+  for (const s of segs) {
+    const spk = (s.speaker || "").trim();
+    if (spk) speakerCounts.set(spk, (speakerCounts.get(spk) || 0) + 1);
+  }
+  const orderedSpeakers = Array.from(speakerCounts.keys());
+
+  if (orderedSpeakers.length > 0) {
+    const toolbar = document.createElement("div");
+    toolbar.className = "speaker-toolbar";
+
+    const pillsWrap = document.createElement("div");
+    pillsWrap.className = "speaker-filter-pills";
+
+    const allPill = document.createElement("button");
+    allPill.type = "button";
+    allPill.className = `speaker-filter-pill ${!state.transcriptSpeakerFilter ? "active" : ""}`;
+    allPill.textContent = `Todos (${segs.length})`;
+    allPill.onclick = () => {
+      state.transcriptSpeakerFilter = null;
+      renderTranscriptTab(session);
+    };
+    pillsWrap.appendChild(allPill);
+
+    for (const spk of orderedSpeakers) {
+      const tone = getSpeakerToneClass(spk, orderedSpeakers);
+      const pill = document.createElement("button");
+      pill.type = "button";
+      pill.className = `speaker-filter-pill ${tone} ${state.transcriptSpeakerFilter === spk ? "active" : ""}`;
+      pill.innerHTML = `<span class="speaker-dot"></span><span>${escapeHtml(spk)}</span><span class="speaker-count">${speakerCounts.get(spk)}</span>`;
+      pill.onclick = () => {
+        state.transcriptSpeakerFilter = state.transcriptSpeakerFilter === spk ? null : spk;
+        renderTranscriptTab(session);
+      };
+      pillsWrap.appendChild(pill);
+    }
+    toolbar.appendChild(pillsWrap);
+
+    const renameBtn = document.createElement("button");
+    renameBtn.type = "button";
+    renameBtn.className = "pill-btn outline xs speaker-rename-toggle";
+    renameBtn.textContent = "Renombrar hablantes";
+    toolbar.appendChild(renameBtn);
+
+    const renamePanel = document.createElement("form");
+    renamePanel.className = "speaker-rename-panel hidden";
+    renamePanel.innerHTML = `
+      <div class="speaker-rename-grid">
+        ${orderedSpeakers.map((spk, idx) => `
+          <label class="speaker-rename-row">
+            <span class="speaker-badge ${getSpeakerToneClass(spk, orderedSpeakers)}">${escapeHtml(spk)}</span>
+            <input type="text" class="pill-input sm speaker-rename-input" data-old-speaker="${escapeHtml(spk)}" value="${escapeHtml(spk)}" maxlength="40" placeholder="Nombre del hablante ${idx + 1}" />
+          </label>
+        `).join("")}
+      </div>
+      <div class="speaker-rename-actions">
+        <button type="button" class="pill-btn outline xs speaker-rename-cancel">Cancelar</button>
+        <button type="submit" class="pill-btn dark xs speaker-rename-save">Guardar nombres</button>
+      </div>
+    `;
+    renameBtn.onclick = () => renamePanel.classList.toggle("hidden");
+    renamePanel.querySelector(".speaker-rename-cancel").onclick = () => renamePanel.classList.add("hidden");
+    renamePanel.onsubmit = async (ev) => {
+      ev.preventDefault();
+      const mapping = {};
+      renamePanel.querySelectorAll(".speaker-rename-input").forEach((inp) => {
+        const oldName = inp.dataset.oldSpeaker;
+        const nextName = inp.value.trim();
+        if (oldName && nextName && oldName !== nextName) {
+          mapping[oldName] = nextName;
+        }
+      });
+      if (!Object.keys(mapping).length) {
+        renamePanel.classList.add("hidden");
+        return;
+      }
+      const saveBtn = renamePanel.querySelector(".speaker-rename-save");
+      saveBtn.disabled = true;
+      try {
+        await api(`/api/sessions/${session.id}/recordings/${activeRec.id}/speakers`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mapping }),
+        });
+        if (state.transcriptSpeakerFilter && mapping[state.transcriptSpeakerFilter]) {
+          state.transcriptSpeakerFilter = mapping[state.transcriptSpeakerFilter];
+        }
+        await selectSession(session.id);
+        showToast("Nombres de hablantes actualizados.");
+      } catch (err) {
+        showToast(err.message, true);
+      } finally {
+        saveBtn.disabled = false;
+      }
+    };
+
+    card.appendChild(toolbar);
+    card.appendChild(renamePanel);
+  }
+
   const rows = [];
   let matchedAny = false;
+  let lastRenderedSpeaker = null;
   if (segs.length > 0) {
     for (const seg of segs) {
       const text = seg.text || "";
-      if (query && !text.toLowerCase().includes(query)) continue;
+      const speaker = (seg.speaker || "").trim();
+      if (state.transcriptSpeakerFilter && speaker !== state.transcriptSpeakerFilter) continue;
+      if (query && !text.toLowerCase().includes(query) && !speaker.toLowerCase().includes(query)) continue;
       matchedAny = true;
 
       const row = document.createElement("div");
-      row.className = "segment-row";
+      const turnChanged = Boolean(speaker && speaker !== lastRenderedSpeaker);
+      row.className = `segment-row${turnChanged ? " speaker-turn-start" : ""}`;
+      if (speaker) lastRenderedSpeaker = speaker;
 
       const playSegment = () => seekRecording(activeRec.id, seg.start, { pulse: true });
       const tsBtn = document.createElement("button");
       tsBtn.className = "timestamp-btn";
       tsBtn.textContent = formatDuration(seg.start);
       tsBtn.onclick = playSegment;
+
+      if (speaker) {
+        const spkBadge = document.createElement("span");
+        spkBadge.className = `speaker-badge ${getSpeakerToneClass(speaker, orderedSpeakers)}`;
+        spkBadge.textContent = speaker;
+        spkBadge.title = "Filtrar por este hablante";
+        spkBadge.onclick = () => {
+          state.transcriptSpeakerFilter = state.transcriptSpeakerFilter === speaker ? null : speaker;
+          renderTranscriptTab(session);
+        };
+        row.appendChild(tsBtn);
+        row.appendChild(spkBadge);
+      } else {
+        row.appendChild(tsBtn);
+      }
 
       const textEl = document.createElement("div");
       textEl.className = "segment-text";
@@ -2590,7 +2854,6 @@ function renderTranscriptTab(session) {
       words.append(text.slice(offset));
       textEl.appendChild(words);
 
-      row.appendChild(tsBtn);
       row.appendChild(textEl);
       card.appendChild(row);
       rows.push({ start, end, element: row, words: timedWords });
@@ -3254,6 +3517,136 @@ async function submitFullExam(session) {
   }
 }
 
+const STUDIO_ICONS = {
+  mic: `<svg aria-hidden="true" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M9 22h6"/></svg>`,
+  doc: `<svg aria-hidden="true" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg>`,
+  image: `<svg aria-hidden="true" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`,
+  check: `<svg aria-hidden="true" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`,
+  mixed: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M14 17.5h7M17.5 14v7"/></svg>`,
+  mcq: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="7" r="2.2"/><path d="M11 7h9"/><circle cx="6" cy="12" r="2.2" fill="currentColor"/><path d="M11 12h9"/><circle cx="6" cy="17" r="2.2"/><path d="M11 17h9"/></svg>`,
+  true_false: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 8 7 11 11 6"/><path d="M14 9h6"/><path d="M5 15l4 4M9 15l-4 4"/><path d="M14 17h6"/></svg>`,
+  open: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>`,
+  immediate: `<svg aria-hidden="true" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`,
+  exam: `<svg aria-hidden="true" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 1.5"/><path d="M9 2h6"/></svg>`,
+  conversation: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>`,
+  exam_review: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg>`,
+  debate: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M20 7H9"/><path d="M8 21l-4-4 4-4"/><path d="M4 17h11"/></svg>`,
+  step_by_step: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18h6v-4h5v-4h5V6"/></svg>`,
+};
+
+const QUIZ_MODE_LABELS = {
+  mixed: "Mixto completo",
+  mcq: "Opción múltiple",
+  true_false: "Verdadero / Falso",
+  open: "Respuesta abierta",
+};
+const QUIZ_DIFF_LABELS = { easy: "Básico", medium: "Intermedio", hard: "Difícil / Parcial" };
+const QUIZ_STYLE_LABELS = { conceptual: "Conceptual", practical: "Casos prácticos", tricky: "Trampas" };
+const PODCAST_STYLE_LABELS = {
+  conversation: "Conversación natural",
+  exam_review: "Repaso de examen",
+  debate: "Debate analítico",
+  step_by_step: "Paso a paso",
+};
+const PODCAST_LEN_LABELS = { short: "Corto (~2 min)", medium: "Medio (~4 min)", long: "Largo (~7 min)" };
+
+function buildSourceTilesHtml(readyRecs, readySrcs, selectedRecIds, selectedSrcIds, prefix) {
+  return [
+    ...readyRecs.map((r) => {
+      const sel = selectedRecIds.has(r.id);
+      const dur = r.duration_sec ? formatDuration(r.duration_sec) : "Audio";
+      return `
+        <button type="button" class="source-tile ${sel ? "selected" : ""}" data-${prefix}-kind="rec" data-${prefix}-item="${escapeHtml(r.id)}" aria-pressed="${sel}">
+          <span class="source-tile-icon">${STUDIO_ICONS.mic}</span>
+          <span class="source-tile-copy">
+            <span class="source-tile-name">${escapeHtml(r.filename)}</span>
+            <span class="source-tile-meta">${escapeHtml(dur)}</span>
+          </span>
+          <span class="source-tile-check">${STUDIO_ICONS.check}</span>
+        </button>`;
+    }),
+    ...readySrcs.map((s) => {
+      const sel = selectedSrcIds.has(s.id);
+      const isImg = s.source_type === "image";
+      const icon = isImg ? STUDIO_ICONS.image : STUDIO_ICONS.doc;
+      const meta = isImg ? "Imagen" : (s.page_count ? `${s.page_count} pág.` : "Documento");
+      return `
+        <button type="button" class="source-tile ${sel ? "selected" : ""}" data-${prefix}-kind="src" data-${prefix}-item="${escapeHtml(s.id)}" aria-pressed="${sel}">
+          <span class="source-tile-icon">${icon}</span>
+          <span class="source-tile-copy">
+            <span class="source-tile-name">${escapeHtml(s.filename)}</span>
+            <span class="source-tile-meta">${escapeHtml(meta)}</span>
+          </span>
+          <span class="source-tile-check">${STUDIO_ICONS.check}</span>
+        </button>`;
+    }),
+  ].join("");
+}
+
+function syncQuizSetupDOM(setup, session, qs) {
+  if (!setup) return;
+  const readyRecs = (session?.recordings || []).filter((r) => r.status === "ready");
+  const readySrcs = (session?.sources || []).filter((s) => s.status === "ready");
+  const totalSources = readyRecs.length + readySrcs.length;
+  const selectedTotal = qs.selectedRecIds.size + qs.selectedSrcIds.size;
+
+  setup.querySelectorAll(".source-tile").forEach((tile) => {
+    const target = tile.dataset.quizKind === "rec" ? qs.selectedRecIds : qs.selectedSrcIds;
+    const active = target.has(tile.dataset.quizItem);
+    tile.classList.toggle("selected", active);
+    tile.setAttribute("aria-pressed", String(active));
+  });
+
+  const srcCount = setup.querySelector("[data-quiz-src-count]");
+  if (srcCount) srcCount.textContent = `${selectedTotal}/${totalSources} activa(s)`;
+
+  const applyActive = (group, current) => {
+    setup.querySelectorAll(`[data-quiz-group="${group}"] [data-val]`).forEach((btn) => {
+      const on = btn.dataset.val === String(current);
+      btn.classList.toggle("active", on);
+      btn.setAttribute("aria-pressed", String(on));
+    });
+  };
+  applyActive("count", qs.count);
+  applyActive("mode", qs.mode);
+  applyActive("difficulty", qs.difficulty);
+  applyActive("questionStyle", qs.questionStyle);
+  applyActive("examMode", qs.examMode ? "true" : "false");
+  applyActive("timeLimitMin", qs.timeLimitMin);
+
+  const hintToggle = setup.querySelector("[data-quiz-hints]");
+  if (hintToggle) {
+    hintToggle.classList.toggle("active", Boolean(qs.includeHints));
+    hintToggle.setAttribute("aria-pressed", String(Boolean(qs.includeHints)));
+  }
+
+  const deckCount = setup.querySelector("[data-deck-count]");
+  if (deckCount && deckCount.textContent !== String(qs.count)) {
+    deckCount.textContent = String(qs.count);
+    deckCount.classList.remove("pop-num");
+    void deckCount.offsetWidth;
+    deckCount.classList.add("pop-num");
+  }
+  const deckMode = setup.querySelector("[data-deck-mode]");
+  if (deckMode) deckMode.textContent = QUIZ_MODE_LABELS[qs.mode] || qs.mode;
+  const setSpec = (attr, val) => {
+    const el = setup.querySelector(`[${attr}]`);
+    if (el) el.textContent = val;
+  };
+  setSpec("data-deck-sources", selectedTotal > 0 ? `${selectedTotal} de ${totalSources}` : "Ninguna");
+  setSpec("data-deck-diff", QUIZ_DIFF_LABELS[qs.difficulty] || qs.difficulty);
+  setSpec("data-deck-style", QUIZ_STYLE_LABELS[qs.questionStyle] || qs.questionStyle);
+  setSpec("data-deck-modality", qs.examMode ? "Modo examen real" : "Feedback inmediato");
+  setSpec("data-deck-timer", qs.timeLimitMin > 0 ? `${qs.timeLimitMin} min` : "Sin límite");
+  setSpec("data-deck-hints", qs.includeHints ? "Activadas" : "Ocultas");
+
+  const emptyWarn = setup.querySelector("[data-deck-warn]");
+  if (emptyWarn) emptyWarn.classList.toggle("hidden", selectedTotal > 0);
+
+  const btn = setup.querySelector("#btn-generate-quiz");
+  if (btn) btn.disabled = Boolean(state.podcastBusy) || selectedTotal === 0;
+}
+
 function renderQuizTab(session) {
   const pane = document.getElementById("tab-quiz");
   const resetBtn = document.getElementById("btn-reset-quiz");
@@ -3262,28 +3655,32 @@ function renderQuizTab(session) {
   const readyRecs = (session?.recordings || []).filter((r) => r.status === "ready");
   const readySrcs = (session?.sources || []).filter((s) => s.status === "ready");
   const qs = getQuizState(session?.id || "none");
-  const selectedTotal = qs.selectedRecIds.size + qs.selectedSrcIds.size;
+  const isSetupView = !qs.loading && (!qs.questions || qs.questions.length === 0);
 
-  const quizSig = [
-    session?.id || "",
-    readyRecs.length,
-    readySrcs.length,
-    qs.loading ? 1 : 0,
-    qs.count,
-    qs.mode,
-    qs.difficulty,
-    qs.questionStyle,
-    qs.includeHints ? 1 : 0,
-    qs.examMode ? 1 : 0,
-    qs.timeLimitMin,
-    qs.examSubmitted ? 1 : 0,
-    selectedTotal,
-    Array.from(qs.selectedRecIds).sort().join(","),
-    Array.from(qs.selectedSrcIds).sort().join(","),
-    qs.questions ? qs.questions.length : -1,
-    JSON.stringify(qs.answers),
-  ].join("|");
-  if (!memoChanged("quiz-pane", quizSig)) return;
+  const quizSig = isSetupView
+    ? [
+        "setup",
+        session?.id || "",
+        readyRecs.map((r) => `${r.id}:${r.filename}`).join(","),
+        readySrcs.map((s) => `${s.id}:${s.filename}`).join(","),
+      ].join("|")
+    : [
+        "active",
+        session?.id || "",
+        readyRecs.length,
+        readySrcs.length,
+        qs.loading ? 1 : 0,
+        qs.examSubmitted ? 1 : 0,
+        qs.questions ? qs.questions.length : -1,
+        JSON.stringify(qs.answers),
+      ].join("|");
+
+  if (!memoChanged("quiz-pane", quizSig)) {
+    if (isSetupView && session && (readyRecs.length > 0 || readySrcs.length > 0)) {
+      syncQuizSetupDOM(pane.querySelector(".quiz-setup-shell"), session, qs);
+    }
+    return;
+  }
 
   if (!session || (readyRecs.length === 0 && readySrcs.length === 0)) {
     if (resetBtn) resetBtn.classList.add("hidden");
@@ -3306,153 +3703,212 @@ function renderQuizTab(session) {
     if (resetBtn) resetBtn.classList.add("hidden");
     pane.innerHTML = "";
 
-    const sourceChipsHtml = [
-      ...readyRecs.map((r) => {
-        const sel = qs.selectedRecIds.has(r.id);
-        return `<button type="button" class="podcast-source-chip ${sel ? "selected" : ""}" data-quiz-kind="rec" data-quiz-item="${escapeHtml(r.id)}">🎙 ${escapeHtml(r.filename)}</button>`;
-      }),
-      ...readySrcs.map((s) => {
-        const sel = qs.selectedSrcIds.has(s.id);
-        const ico = s.source_type === "image" ? "🖼" : "📄";
-        return `<button type="button" class="podcast-source-chip ${sel ? "selected" : ""}" data-quiz-kind="src" data-quiz-item="${escapeHtml(s.id)}">${ico} ${escapeHtml(s.filename)}</button>`;
-      }),
-    ].join("");
+    const sourceTilesHtml = buildSourceTilesHtml(readyRecs, readySrcs, qs.selectedRecIds, qs.selectedSrcIds, "quiz");
+    const formatCards = [
+      { id: "mixed", title: "Mixto completo", desc: "Combina opción múltiple, V/F y respuesta abierta" },
+      { id: "mcq", title: "Opción múltiple", desc: "4 alternativas balanceadas con distractores claros" },
+      { id: "true_false", title: "Verdadero / Falso", desc: "Enunciados directos balanceados al 50/50" },
+      { id: "open", title: "Respuesta abierta", desc: "Desarrollo libre calificado con retroalimentación IA" },
+    ];
+    const modeCards = [
+      { id: "false", icon: "immediate", title: "Feedback inmediato", desc: "Corrige cada pregunta al instante" },
+      { id: "true", icon: "exam", title: "Modo examen real", desc: "Nota final al entregar todas" },
+    ];
+    const focusSuggestions = [
+      "Definiciones clave",
+      "Fórmulas y reglas",
+      "Casos prácticos",
+      "Diferencias y contrastes",
+    ];
 
     const setup = document.createElement("div");
-    setup.className = "quiz-setup-card";
+    setup.className = "quiz-setup-shell";
     setup.innerHTML = `
-      <div class="quiz-setup-header">
-        <h2>Generador de examen personalizado</h2>
-        <p>Elige las fuentes, el nivel de exigencia, el enfoque temático y si deseas retroalimentación inmediata o simulación cronometrada de examen.</p>
+      <div class="studio-composer-layout">
+        <div class="studio-configurator">
+          <div class="studio-head">
+            <span class="studio-eyebrow">EXÁMENES · SIMULACRO LOCAL</span>
+            <h2>Configura tu evaluación</h2>
+            <p>Combina grabaciones y apuntes en un simulacro adaptado al nivel del examen.</p>
+          </div>
+
+          <section class="studio-section">
+            <div class="studio-section-head">
+              <span class="studio-section-label">1. Fuentes a evaluar</span>
+              <div class="studio-section-actions">
+                <span class="studio-count-badge" data-quiz-src-count></span>
+                <button type="button" class="studio-link-btn" data-quiz-select-all="1">Todas</button>
+                <button type="button" class="studio-link-btn" data-quiz-select-all="0">Ninguna</button>
+              </div>
+            </div>
+            <div class="source-tiles-grid">${sourceTilesHtml}</div>
+          </section>
+
+          <section class="studio-section">
+            <div class="studio-section-head">
+              <span class="studio-section-label">2. Formato de preguntas</span>
+            </div>
+            <div class="studio-cards-2x2" data-quiz-group="mode">
+              ${formatCards.map((c) => `
+                <button type="button" class="studio-option-card ${qs.mode === c.id ? "active" : ""}" data-val="${c.id}">
+                  <span class="studio-card-top">
+                    <span class="studio-card-icon">${STUDIO_ICONS[c.id]}</span>
+                    <span class="studio-card-dot"></span>
+                  </span>
+                  <span class="studio-card-title">${c.title}</span>
+                  <span class="studio-card-desc">${c.desc}</span>
+                </button>`).join("")}
+            </div>
+          </section>
+
+          <section class="studio-section">
+            <div class="studio-section-head">
+              <span class="studio-section-label">3. Extensión, dificultad y estilo</span>
+            </div>
+            <div class="studio-params-stack">
+              <div class="seg-control-track" data-quiz-group="count" aria-label="Cantidad de preguntas">
+                ${[3, 5, 8, 10, 15].map((n) => `<button type="button" class="seg-control-item" data-val="${n}">${n} preg.</button>`).join("")}
+              </div>
+              <div class="studio-dual-tracks">
+                <div class="seg-control-track" data-quiz-group="difficulty" aria-label="Dificultad">
+                  <button type="button" class="seg-control-item" data-val="easy">Básico</button>
+                  <button type="button" class="seg-control-item" data-val="medium">Intermedio</button>
+                  <button type="button" class="seg-control-item" data-val="hard">Difícil</button>
+                </div>
+                <div class="seg-control-track" data-quiz-group="questionStyle" aria-label="Estilo">
+                  <button type="button" class="seg-control-item" data-val="conceptual">Conceptual</button>
+                  <button type="button" class="seg-control-item" data-val="practical">Casos</button>
+                  <button type="button" class="seg-control-item" data-val="tricky">Trampas</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="studio-section">
+            <div class="studio-section-head">
+              <span class="studio-section-label">4. Modalidad, tiempo y pistas</span>
+            </div>
+            <div class="studio-cards-2x1" data-quiz-group="examMode">
+              ${modeCards.map((c) => `
+                <button type="button" class="studio-option-card compact" data-val="${c.id}">
+                  <span class="studio-card-top">
+                    <span class="studio-card-icon">${STUDIO_ICONS[c.icon]}</span>
+                    <span class="studio-card-dot"></span>
+                  </span>
+                  <span class="studio-card-title">${c.title}</span>
+                  <span class="studio-card-desc">${c.desc}</span>
+                </button>`).join("")}
+            </div>
+            <div class="studio-timer-row">
+              <div class="seg-control-track" data-quiz-group="timeLimitMin" aria-label="Tiempo límite">
+                <button type="button" class="seg-control-item" data-val="0">Sin límite</button>
+                <button type="button" class="seg-control-item" data-val="5">5 min</button>
+                <button type="button" class="seg-control-item" data-val="10">10 min</button>
+                <button type="button" class="seg-control-item" data-val="15">15 min</button>
+              </div>
+              <button type="button" class="studio-switch-pill" data-quiz-hints aria-pressed="false">
+                <span class="switch-dot"></span>
+                <span>Incluir pistas</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="studio-section">
+            <div class="studio-section-head">
+              <span class="studio-section-label">5. Enfoque temático (opcional)</span>
+            </div>
+            <textarea class="podcast-focus-input quiz-focus-input" placeholder="Ej. Enfócate en definiciones clave, fórmulas del capítulo 3 o casos clínicos...">${escapeHtml(qs.focus)}</textarea>
+            <div class="studio-focus-chips">
+              ${focusSuggestions.map((label) => `<button type="button" class="focus-preset-chip" data-focus-chip="${escapeHtml(label)}">+ ${escapeHtml(label)}</button>`).join("")}
+            </div>
+          </section>
+        </div>
+
+        <aside class="studio-summary-deck obsidian-card">
+          <div class="deck-top-row">
+            <span class="deck-badge">PLAN DE EXAMEN</span>
+            <span class="deck-mode-tag" data-deck-mode></span>
+          </div>
+          <div class="deck-hero-metric">
+            <span class="deck-big-num" data-deck-count>${qs.count}</span>
+            <span class="deck-big-unit">preguntas<br/>a medida</span>
+          </div>
+          <div class="deck-spec-list">
+            <div class="deck-spec-row"><span>Fuentes</span><strong data-deck-sources></strong></div>
+            <div class="deck-spec-row"><span>Nivel</span><strong data-deck-diff></strong></div>
+            <div class="deck-spec-row"><span>Enfoque</span><strong data-deck-style></strong></div>
+            <div class="deck-spec-row"><span>Evaluación</span><strong data-deck-modality></strong></div>
+            <div class="deck-spec-row"><span>Temporizador</span><strong data-deck-timer></strong></div>
+            <div class="deck-spec-row"><span>Pistas</span><strong data-deck-hints></strong></div>
+          </div>
+          <p class="deck-warning hidden" data-deck-warn>Selecciona al menos una fuente para habilitar la generación.</p>
+          <button type="button" id="btn-generate-quiz" class="quiz-start-btn">
+            <span>Generar examen</span>
+            <span class="cta-circle" aria-hidden="true">→</span>
+          </button>
+        </aside>
       </div>
-      <div class="quiz-config-grid">
-        <div class="quiz-config-row">
-          <div class="quiz-config-label">Fuentes a evaluar (${selectedTotal} seleccionada(s))</div>
-          <div class="podcast-sources-grid">${sourceChipsHtml}</div>
-        </div>
-        <div class="quiz-config-row">
-          <div class="quiz-config-label">Tema o enfoque específico (opcional)</div>
-          <textarea class="podcast-focus-input quiz-focus-input" placeholder="Ej. Enfócate en definiciones clave, fórmulas del capítulo 3, diferencias entre algoritmos o casos clínicos...">${escapeHtml(qs.focus)}</textarea>
-        </div>
-        <div class="quiz-config-row">
-          <div class="quiz-config-label">Cantidad de preguntas</div>
-          <div class="quiz-pill-group" data-quiz-group="count">
-            <button type="button" class="quiz-choice-pill ${qs.count === 3 ? "active" : ""}" data-val="3">3 preguntas</button>
-            <button type="button" class="quiz-choice-pill ${qs.count === 5 ? "active" : ""}" data-val="5">5 preguntas</button>
-            <button type="button" class="quiz-choice-pill ${qs.count === 8 ? "active" : ""}" data-val="8">8 preguntas</button>
-            <button type="button" class="quiz-choice-pill ${qs.count === 10 ? "active" : ""}" data-val="10">10 preguntas</button>
-            <button type="button" class="quiz-choice-pill ${qs.count === 15 ? "active" : ""}" data-val="15">15 preguntas</button>
-          </div>
-        </div>
-        <div class="quiz-config-row">
-          <div class="quiz-config-label">Formato de preguntas</div>
-          <div class="quiz-pill-group" data-quiz-group="mode">
-            <button type="button" class="quiz-choice-pill ${qs.mode === "mixed" ? "active" : ""}" data-val="mixed">Mixto completo</button>
-            <button type="button" class="quiz-choice-pill ${qs.mode === "mcq" ? "active" : ""}" data-val="mcq">Opción múltiple</button>
-            <button type="button" class="quiz-choice-pill ${qs.mode === "true_false" ? "active" : ""}" data-val="true_false">Verdadero / Falso</button>
-            <button type="button" class="quiz-choice-pill ${qs.mode === "open" ? "active" : ""}" data-val="open">Respuesta abierta</button>
-          </div>
-        </div>
-        <div class="field-row">
-          <div class="quiz-config-row">
-            <div class="quiz-config-label">Dificultad</div>
-            <div class="quiz-pill-group" data-quiz-group="difficulty">
-              <button type="button" class="quiz-choice-pill ${qs.difficulty === "easy" ? "active" : ""}" data-val="easy">Básico</button>
-              <button type="button" class="quiz-choice-pill ${qs.difficulty === "medium" ? "active" : ""}" data-val="medium">Intermedio</button>
-              <button type="button" class="quiz-choice-pill ${qs.difficulty === "hard" ? "active" : ""}" data-val="hard">Difícil / Parcial</button>
-            </div>
-          </div>
-          <div class="quiz-config-row">
-            <div class="quiz-config-label">Estilo de preguntas</div>
-            <div class="quiz-pill-group" data-quiz-group="questionStyle">
-              <button type="button" class="quiz-choice-pill ${qs.questionStyle === "conceptual" ? "active" : ""}" data-val="conceptual">Conceptual</button>
-              <button type="button" class="quiz-choice-pill ${qs.questionStyle === "practical" ? "active" : ""}" data-val="practical">Casos prácticos</button>
-              <button type="button" class="quiz-choice-pill ${qs.questionStyle === "tricky" ? "active" : ""}" data-val="tricky">Trampas</button>
-            </div>
-          </div>
-        </div>
-        <div class="field-row">
-          <div class="quiz-config-row">
-            <div class="quiz-config-label">Modalidad de evaluación</div>
-            <div class="quiz-pill-group" data-quiz-group="examMode">
-              <button type="button" class="quiz-choice-pill ${!qs.examMode ? "active" : ""}" data-val="false">Feedback inmediato</button>
-              <button type="button" class="quiz-choice-pill ${qs.examMode ? "active" : ""}" data-val="true">Modo examen real</button>
-            </div>
-          </div>
-          <div class="quiz-config-row">
-            <div class="quiz-config-label">Temporizador y pistas</div>
-            <div class="quiz-pill-group" data-quiz-group="timeLimitMin">
-              <button type="button" class="quiz-choice-pill ${qs.timeLimitMin === 0 ? "active" : ""}" data-val="0">Sin límite</button>
-              <button type="button" class="quiz-choice-pill ${qs.timeLimitMin === 5 ? "active" : ""}" data-val="5">5 min</button>
-              <button type="button" class="quiz-choice-pill ${qs.timeLimitMin === 10 ? "active" : ""}" data-val="10">10 min</button>
-              <button type="button" class="quiz-choice-pill ${qs.timeLimitMin === 15 ? "active" : ""}" data-val="15">15 min</button>
-              <button type="button" class="quiz-choice-pill quiz-hint-toggle ${qs.includeHints ? "active" : ""}" data-val="toggle">💡 Pistas</button>
-            </div>
-          </div>
-        </div>
-      </div>
-      <button type="button" id="btn-generate-quiz" class="quiz-start-btn" ${state.podcastBusy || selectedTotal === 0 ? "disabled" : ""}>
-        <span>Generar examen personalizado</span>
-        <span class="cta-circle" aria-hidden="true">→</span>
-      </button>
     `;
 
-    setup.querySelectorAll(".podcast-source-chip").forEach((chip) => {
-      chip.onclick = () => {
-        const target = chip.dataset.quizKind === "rec" ? qs.selectedRecIds : qs.selectedSrcIds;
-        const id = chip.dataset.quizItem;
+    setup.querySelectorAll(".source-tile").forEach((tile) => {
+      tile.onclick = () => {
+        const target = tile.dataset.quizKind === "rec" ? qs.selectedRecIds : qs.selectedSrcIds;
+        const id = tile.dataset.quizItem;
         if (target.has(id)) target.delete(id);
         else target.add(id);
-        renderQuizTab(session);
+        syncQuizSetupDOM(setup, session, qs);
       };
     });
 
-    setup.querySelector(".quiz-focus-input").addEventListener("input", (e) => {
-      qs.focus = e.target.value;
-    });
-
-    setup.querySelectorAll('[data-quiz-group="count"] .quiz-choice-pill').forEach((b) => {
-      b.onclick = () => {
-        qs.count = Number(b.dataset.val);
-        renderQuizTab(session);
-      };
-    });
-    setup.querySelectorAll('[data-quiz-group="mode"] .quiz-choice-pill').forEach((b) => {
-      b.onclick = () => {
-        qs.mode = b.dataset.val;
-        renderQuizTab(session);
-      };
-    });
-    setup.querySelectorAll('[data-quiz-group="difficulty"] .quiz-choice-pill').forEach((b) => {
-      b.onclick = () => {
-        qs.difficulty = b.dataset.val;
-        renderQuizTab(session);
-      };
-    });
-    setup.querySelectorAll('[data-quiz-group="questionStyle"] .quiz-choice-pill').forEach((b) => {
-      b.onclick = () => {
-        qs.questionStyle = b.dataset.val;
-        renderQuizTab(session);
-      };
-    });
-    setup.querySelectorAll('[data-quiz-group="examMode"] .quiz-choice-pill').forEach((b) => {
-      b.onclick = () => {
-        qs.examMode = b.dataset.val === "true";
-        renderQuizTab(session);
-      };
-    });
-    setup.querySelectorAll('[data-quiz-group="timeLimitMin"] .quiz-choice-pill').forEach((b) => {
-      b.onclick = () => {
-        if (b.dataset.val === "toggle") {
-          qs.includeHints = !qs.includeHints;
-        } else {
-          qs.timeLimitMin = Number(b.dataset.val);
+    setup.querySelectorAll("[data-quiz-select-all]").forEach((btn) => {
+      btn.onclick = () => {
+        const selectAll = btn.dataset.quizSelectAll === "1";
+        qs.selectedRecIds.clear();
+        qs.selectedSrcIds.clear();
+        if (selectAll) {
+          readyRecs.forEach((r) => qs.selectedRecIds.add(r.id));
+          readySrcs.forEach((s) => qs.selectedSrcIds.add(s.id));
         }
-        renderQuizTab(session);
+        syncQuizSetupDOM(setup, session, qs);
       };
     });
+
+    const focusArea = setup.querySelector(".quiz-focus-input");
+    focusArea.addEventListener("input", () => {
+      qs.focus = focusArea.value;
+    });
+    setup.querySelectorAll("[data-focus-chip]").forEach((chip) => {
+      chip.onclick = () => {
+        const phrase = chip.dataset.focusChip;
+        const cur = focusArea.value.trim();
+        focusArea.value = cur ? `${cur}, ${phrase.toLowerCase()}` : phrase;
+        qs.focus = focusArea.value;
+        focusArea.focus();
+      };
+    });
+
+    const bindGroup = (group, parser = (v) => v) => {
+      setup.querySelectorAll(`[data-quiz-group="${group}"] [data-val]`).forEach((b) => {
+        b.onclick = () => {
+          qs[group] = parser(b.dataset.val);
+          syncQuizSetupDOM(setup, session, qs);
+        };
+      });
+    };
+    bindGroup("count", Number);
+    bindGroup("mode");
+    bindGroup("difficulty");
+    bindGroup("questionStyle");
+    bindGroup("examMode", (v) => v === "true");
+    bindGroup("timeLimitMin", Number);
+
+    setup.querySelector("[data-quiz-hints]").onclick = () => {
+      qs.includeHints = !qs.includeHints;
+      syncQuizSetupDOM(setup, session, qs);
+    };
 
     setup.querySelector("#btn-generate-quiz").onclick = () => generateQuizForSession(session);
+    syncQuizSetupDOM(setup, session, qs);
     pane.appendChild(setup);
     return;
   }
@@ -3665,6 +4121,57 @@ async function generatePodcastForSession(session) {
   }
 }
 
+function syncPodcastSetupDOM(pane, session, st) {
+  if (!pane || !st) return;
+  const readyRecs = (session?.recordings || []).filter((r) => r.status === "ready");
+  const readySrcs = (session?.sources || []).filter((s) => s.status === "ready");
+  const totalSources = readyRecs.length + readySrcs.length;
+  const selectedTotal = st.selectedRecIds.size + st.selectedSrcIds.size;
+
+  pane.querySelectorAll(".source-tile").forEach((tile) => {
+    const targetSet = tile.dataset.podKind === "rec" ? st.selectedRecIds : st.selectedSrcIds;
+    const active = targetSet.has(tile.dataset.podItem);
+    tile.classList.toggle("selected", active);
+    tile.setAttribute("aria-pressed", String(active));
+  });
+
+  const srcCount = pane.querySelector("[data-pod-src-count]");
+  if (srcCount) srcCount.textContent = `${selectedTotal}/${totalSources} activa(s)`;
+
+  const applyActive = (group, current) => {
+    pane.querySelectorAll(`[data-pod-group="${group}"] [data-val]`).forEach((btn) => {
+      const on = btn.dataset.val === String(current);
+      btn.classList.toggle("active", on);
+      btn.setAttribute("aria-pressed", String(on));
+    });
+  };
+  applyActive("style", st.style);
+  applyActive("length", st.length);
+  applyActive("language", st.language);
+
+  const hostsEl = pane.querySelector("[data-pod-hosts]");
+  if (hostsEl) {
+    const isEn = st.language === "en";
+    hostsEl.innerHTML = isEn
+      ? `<span class="cast-chip host-a"><span class="cast-dot">A</span>Claire</span><span class="cast-sep">+</span><span class="cast-chip host-b"><span class="cast-dot">B</span>Ryan</span>`
+      : `<span class="cast-chip host-a"><span class="cast-dot">A</span>Sofía</span><span class="cast-sep">+</span><span class="cast-chip host-b"><span class="cast-dot">B</span>Mateo</span>`;
+  }
+
+  const setSpec = (attr, val) => {
+    const el = pane.querySelector(`[${attr}]`);
+    if (el) el.textContent = val;
+  };
+  setSpec("data-pod-deck-style", PODCAST_STYLE_LABELS[st.style] || st.style);
+  setSpec("data-pod-deck-len", PODCAST_LEN_LABELS[st.length] || st.length);
+  setSpec("data-pod-deck-sources", selectedTotal > 0 ? `${selectedTotal} de ${totalSources}` : "Ninguna");
+
+  const warn = pane.querySelector("[data-pod-warn]");
+  if (warn) warn.classList.toggle("hidden", selectedTotal > 0);
+
+  const btn = pane.querySelector(".pod-start-btn");
+  if (btn) btn.disabled = selectedTotal === 0;
+}
+
 function renderPodcastTab(session) {
   const pane = document.getElementById("tab-podcast");
   if (!pane) return;
@@ -3683,11 +4190,6 @@ function renderPodcastTab(session) {
     session?.id || "",
     readyRecs.map((r) => `${r.id}:${r.filename}`).join(","),
     readySrcs.map((s) => `${s.id}:${s.filename}`).join(","),
-    st ? Array.from(st.selectedRecIds).sort().join(",") : "",
-    st ? Array.from(st.selectedSrcIds).sort().join(",") : "",
-    st?.style || "",
-    st?.length || "",
-    st?.language || "",
     isLocked ? 1 : 0,
     activePod ? activePod.id : "",
     activeScriptLen,
@@ -3720,6 +4222,8 @@ function renderPodcastTab(session) {
           el.classList.toggle("active", idx === stepIdx);
         });
       }
+    } else if (session && st && (readyRecs.length > 0 || readySrcs.length > 0)) {
+      syncPodcastSetupDOM(pane, session, st);
     }
     return;
   }
@@ -3800,79 +4304,139 @@ function renderPodcastTab(session) {
 
     pane.appendChild(stage);
   } else {
-    const banner = document.createElement("div");
-    banner.className = "podcast-lock-banner";
-    banner.innerHTML = `<span>🎙</span><div><strong>Podcast Studio 100% local (Kokoro-82M ONNX):</strong> se dedica el equipo en modo exclusivo (1.° Guion con Ollama → 2.° Liberar VRAM → 3.° Voces neuronales locales) con opción de cancelar en cualquier momento.</div>`;
-    pane.appendChild(banner);
+    const sourceTilesHtml = buildSourceTilesHtml(readyRecs, readySrcs, st.selectedRecIds, st.selectedSrcIds, "pod");
+    const styleCards = [
+      { id: "conversation", title: "Conversación natural", desc: "Charla amena conectando ideas y ejemplos" },
+      { id: "exam_review", title: "Repaso de examen", desc: "Preguntas clave, advertencias y síntesis rápida" },
+      { id: "debate", title: "Debate analítico", desc: "Contrasta matices, pros y contras del tema" },
+      { id: "step_by_step", title: "Paso a paso", desc: "Desglose estructurado desde las bases" },
+    ];
+    const focusSuggestions = [
+      "Temas más difíciles",
+      "Ejemplos cotidianos",
+      "Preguntas tipo parcial",
+      "Resumen ejecutivo",
+    ];
 
     const studio = document.createElement("div");
-    studio.className = "podcast-studio-card";
-
-    const selectedTotal = st.selectedRecIds.size + st.selectedSrcIds.size;
-    const sourceChipsHtml = [
-      ...readyRecs.map((r) => {
-        const sel = st.selectedRecIds.has(r.id);
-        return `<button type="button" class="podcast-source-chip ${sel ? "selected" : ""}" data-pod-kind="rec" data-pod-item="${escapeHtml(r.id)}">🎙 ${escapeHtml(r.filename)}</button>`;
-      }),
-      ...readySrcs.map((s) => {
-        const sel = st.selectedSrcIds.has(s.id);
-        const ico = s.source_type === "image" ? "🖼" : "📄";
-        return `<button type="button" class="podcast-source-chip ${sel ? "selected" : ""}" data-pod-kind="src" data-pod-item="${escapeHtml(s.id)}">${ico} ${escapeHtml(s.filename)}</button>`;
-      }),
-    ].join("");
-
+    studio.className = "podcast-studio-shell";
     studio.innerHTML = `
-      <div class="quiz-setup-header">
-        <h2>Crear episodio de Podcast local</h2>
-        <p>Elige qué fuentes incluir, indica el enfoque o temas clave y selecciona el estilo de conversación entre dos conductores.</p>
-      </div>
-      <div class="quiz-config-grid">
-        <div class="quiz-config-row">
-          <div class="quiz-config-label">Fuentes a incluir (${selectedTotal} seleccionada(s))</div>
-          <div class="podcast-sources-grid">${sourceChipsHtml}</div>
-        </div>
-        <div class="quiz-config-row">
-          <div class="quiz-config-label">Temas o enfoque específico (opcional)</div>
-          <textarea class="podcast-focus-input" placeholder="Ej. Enfóquense en los conceptos que entran al examen, comparen las fórmulas del pizarrón con lo que explicó el profesor y den ejemplos prácticos...">${escapeHtml(st.focus)}</textarea>
-        </div>
-        <div class="quiz-config-row">
-          <div class="quiz-config-label">Estilo del diálogo</div>
-          <div class="quiz-pill-group" data-pod-group="style">
-            <button type="button" class="quiz-choice-pill ${st.style === "conversation" ? "active" : ""}" data-val="conversation">Conversación natural</button>
-            <button type="button" class="quiz-choice-pill ${st.style === "exam_review" ? "active" : ""}" data-val="exam_review">Repaso de examen</button>
-            <button type="button" class="quiz-choice-pill ${st.style === "debate" ? "active" : ""}" data-val="debate">Debate analítico</button>
-            <button type="button" class="quiz-choice-pill ${st.style === "step_by_step" ? "active" : ""}" data-val="step_by_step">Paso a paso</button>
+      <div class="studio-composer-layout">
+        <div class="studio-configurator">
+          <div class="studio-head">
+            <span class="studio-eyebrow">ESTUDIO DE AUDIO · KOKORO-82M LOCAL</span>
+            <h2>Produce un episodio a dos voces</h2>
+            <p>Selecciona tus fuentes, define el tono editorial y genera un diálogo neuronal sin salir de tu equipo.</p>
           </div>
-        </div>
-        <div class="quiz-config-row">
-          <div class="quiz-config-label">Duración e idioma</div>
-          <div class="field-row">
-            <div class="quiz-pill-group" data-pod-group="length">
-              <button type="button" class="quiz-choice-pill ${st.length === "short" ? "active" : ""}" data-val="short">Corto (~2 min)</button>
-              <button type="button" class="quiz-choice-pill ${st.length === "medium" ? "active" : ""}" data-val="medium">Medio (~4 min)</button>
-              <button type="button" class="quiz-choice-pill ${st.length === "long" ? "active" : ""}" data-val="long">Largo (~7 min)</button>
+
+          <section class="studio-section">
+            <div class="studio-section-head">
+              <span class="studio-section-label">1. Material del episodio</span>
+              <div class="studio-section-actions">
+                <span class="studio-count-badge" data-pod-src-count></span>
+                <button type="button" class="studio-link-btn" data-pod-select-all="1">Todas</button>
+                <button type="button" class="studio-link-btn" data-pod-select-all="0">Ninguna</button>
+              </div>
             </div>
-            <div class="quiz-pill-group" data-pod-group="language">
-              <button type="button" class="quiz-choice-pill ${st.language === "es" ? "active" : ""}" data-val="es">Español</button>
-              <button type="button" class="quiz-choice-pill ${st.language === "en" ? "active" : ""}" data-val="en">English</button>
+            <div class="source-tiles-grid">${sourceTilesHtml}</div>
+          </section>
+
+          <section class="studio-section">
+            <div class="studio-section-head">
+              <span class="studio-section-label">2. Estilo editorial del programa</span>
+            </div>
+            <div class="studio-cards-2x2" data-pod-group="style">
+              ${styleCards.map((c) => `
+                <button type="button" class="studio-option-card" data-val="${c.id}">
+                  <span class="studio-card-top">
+                    <span class="studio-card-icon">${STUDIO_ICONS[c.id]}</span>
+                    <span class="studio-card-dot"></span>
+                  </span>
+                  <span class="studio-card-title">${c.title}</span>
+                  <span class="studio-card-desc">${c.desc}</span>
+                </button>`).join("")}
+            </div>
+          </section>
+
+          <section class="studio-section">
+            <div class="studio-section-head">
+              <span class="studio-section-label">3. Dirección y enfoque del guion (opcional)</span>
+            </div>
+            <textarea class="podcast-focus-input" placeholder="Ej. Comparen las fórmulas del pizarrón con la clase grabada, aclaren los puntos más confusos y den ejemplos concretos...">${escapeHtml(st.focus)}</textarea>
+            <div class="studio-focus-chips">
+              ${focusSuggestions.map((label) => `<button type="button" class="focus-preset-chip" data-pod-focus-chip="${escapeHtml(label)}">+ ${escapeHtml(label)}</button>`).join("")}
+            </div>
+          </section>
+        </div>
+
+        <aside class="studio-summary-deck podcast-deck obsidian-card">
+          <div class="deck-top-row">
+            <span class="deck-badge">CABINA DE EMISIÓN</span>
+            <div class="deck-static-bars" aria-hidden="true">
+              <span style="height:36%"></span><span style="height:72%"></span><span style="height:100%"></span><span style="height:56%"></span><span style="height:82%"></span><span style="height:44%"></span>
             </div>
           </div>
-        </div>
+
+          <div class="deck-cast-box">
+            <div class="deck-sublabel">Locutores en cabina</div>
+            <div class="deck-cast-row" data-pod-hosts></div>
+          </div>
+
+          <div class="deck-control-block">
+            <div class="deck-sublabel">Idioma del episodio</div>
+            <div class="seg-control-track dark-track" data-pod-group="language">
+              <button type="button" class="seg-control-item" data-val="es">Español</button>
+              <button type="button" class="seg-control-item" data-val="en">English</button>
+            </div>
+          </div>
+
+          <div class="deck-control-block">
+            <div class="deck-sublabel">Duración objetivo</div>
+            <div class="seg-control-track dark-track" data-pod-group="length">
+              <button type="button" class="seg-control-item" data-val="short">Corto (~2m)</button>
+              <button type="button" class="seg-control-item" data-val="medium">Medio (~4m)</button>
+              <button type="button" class="seg-control-item" data-val="long">Largo (~7m)</button>
+            </div>
+          </div>
+
+          <div class="deck-spec-list">
+            <div class="deck-spec-row"><span>Fuentes</span><strong data-pod-deck-sources></strong></div>
+            <div class="deck-spec-row"><span>Formato</span><strong data-pod-deck-style></strong></div>
+            <div class="deck-spec-row"><span>Duración</span><strong data-pod-deck-len></strong></div>
+          </div>
+
+          <p class="deck-exclusive-note">Modo exclusivo local: libera VRAM al sintetizar y permite cancelar en vivo.</p>
+          <p class="deck-warning hidden" data-pod-warn>Selecciona al menos una fuente para grabar el episodio.</p>
+
+          <button type="button" class="quiz-start-btn pod-start-btn">
+            <span>Grabar podcast local</span>
+            <span class="cta-circle" aria-hidden="true">→</span>
+          </button>
+        </aside>
       </div>
-      <button type="button" class="quiz-start-btn pod-start-btn" ${selectedTotal === 0 ? "disabled" : ""}>
-        <span>Generar podcast local</span>
-        <span class="cta-circle" aria-hidden="true">→</span>
-      </button>
     `;
 
-    studio.querySelectorAll(".podcast-source-chip").forEach((chip) => {
-      chip.onclick = () => {
-        const kind = chip.dataset.podKind;
-        const id = chip.dataset.podItem;
+    studio.querySelectorAll(".source-tile").forEach((tile) => {
+      tile.onclick = () => {
+        const kind = tile.dataset.podKind;
+        const id = tile.dataset.podItem;
         const targetSet = kind === "rec" ? st.selectedRecIds : st.selectedSrcIds;
         if (targetSet.has(id)) targetSet.delete(id);
         else targetSet.add(id);
-        renderPodcastTab(session);
+        syncPodcastSetupDOM(pane, session, st);
+      };
+    });
+
+    studio.querySelectorAll("[data-pod-select-all]").forEach((btn) => {
+      btn.onclick = () => {
+        const selectAll = btn.dataset.podSelectAll === "1";
+        st.selectedRecIds.clear();
+        st.selectedSrcIds.clear();
+        if (selectAll) {
+          readyRecs.forEach((r) => st.selectedRecIds.add(r.id));
+          readySrcs.forEach((s) => st.selectedSrcIds.add(s.id));
+        }
+        syncPodcastSetupDOM(pane, session, st);
       };
     });
 
@@ -3880,18 +4444,28 @@ function renderPodcastTab(session) {
     focusEl.addEventListener("input", () => {
       st.focus = focusEl.value;
     });
+    studio.querySelectorAll("[data-pod-focus-chip]").forEach((chip) => {
+      chip.onclick = () => {
+        const phrase = chip.dataset.podFocusChip;
+        const cur = focusEl.value.trim();
+        focusEl.value = cur ? `${cur}, ${phrase.toLowerCase()}` : phrase;
+        st.focus = focusEl.value;
+        focusEl.focus();
+      };
+    });
 
     ["style", "length", "language"].forEach((group) => {
-      studio.querySelectorAll(`[data-pod-group="${group}"] .quiz-choice-pill`).forEach((b) => {
+      studio.querySelectorAll(`[data-pod-group="${group}"] [data-val]`).forEach((b) => {
         b.onclick = () => {
           st[group] = b.dataset.val;
-          renderPodcastTab(session);
+          syncPodcastSetupDOM(pane, session, st);
         };
       });
     });
 
     studio.querySelector(".pod-start-btn").onclick = () => generatePodcastForSession(session);
     pane.appendChild(studio);
+    syncPodcastSetupDOM(pane, session, st);
   }
 
   // Completed / Errored Episodes
@@ -4049,16 +4623,55 @@ async function uploadRecordingFiles(sessionId, files) {
   return api(`/api/sessions/${sessionId}/recordings`, { method: "POST", body });
 }
 
+function getCaptureButtonLabel(mode, isRecording) {
+  if (isRecording) return "Detener grabación";
+  if (mode === "system") return "Grabar audio del equipo";
+  if (mode === "both") return "Grabar equipo + micrófono";
+  return "Grabar con micrófono";
+}
+
+function setCaptureLevel(level) {
+  const fill = document.getElementById("capture-level-fill");
+  if (!fill) return;
+  const pct = Math.round(Math.min(1, Math.max(0, Number(level) || 0)) * 100);
+  fill.style.width = `${pct}%`;
+}
+
+function syncCaptureModeBar() {
+  const bar = document.getElementById("capture-mode-bar");
+  if (!bar) return;
+  const locked = Boolean(microphoneCapture) || Boolean(systemCaptureState) || state.podcastBusy;
+  const nativeAvail = Boolean(state.systemStatus?.system_audio_available);
+  bar.querySelectorAll(".capture-mode-btn").forEach((btn) => {
+    const mode = btn.dataset.captureMode;
+    const isActive = state.captureMode === mode;
+    btn.classList.toggle("active", isActive);
+    btn.setAttribute("aria-pressed", String(isActive));
+    btn.disabled = locked;
+    if (mode !== "mic") {
+      btn.title = nativeAvail
+        ? (mode === "system"
+          ? "Captura nativa de audio del equipo (WASAPI, sin diálogo)"
+          : "Combina audio del equipo y micrófono (WASAPI)")
+        : "Captura audio de pantalla/pestaña mediante el selector del navegador";
+    }
+  });
+}
+
 function syncMicrophoneControls() {
   const btn = document.getElementById("btn-microphone");
-  const recording = microphoneCapture?.recorder?.state === "recording";
-  btn.disabled = !recording && (Boolean(microphoneCapture) || state.podcastBusy);
+  const browserRec = microphoneCapture?.recorder?.state === "recording";
+  const sysRec = Boolean(systemCaptureState?.recording);
+  const recording = browserRec || sysRec;
+  const busyStarting = (Boolean(microphoneCapture) || Boolean(systemCaptureState)) && !recording;
+  btn.disabled = !recording && (busyStarting || state.podcastBusy);
   btn.setAttribute("aria-pressed", String(recording));
-  document.getElementById("microphone-label").textContent = recording
-    ? "Detener grabación"
-    : "Grabar con micrófono";
-  document.getElementById("microphone-live").disabled = Boolean(microphoneCapture) || state.podcastBusy;
+  document.getElementById("microphone-label").textContent = getCaptureButtonLabel(state.captureMode, recording);
+  document.getElementById("microphone-live").disabled = Boolean(microphoneCapture) || Boolean(systemCaptureState) || state.podcastBusy;
   document.getElementById("microphone-time").classList.toggle("hidden", !recording);
+  document.getElementById("capture-level-wrap")?.classList.toggle("hidden", !recording);
+  if (!recording) setCaptureLevel(0);
+  syncCaptureModeBar();
 }
 
 function syncMicrophonePreview(session) {
@@ -4139,9 +4752,14 @@ function startMicrophoneFragment(capture) {
 async function saveMicrophoneCapture(capture, parts) {
   clearInterval(capture.clock);
   clearTimeout(capture.previewTimer);
+  if (capture.vuRaf) cancelAnimationFrame(capture.vuRaf);
   capture.previewRequest?.abort();
   if (capture.previewRecorder?.state === "recording") capture.previewRecorder.stop();
-  capture.stream.getTracks().forEach((track) => track.stop());
+  capture.extraStreams?.forEach((s) => s.getTracks().forEach((track) => track.stop()));
+  if (capture.audioCtx) {
+    try { await capture.audioCtx.close(); } catch (_) {}
+  }
+  capture.stream?.getTracks().forEach((track) => track.stop());
   syncMicrophoneControls();
 
   const status = document.getElementById("microphone-status");
@@ -4149,12 +4767,13 @@ async function saveMicrophoneCapture(capture, parts) {
   let file;
   try {
     if (!parts.length) {
-      status.textContent = "No se recibió audio del micrófono.";
+      status.textContent = "No se recibió audio de la captura.";
       if (liveStatus) liveStatus.textContent = status.textContent;
       return;
     }
     const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-    file = new File(parts, `Micrófono-${stamp}.${capture.extension}`, { type: parts[0].type });
+    const prefix = capture.mode === "both" ? "Equipo-Mic" : (capture.mode === "system" ? "Audio-equipo" : "Micrófono");
+    file = new File(parts, `${prefix}-${stamp}.${capture.extension}`, { type: parts[0].type });
     status.textContent = "Guardando grabación…";
     if (liveStatus) liveStatus.textContent = status.textContent;
     const [recording] = await uploadRecordingFiles(capture.sessionId, [file]);
@@ -4190,13 +4809,197 @@ async function saveMicrophoneCapture(capture, parts) {
   }
 }
 
+function attachBrowserVuMeter(capture, stream) {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = capture.audioCtx || new AudioCtx();
+    capture.audioCtx = ctx;
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+    const data = new Uint8Array(analyser.fftSize);
+    let smoothed = 0;
+    const tick = () => {
+      if (!microphoneCapture || microphoneCapture !== capture) return;
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i += 1) {
+        const v = (data[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      const norm = Math.min(1, Math.sqrt(rms * 4.2));
+      smoothed = smoothed * 0.55 + norm * 0.45;
+      setCaptureLevel(smoothed);
+      capture.vuRaf = requestAnimationFrame(tick);
+    };
+    capture.vuRaf = requestAnimationFrame(tick);
+  } catch (_) {}
+}
+
+async function pollSystemCaptureLive(capture) {
+  if (!systemCaptureState || systemCaptureState !== capture || !capture.recording) return;
+  if (!capture.liveInFlight) {
+    capture.liveInFlight = true;
+    const statusEl = document.getElementById("microphone-live-status");
+    const preview = document.getElementById("microphone-preview");
+    try {
+      const { text } = await api("/api/recordings/system-capture/live-transcript", { method: "POST" });
+      if (systemCaptureState === capture && capture.recording && text) {
+        const clean = text.trim();
+        if (clean && clean !== capture.lastLiveSnippet) {
+          capture.lastLiveSnippet = clean;
+          const follow = preview.scrollHeight - preview.scrollTop - preview.clientHeight <= 24;
+          const row = document.createElement("div");
+          row.className = "segment-row";
+          const stamp = document.createElement("span");
+          stamp.className = "timestamp-btn";
+          stamp.textContent = document.getElementById("microphone-time").textContent || "00:00";
+          const words = document.createElement("div");
+          words.className = "segment-text";
+          words.textContent = clean;
+          row.append(stamp, words);
+          preview.append(row);
+          if (follow) preview.scrollTop = preview.scrollHeight;
+        }
+        statusEl.textContent = preview.textContent ? "Grabando audio del equipo…" : "Escuchando audio…";
+      }
+    } catch (err) {
+      if (systemCaptureState === capture && capture.recording) {
+        statusEl.textContent = err.message;
+      }
+    } finally {
+      capture.liveInFlight = false;
+    }
+  }
+  if (systemCaptureState === capture && capture.recording) {
+    capture.liveTimer = setTimeout(() => pollSystemCaptureLive(capture), capture.previewIntervalMs);
+  }
+}
+
+async function stopNativeSystemCapture() {
+  const capture = systemCaptureState;
+  if (!capture) return;
+  capture.recording = false;
+  clearInterval(capture.statusTimer);
+  clearTimeout(capture.liveTimer);
+  const status = document.getElementById("microphone-status");
+  const liveStatus = capture.live ? document.getElementById("microphone-live-status") : null;
+  status.textContent = "Finalizando y guardando audio…";
+  if (liveStatus) liveStatus.textContent = status.textContent;
+  syncMicrophoneControls();
+
+  try {
+    const res = await api("/api/recordings/system-capture/stop", { method: "POST" });
+    status.textContent = "Audio del equipo guardado. Transcripción en cola.";
+    if (liveStatus && res.recording?.id) {
+      microphonePreview.recordingId = res.recording.id;
+      liveStatus.textContent = "Preparando la transcripción completa…";
+    }
+  } catch (err) {
+    status.textContent = err.message;
+    if (liveStatus) liveStatus.textContent = err.message;
+    showToast(err.message, true);
+  } finally {
+    systemCaptureState = null;
+    syncMicrophoneControls();
+  }
+
+  try {
+    if (state.activeSessionId === capture.sessionId) {
+      await selectSession(capture.sessionId);
+      if (state.activeSessionId === capture.sessionId && !state.podcastBusy) switchTab("transcript");
+    }
+    await loadSessions(false);
+  } catch (err) {
+    showToast(err.message, true);
+  }
+}
+
+async function startNativeSystemCapture() {
+  const status = document.getElementById("microphone-status");
+  const settings = state.systemStatus?.settings;
+  const capture = {
+    sessionId: state.activeSessionId,
+    mode: state.captureMode,
+    live: document.getElementById("microphone-live").checked,
+    previewIntervalMs: settings?.whisper_model === PARAKEET_MODEL_ID && settings.whisper_device === "auto" ? 4500 : 8000,
+    recording: false,
+    statusTimer: null,
+    liveTimer: null,
+    liveInFlight: false,
+    lastLiveSnippet: "",
+  };
+  systemCaptureState = capture;
+  status.textContent = "Iniciando captura WASAPI del equipo…";
+  syncMicrophoneControls();
+
+  try {
+    if (!capture.sessionId) {
+      await createNewSession();
+      capture.sessionId = state.activeSessionId;
+    }
+    if (!capture.sessionId || state.podcastBusy) throw new Error("Espera a que termine el podcast.");
+
+    const started = await api(`/api/sessions/${capture.sessionId}/recordings/system-capture/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: capture.mode }),
+    });
+    capture.recording = true;
+    const clock = document.getElementById("microphone-time");
+    clock.textContent = "00:00";
+    status.textContent = capture.live
+      ? ""
+      : `Capturando ${capture.mode === "both" ? "equipo + micrófono" : "audio del equipo"} (${started.device_name || "WASAPI"}).`;
+    syncMicrophoneControls();
+
+    capture.statusTimer = setInterval(async () => {
+      if (!systemCaptureState || systemCaptureState !== capture || !capture.recording) return;
+      try {
+        const st = await api("/api/recordings/system-capture/status");
+        if (!systemCaptureState || systemCaptureState !== capture) return;
+        clock.textContent = formatElapsedClock((st.elapsed_sec || 0) * 1000);
+        setCaptureLevel(st.level || 0);
+      } catch (_) {}
+    }, 180);
+
+    if (capture.live) {
+      microphonePreview = { sessionId: capture.sessionId };
+      document.getElementById("microphone-preview").replaceChildren();
+      document.getElementById("microphone-live-status").textContent = "Esperando el primer fragmento…";
+      syncMicrophonePreview(state.activeSession);
+      if (state.activeSessionId === capture.sessionId) {
+        switchTab("transcript");
+        document.getElementById("center-scroll").scrollTop = 0;
+      }
+      capture.liveTimer = setTimeout(() => pollSystemCaptureLive(capture), capture.previewIntervalMs);
+    }
+  } catch (err) {
+    status.textContent = err.message;
+    systemCaptureState = null;
+    syncMicrophoneControls();
+  }
+}
+
 async function toggleMicrophoneCapture() {
+  if (systemCaptureState?.recording) {
+    await stopNativeSystemCapture();
+    return;
+  }
   if (microphoneCapture?.recorder?.state === "recording") {
     microphoneCapture.recorder.stop();
     syncMicrophoneControls();
     return;
   }
-  if (microphoneCapture || state.podcastBusy) return;
+  if (microphoneCapture || systemCaptureState || state.podcastBusy) return;
+
+  if (state.captureMode !== "mic" && state.systemStatus?.system_audio_available) {
+    await startNativeSystemCapture();
+    return;
+  }
 
   const status = document.getElementById("microphone-status");
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
@@ -4207,15 +5010,42 @@ async function toggleMicrophoneCapture() {
   const settings = state.systemStatus?.settings;
   const capture = {
     sessionId: state.activeSessionId,
+    mode: state.captureMode,
     live: document.getElementById("microphone-live").checked,
     previewIntervalMs: settings?.whisper_model === PARAKEET_MODEL_ID && settings.whisper_device === "auto" ? 4000 : 8000,
+    extraStreams: [],
   };
   microphoneCapture = capture;
-  status.textContent = "Esperando permiso del micrófono…";
+  status.textContent = capture.mode === "mic"
+    ? "Esperando permiso del micrófono…"
+    : "Selecciona la pestaña o pantalla con audio en el navegador…";
   syncMicrophoneControls();
 
   try {
-    capture.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (capture.mode === "mic") {
+      capture.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } else {
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true });
+      displayStream.getVideoTracks().forEach((t) => t.stop());
+      if (!displayStream.getAudioTracks().length) {
+        throw new Error("No se compartió ninguna pista de audio del equipo.");
+      }
+      capture.extraStreams.push(displayStream);
+      if (capture.mode === "both") {
+        const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        capture.extraStreams.push(micStream);
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        const ctx = new AudioCtx();
+        capture.audioCtx = ctx;
+        const dest = ctx.createMediaStreamDestination();
+        ctx.createMediaStreamSource(displayStream).connect(dest);
+        ctx.createMediaStreamSource(micStream).connect(dest);
+        capture.stream = dest.stream;
+      } else {
+        capture.stream = new MediaStream(displayStream.getAudioTracks());
+      }
+    }
+
     if (!capture.sessionId) {
       await createNewSession();
       capture.sessionId = state.activeSessionId;
@@ -4229,7 +5059,7 @@ async function toggleMicrophoneCapture() {
     capture.recorder = recorder;
     recorder.ondataavailable = ({ data }) => { if (data.size) parts.push(data); };
     recorder.onstop = () => saveMicrophoneCapture(capture, parts);
-    recorder.onerror = () => showToast("El micrófono interrumpió la grabación.", true);
+    recorder.onerror = () => showToast("Se interrumpió la grabación de audio.", true);
     recorder.start();
     const container = recorder.mimeType.split(";")[0];
     capture.extension = { "audio/mp4": "m4a", "video/mp4": "mp4", "audio/ogg": "ogg" }[container] || "webm";
@@ -4238,6 +5068,7 @@ async function toggleMicrophoneCapture() {
     const clock = document.getElementById("microphone-time");
     clock.textContent = "00:00";
     capture.clock = setInterval(() => { clock.textContent = formatElapsedClock(performance.now() - capture.startedAt); }, 1000);
+    attachBrowserVuMeter(capture, capture.stream);
     status.textContent = capture.live ? "" : "Se transcribirá al detener la grabación.";
     syncMicrophoneControls();
     if (capture.live) {
@@ -4252,9 +5083,13 @@ async function toggleMicrophoneCapture() {
       startMicrophoneFragment(capture);
     }
   } catch (err) {
+    capture.extraStreams?.forEach((s) => s.getTracks().forEach((track) => track.stop()));
+    if (capture.audioCtx) {
+      try { await capture.audioCtx.close(); } catch (_) {}
+    }
     capture.stream?.getTracks().forEach((track) => track.stop());
     status.textContent = err.name === "NotAllowedError" || err.name === "NotFoundError"
-      ? "Comprueba que el micrófono esté conectado y que el navegador tenga permiso."
+      ? "Permiso denegado o dispositivo de audio no disponible."
       : err.message;
     microphoneCapture = null;
     syncMicrophoneControls();
@@ -4834,10 +5669,49 @@ function populateSettingsFromStatus(status) {
   for (const w of whisperModels) {
     const opt = document.createElement("option");
     opt.value = w.id;
-    opt.textContent = w.label;
+    const prefix = w.installed ? "✓ " : "↓ ";
+    const sizeText = !w.installed && w.size_hint && !w.label.includes(w.size_hint) ? ` · ${w.size_hint}` : "";
+    opt.textContent = `${prefix}${w.label}${sizeText}`;
     whisperSelect.appendChild(opt);
   }
-  whisperSelect.value = settings.whisper_model || "large-v3-turbo";
+  whisperSelect.value = settings.whisper_model || whisperSelect.options[0]?.value || "large-v3-turbo";
+
+  const syncAsrModelActionUI = () => {
+    const cur = whisperModels.find((m) => m.id === whisperSelect.value);
+    const pill = document.getElementById("asr-model-status-pill");
+    const btn = document.getElementById("btn-asr-model-action");
+    if (!pill || !btn) return;
+    const downloading = status?.downloading_whisper_model || null;
+    if (!cur) {
+      pill.textContent = "";
+      btn.classList.add("hidden");
+      return;
+    }
+    if (downloading) {
+      pill.className = "asr-model-status-pill remote";
+      pill.textContent = `Descargando ${downloading}…`;
+      btn.classList.remove("hidden");
+      btn.disabled = true;
+      btn.textContent = "Descargando…";
+      return;
+    }
+    btn.disabled = false;
+    if (cur.installed) {
+      pill.className = "asr-model-status-pill installed";
+      pill.textContent = "✓ Descargado en disco";
+      btn.classList.toggle("hidden", !cur.can_delete);
+      btn.textContent = "Eliminar pesos";
+      btn.dataset.asrAction = "delete";
+    } else {
+      pill.className = "asr-model-status-pill remote";
+      const hint = cur.size_hint ? ` (${cur.size_hint})` : "";
+      pill.textContent = `↓ Sin descargar${hint} · baja solo si lo eliges`;
+      btn.classList.toggle("hidden", !cur.can_download);
+      btn.textContent = "Descargar ahora";
+      btn.dataset.asrAction = "download";
+    }
+  };
+
   const langSelect = document.getElementById("set-whisper-lang");
   const autoLangOpt = langSelect.querySelector('option[value="auto"]');
   langSelect.value = settings.whisper_language || "auto";
@@ -4852,6 +5726,7 @@ function populateSettingsFromStatus(status) {
       langSelect.value = "es";
       refreshCustomSelect(langSelect.id);
     }
+    syncAsrModelActionUI();
   };
   whisperSelect.onchange();
 
@@ -4873,6 +5748,7 @@ function populateSettingsFromStatus(status) {
   document.getElementById("set-num-ctx").value = String(settings.num_ctx || 8192);
   document.getElementById("set-idle-unload").value = String(settings.idle_unload_sec || 180);
   document.getElementById("set-classroom-enhance").checked = settings.classroom_audio_enhance !== false;
+  document.getElementById("set-enable-diarization").checked = settings.enable_diarization !== false;
   document.getElementById("set-enable-thinking").checked = Boolean(settings.enable_thinking);
   document.getElementById("set-eco-mode").checked = Boolean(settings.eco_mode);
   document.getElementById("set-auto-summarize").checked = settings.auto_summarize !== false;
@@ -4882,6 +5758,10 @@ function populateSettingsFromStatus(status) {
   threadsInput.max = String(cpuCount);
   threadsInput.value = String(Math.min(cpuCount, Math.max(1, Number(settings.eco_cpu_threads || 2))));
   syncEcoThreadsUI(cpuCount);
+  syncAppearanceUI(
+    state.appearancePreviewBackup ? state.accentColor : (settings.accent_color || state.accentColor),
+    state.appearancePreviewBackup ? state.fontScale : (settings.font_scale || state.fontScale)
+  );
 
   [
     "set-ollama-model",
@@ -4911,14 +5791,19 @@ function openSettingsModal() {
     showToast("Ajustes bloqueados mientras se genera el podcast en modo exclusivo.", true);
     return;
   }
+  state.appearancePreviewBackup = { accentColor: state.accentColor, fontScale: state.fontScale };
   populateSettingsFromStatus(state.systemStatus || {});
   document.getElementById("btn-open-settings").classList.add("active");
   openModal("settings-modal");
   refreshSystemStatus({ syncSettingsModal: true });
 }
 
-function closeSettingsModal() {
+function closeSettingsModal(restoreBackup = true) {
   closeActiveDropdown();
+  if (restoreBackup && state.appearancePreviewBackup) {
+    applyAppearance(state.appearancePreviewBackup, true);
+  }
+  state.appearancePreviewBackup = null;
   document.getElementById("btn-open-settings").classList.remove("active");
   closeModal("settings-modal");
 }
@@ -4933,17 +5818,22 @@ async function saveSettings(e) {
     num_ctx: Number(document.getElementById("set-num-ctx").value),
     idle_unload_sec: Number(document.getElementById("set-idle-unload").value),
     classroom_audio_enhance: document.getElementById("set-classroom-enhance").checked,
+    enable_diarization: document.getElementById("set-enable-diarization").checked,
     enable_thinking: document.getElementById("set-enable-thinking").checked,
     eco_mode: document.getElementById("set-eco-mode").checked,
     auto_summarize: document.getElementById("set-auto-summarize").checked,
     eco_cpu_threads: Number(document.getElementById("set-eco-cpu-threads").value || 2),
+    accent_color: state.accentColor,
+    font_scale: state.fontScale,
   };
   await api("/api/settings", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  closeSettingsModal();
+  state.appearancePreviewBackup = null;
+  applyAppearance({ accentColor: state.accentColor, fontScale: state.fontScale }, true);
+  closeSettingsModal(false);
   await refreshSystemStatus();
   if (state.activeSessionId) {
     const fresh = await api(`/api/sessions/${state.activeSessionId}`);
@@ -4986,14 +5876,123 @@ function initEvents() {
   };
 
   const studioBody = document.getElementById("studio-body");
+  const drawerBackdrop = document.getElementById("drawer-backdrop");
+  const isCompactDrawerMode = () => window.innerWidth <= 1040;
+
+  const syncDrawerBackdrop = () => {
+    if (!drawerBackdrop) return;
+    const anyDrawerOpen = isCompactDrawerMode() && (
+      !studioBody.classList.contains("left-collapsed")
+      || !studioBody.classList.contains("right-collapsed")
+    );
+    drawerBackdrop.classList.toggle("hidden", !anyDrawerOpen);
+  };
+
+  let lastViewportTier = null;
+  const applyResponsiveViewportLayout = (force = false) => {
+    const w = window.innerWidth;
+    const tier = w <= 1040 ? "narrow" : w <= 1180 ? "medium" : "wide";
+    if (force || tier !== lastViewportTier) {
+      lastViewportTier = tier;
+      if (tier === "narrow") {
+        studioBody.classList.add("left-collapsed", "right-collapsed");
+      } else if (tier === "medium") {
+        studioBody.classList.add("left-collapsed");
+        studioBody.classList.remove("right-collapsed");
+      } else {
+        studioBody.classList.remove("left-collapsed", "right-collapsed");
+      }
+      setTimeout(updateTabIndicator, 250);
+    }
+    syncDrawerBackdrop();
+  };
+
   document.getElementById("btn-toggle-sidebar").onclick = () => {
+    const willOpen = studioBody.classList.contains("left-collapsed");
     studioBody.classList.toggle("left-collapsed");
+    if (isCompactDrawerMode() && willOpen) {
+      studioBody.classList.add("right-collapsed");
+    }
+    syncDrawerBackdrop();
     setTimeout(updateTabIndicator, 250);
   };
   document.getElementById("btn-toggle-sources").onclick = () => {
+    const willOpen = studioBody.classList.contains("right-collapsed");
     studioBody.classList.toggle("right-collapsed");
+    if (isCompactDrawerMode() && willOpen) {
+      studioBody.classList.add("left-collapsed");
+    }
+    syncDrawerBackdrop();
     setTimeout(updateTabIndicator, 250);
   };
+  drawerBackdrop?.addEventListener("click", () => {
+    studioBody.classList.add("left-collapsed", "right-collapsed");
+    syncDrawerBackdrop();
+  });
+
+  applyResponsiveViewportLayout(true);
+  let resizeRaf = 0;
+  window.addEventListener("resize", () => {
+    if (resizeRaf) cancelAnimationFrame(resizeRaf);
+    resizeRaf = requestAnimationFrame(() => applyResponsiveViewportLayout(false));
+  });
+
+  // Personalization live preview controls
+  document.getElementById("accent-swatches")?.addEventListener("click", (e) => {
+    const swatch = e.target.closest(".accent-swatch");
+    if (!swatch?.dataset.accent) return;
+    applyAppearance({ accentColor: swatch.dataset.accent, fontScale: state.fontScale }, false);
+  });
+  document.getElementById("set-accent-custom")?.addEventListener("input", (e) => {
+    applyAppearance({ accentColor: e.target.value, fontScale: state.fontScale }, false);
+  });
+  document.getElementById("font-scale-group")?.addEventListener("click", (e) => {
+    const btn = e.target.closest(".seg-control-item");
+    if (!btn?.dataset.fontScale) return;
+    applyAppearance({ accentColor: state.accentColor, fontScale: Number(btn.dataset.fontScale) }, false);
+  });
+  document.getElementById("set-font-scale")?.addEventListener("input", (e) => {
+    applyAppearance({ accentColor: state.accentColor, fontScale: Number(e.target.value) }, false);
+  });
+  document.getElementById("btn-reset-appearance")?.addEventListener("click", () => {
+    applyAppearance({ accentColor: "#c8ee26", fontScale: 1.0 }, false);
+  });
+
+  document.getElementById("btn-asr-model-action")?.addEventListener("click", async () => {
+    const btn = document.getElementById("btn-asr-model-action");
+    const select = document.getElementById("set-whisper-model");
+    const modelId = select?.value;
+    if (!modelId || btn.disabled) return;
+    const action = btn.dataset.asrAction || "download";
+
+    if (action === "delete") {
+      openConfirm(
+        "Eliminar pesos del modelo",
+        `Se borrarán de tu disco los archivos descargados de '${modelId}' para liberar espacio. Podrás descargarlo de nuevo cuando quieras.`,
+        async () => {
+          await api(`/api/whisper/models/${encodeURIComponent(modelId)}`, { method: "DELETE" });
+          await refreshSystemStatus({ syncSettingsModal: true });
+          showToast(`Pesos de '${modelId}' eliminados del disco.`);
+        }
+      );
+      return;
+    }
+
+    const prevText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Descargando…";
+    const pill = document.getElementById("asr-model-status-pill");
+    if (pill) pill.textContent = `Descargando ${modelId}… (puede tardar 1–3 min)`;
+    try {
+      await api(`/api/whisper/models/${encodeURIComponent(modelId)}/download`, { method: "POST" });
+      await refreshSystemStatus({ syncSettingsModal: true });
+      showToast(`Modelo '${modelId}' descargado y listo.`);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = prevText;
+      showToast(err.message, true);
+    }
+  });
 
   const telPopover = document.getElementById("telemetry-popover");
   const telBtn = document.getElementById("btn-telemetry-popover");
@@ -5044,8 +6043,22 @@ function initEvents() {
   };
 
   document.getElementById("btn-microphone").onclick = toggleMicrophoneCapture;
+  document.getElementById("capture-mode-bar")?.addEventListener("click", (e) => {
+    const btn = e.target.closest(".capture-mode-btn");
+    if (!btn || btn.disabled) return;
+    const mode = btn.dataset.captureMode;
+    if (!mode || mode === state.captureMode) return;
+    state.captureMode = mode;
+    document.getElementById("microphone-status").textContent =
+      mode === "system"
+        ? "Modo Equipo activo (opt-in): grabará y dividirá participantes (Hablante 1, 2…)."
+        : mode === "both"
+          ? "Modo Ambos (llamada): separará tu voz ('Tú') y los demás hablantes."
+          : "";
+    syncMicrophoneControls();
+  });
   window.addEventListener("beforeunload", (e) => {
-    if (!microphoneCapture) return;
+    if (!microphoneCapture && !systemCaptureState) return;
     e.preventDefault();
     e.returnValue = true;
   });
@@ -5403,6 +6416,18 @@ async function initApp() {
     }
   })();
   applyTheme(savedTheme, false);
+
+  try {
+    const savedAccent = localStorage.getItem("transcript_accent_color");
+    const savedScale = localStorage.getItem("transcript_font_scale");
+    applyAppearance(
+      {
+        accentColor: savedAccent || "#c8ee26",
+        fontScale: savedScale ? Number(savedScale) : 1.0,
+      },
+      false
+    );
+  } catch (_) {}
 
   initAllCustomSelects();
   initEvents();

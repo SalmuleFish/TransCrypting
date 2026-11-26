@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 from uuid import uuid4
 
-from backend.config import MLX_ASR_MODELS, PARAKEET_MODEL_ID
+from backend.config import CANARY_MODEL_ID, MLX_ASR_MODELS, PARAKEET_MODEL_ID, QWEN_TORCH_MODELS
 from backend.database import db
 from backend.ollama_service import ollama_service
 from backend.whisper_service import WhisperCancelledError, whisper_service
@@ -121,7 +121,12 @@ class ResourceManager:
                     raise WhisperCancelledError("Transcripción detenida por el usuario.")
                 try:
                     self.phase = "unloading"
-                    self.active_model = model_name if model_name == PARAKEET_MODEL_ID or model_name in MLX_ASR_MODELS else f"whisper-{model_name}"
+                    is_custom_engine = (
+                        model_name in (PARAKEET_MODEL_ID, CANARY_MODEL_ID)
+                        or model_name in MLX_ASR_MODELS
+                        or model_name in QWEN_TORCH_MODELS
+                    )
+                    self.active_model = model_name if is_custom_engine else f"whisper-{model_name}"
                     self.active_device = ""
                     await ollama_service.unload_all()
 

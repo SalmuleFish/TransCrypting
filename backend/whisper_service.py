@@ -13,12 +13,17 @@ import subprocess
 import sysconfig
 import tempfile
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import httpx
 
 from backend.config import (
+    ASR_MODELS_DIR,
+    CANARY_MODEL_ID,
+    CANARY_ONNX_SUPPORTED,
+    FASTER_WHISPER_SUPPORTED,
     HTML5_PLAYABLE_EXTENSIONS,
     MLX_ASR_MODELS,
     MLX_ASR_SUPPORTED,
@@ -27,9 +32,13 @@ from backend.config import (
     PARAKEET_MODEL_ID,
     PARAKEET_MODEL_REPO,
     PARAKEET_MODELS_DIR,
+    PARAKEET_ONNX_SUPPORTED,
     PARAKEET_SUPPORTED,
+    QWEN_TORCH_MODELS,
+    QWEN_TORCH_SUPPORTED,
     WHISPER_METAL_SUPPORTED,
     WHISPER_MODELS,
+    _default_hf_cache_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -209,6 +218,7 @@ _ONNX_WHISPER_MAP = {
     "large-v3-turbo": "onnx-community/whisper-large-v3-turbo",
     "large-v3": "onnx-community/whisper-large-v3",
     PARAKEET_MODEL_ID: "nemo-parakeet-tdt-0.6b-v3",
+    CANARY_MODEL_ID: "nemo-canary-1b-v2",
 }
 
 
@@ -320,6 +330,25 @@ def _convert_to_wav_16k(src_path: Path, dest_wav: Path) -> Path:
     return dest_wav
 
 
+@contextmanager
+def _hf_online_context() -> Iterator[None]:
+    """Temporarily allow Hugging Face Hub downloads on first model use, restoring prior offline flags."""
+    from huggingface_hub import constants as hf_constants
+
+    prev_env = os.environ.get("HF_HUB_OFFLINE")
+    prev_const = getattr(hf_constants, "HF_HUB_OFFLINE", False)
+    try:
+        os.environ["HF_HUB_OFFLINE"] = "0"
+        hf_constants.HF_HUB_OFFLINE = False
+        yield
+    finally:
+        if prev_env is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = prev_env
+        hf_constants.HF_HUB_OFFLINE = prev_const
+
+
 class WhisperService:
     """Manage local Whisper / Parakeet / ONNX transcription models and release them between workloads."""
 
@@ -327,6 +356,8 @@ class WhisperService:
         self._model: Any = None
         self._onnx_model: Any = None
         self._onnx_vad: Any = None
+        self._qwen_model: Any = None
+        self._qwen_processor: Any = None
         self._model_name: str = ""
         self._backend: str = "faster-whisper"
         self._cpp_exe: str | None = None
@@ -337,7 +368,12 @@ class WhisperService:
 
     @property
     def is_loaded(self) -> bool:
-        return self._model is not None or self._onnx_model is not None or self._ggml_path is not None
+        return (
+            self._model is not None
+            or self._onnx_model is not None
+            or self._ggml_path is not None
+            or self._qwen_model is not None
+        )
 
     def _resolve_model_source(self, model_name: str) -> str:
         """Use local CTranslate2 folder or cached Whisper weights; otherwise download once to MODELS_DIR."""
@@ -355,7 +391,6 @@ class WhisperService:
             return str(direct_dir)
 
         from faster_whisper import download_model
-        from huggingface_hub import constants as hf_constants
 
         try:
             return download_model(
@@ -366,25 +401,15 @@ class WhisperService:
         except Exception:
             pass
 
-        prev_env = os.environ.get("HF_HUB_OFFLINE")
-        prev_const = getattr(hf_constants, "HF_HUB_OFFLINE", False)
-        try:
-            os.environ["HF_HUB_OFFLINE"] = "0"
-            hf_constants.HF_HUB_OFFLINE = False
+        with _hf_online_context():
             return download_model(
                 model_name,
                 cache_dir=str(MODELS_DIR),
                 local_files_only=False,
             )
-        finally:
-            if prev_env is None:
-                os.environ.pop("HF_HUB_OFFLINE", None)
-            else:
-                os.environ["HF_HUB_OFFLINE"] = prev_env
-            hf_constants.HF_HUB_OFFLINE = prev_const
 
     def _load_onnx_asr(self, model_name: str) -> str:
-        """Load Whisper or Parakeet via onnx-asr with CPU thread cap."""
+        """Load Whisper, Parakeet, or Canary via onnx-asr with CPU thread cap."""
         import onnx_asr
         import onnxruntime as ort
 
@@ -393,17 +418,31 @@ class WhisperService:
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = max(1, int(threads))
         opts.inter_op_num_threads = 1
-        self._onnx_model = onnx_asr.load_model(
-            mapped,
-            quantization="int8",
-            sess_options=opts,
-            providers=["CPUExecutionProvider"],
-        )
-        self._onnx_vad = onnx_asr.load_vad(
-            "silero",
-            sess_options=opts,
-            providers=["CPUExecutionProvider"],
-        )
+        try:
+            self._onnx_model = onnx_asr.load_model(
+                mapped,
+                quantization="int8",
+                sess_options=opts,
+                providers=["CPUExecutionProvider"],
+            )
+            self._onnx_vad = onnx_asr.load_vad(
+                "silero",
+                sess_options=opts,
+                providers=["CPUExecutionProvider"],
+            )
+        except Exception:
+            with _hf_online_context():
+                self._onnx_model = onnx_asr.load_model(
+                    mapped,
+                    quantization="int8",
+                    sess_options=opts,
+                    providers=["CPUExecutionProvider"],
+                )
+                self._onnx_vad = onnx_asr.load_vad(
+                    "silero",
+                    sess_options=opts,
+                    providers=["CPUExecutionProvider"],
+                )
         self._backend = "onnx-asr"
         self._model_name = model_name
         self.active_device = "cpu"
@@ -420,6 +459,52 @@ class WhisperService:
                 return self.active_device
 
         self.unload()
+        if model_name in QWEN_TORCH_MODELS and not MLX_ASR_SUPPORTED:
+            preset = QWEN_TORCH_MODELS[model_name]
+            if not QWEN_TORCH_SUPPORTED:
+                raise RuntimeError(
+                    f"{preset['engine']} en Windows/Linux requiere PyTorch y transformers>=5.13."
+                )
+
+            import torch
+            from huggingface_hub import snapshot_download
+            from transformers import AutoProcessor, Qwen3ASRForConditionalGeneration
+
+            target_dir = ASR_MODELS_DIR / model_name
+            target_dir.mkdir(parents=True, exist_ok=True)
+            has_weights = (target_dir / "config.json").is_file() and (
+                (target_dir / "model.safetensors").is_file()
+                or any(target_dir.glob("model-*.safetensors"))
+            )
+            if not has_weights:
+                with _hf_online_context():
+                    snapshot_download(
+                        preset["repo"],
+                        local_dir=str(target_dir),
+                        local_files_only=False,
+                    )
+
+            use_cuda = pref in ("auto", "cuda") and torch.cuda.is_available()
+            if pref == "cuda" and not torch.cuda.is_available():
+                raise RuntimeError("No se encontró GPU CUDA disponible para Qwen3-ASR.")
+            device = "cuda" if use_cuda else "cpu"
+            if use_cuda:
+                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            else:
+                dtype = torch.float32
+
+            self._qwen_processor = AutoProcessor.from_pretrained(str(target_dir))
+            self._qwen_model = (
+                Qwen3ASRForConditionalGeneration.from_pretrained(str(target_dir), dtype=dtype)
+                .to(device)
+                .eval()
+            )
+            self._backend = "qwen-torch"
+            self._model_name = model_name
+            self.active_device = device
+            self.active_compute_type = str(dtype).replace("torch.", "")
+            return device
+
         if model_name in MLX_ASR_MODELS:
             preset = MLX_ASR_MODELS[model_name]
             if not MLX_ASR_SUPPORTED:
@@ -449,13 +534,13 @@ class WhisperService:
             self.active_device = device
             return device
 
-        if model_name == PARAKEET_MODEL_ID:
-            if not PARAKEET_SUPPORTED:
+        if model_name in (PARAKEET_MODEL_ID, CANARY_MODEL_ID):
+            if model_name == CANARY_MODEL_ID or not PARAKEET_SUPPORTED:
                 try:
                     return self._load_onnx_asr(model_name)
                 except Exception as exc:
                     raise RuntimeError(
-                        "Parakeet v3 requiere Apple Silicon (parakeet-mlx) o onnx-asr."
+                        f"{model_name} requiere 'onnx-asr' instalado."
                     ) from exc
             if pref == "cuda":
                 raise RuntimeError("Selecciona Automático o CPU para usar Parakeet v3.")
@@ -681,7 +766,9 @@ class WhisperService:
                 src_wav = enhanced_tmp if enhanced_tmp is not None else _convert_to_wav_16k(audio_path, wav_path)
                 adapter = self._onnx_model.with_vad(self._onnx_vad)
                 kwargs: dict[str, Any] = {}
-                if lang_arg and self._model_name != PARAKEET_MODEL_ID:
+                if self._model_name == CANARY_MODEL_ID:
+                    kwargs["language"] = lang_arg or "es"
+                elif lang_arg and self._model_name != PARAKEET_MODEL_ID:
                     kwargs["language"] = lang_arg
                 seg_iter = adapter.recognize(str(src_wav), **kwargs)
 
@@ -715,11 +802,152 @@ class WhisperService:
 
                 full_text = "\n".join(text_parts).strip() or "[No se detectó voz comprensible en la grabación]"
                 final_dur = duration_sec or (segments[-1]["end"] if segments else 0.0)
+                resolved_lang = (
+                    (lang_arg or "es") if self._model_name == CANARY_MODEL_ID else (lang_arg or "auto")
+                )
                 return {
                     "text": full_text,
                     "segments": segments,
-                    "language": lang_arg or "auto",
+                    "language": resolved_lang,
                     "duration_sec": round(float(final_dur), 2),
+                }
+            finally:
+                if enhanced_tmp is not None:
+                    enhanced_tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _build_qwen_chunks(samples: Any, sample_rate: int = 16000) -> list[tuple[float, float]]:
+        """Group audio into ~26s speech-aligned windows using energy-valley splitting."""
+        import numpy as np
+
+        total_sec = len(samples) / float(sample_rate)
+        if total_sec <= 0.0:
+            return []
+        if total_sec <= 28.0:
+            return [(0.0, total_sec)]
+
+        # Energy-valley splitter targeting 20–28s chunks without cutting mid-word
+        windows: list[tuple[float, float]] = []
+        frame_len = int(0.05 * sample_rate)
+        cursor_s = 0.0
+        while cursor_s < total_sec - 0.15:
+            if total_sec - cursor_s <= 28.0:
+                windows.append((cursor_s, total_sec))
+                break
+            search_start = int((cursor_s + 18.0) * sample_rate)
+            search_end = min(len(samples), int((cursor_s + 28.0) * sample_rate))
+            best_sample = int((cursor_s + 25.0) * sample_rate)
+            best_energy = float("inf")
+            for pos in range(search_start, max(search_start + 1, search_end - frame_len), frame_len):
+                frame = samples[pos : pos + frame_len]
+                energy = float(np.mean(frame * frame))
+                if energy < best_energy:
+                    best_energy = energy
+                    best_sample = pos + frame_len // 2
+            split_s = min(total_sec, best_sample / float(sample_rate))
+            windows.append((cursor_s, split_s))
+            cursor_s = split_s
+        return windows
+
+    def _transcribe_qwen_torch(
+        self,
+        audio_path: Path,
+        language: str = "auto",
+        progress_callback: Callable[[float, str], None] | None = None,
+        classroom_enhance: bool = True,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """Transcribe audio using Qwen3ASRForConditionalGeneration on CUDA or CPU."""
+        if self._qwen_model is None or self._qwen_processor is None:
+            raise RuntimeError("Qwen3-ASR no está cargado.")
+
+        import numpy as np
+        import soundfile as sf
+        import torch
+
+        lang_arg = None if not language or language == "auto" else language
+        lang_name_to_code = {
+            "spanish": "es", "english": "en", "portuguese": "pt",
+            "french": "fr", "german": "de", "italian": "it",
+            "chinese": "zh", "japanese": "ja", "korean": "ko",
+        }
+
+        with tempfile.TemporaryDirectory(prefix="qwen_asr_") as tmp_dir:
+            wav_path = Path(tmp_dir) / "input_16k.wav"
+            enhanced_tmp = enhance_audio_for_speech(audio_path) if classroom_enhance else None
+            try:
+                src_wav = enhanced_tmp if enhanced_tmp is not None else _convert_to_wav_16k(audio_path, wav_path)
+                samples, sr = sf.read(str(src_wav), dtype="float32")
+                if getattr(samples, "ndim", 1) > 1:
+                    samples = samples.mean(axis=1)
+                if sr != 16000:
+                    src_wav = _convert_to_wav_16k(src_wav, wav_path)
+                    samples, sr = sf.read(str(src_wav), dtype="float32")
+                    if getattr(samples, "ndim", 1) > 1:
+                        samples = samples.mean(axis=1)
+
+                total_duration = len(samples) / float(sr or 16000)
+                windows = self._build_qwen_chunks(samples, sr)
+                segments: list[dict[str, Any]] = []
+                text_parts: list[str] = []
+                detected_lang = lang_arg or ""
+
+                model = self._qwen_model
+                processor = self._qwen_processor
+                model_dtype = next(model.parameters()).dtype
+
+                for seg_start, seg_end in windows:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise WhisperCancelledError("Transcripción detenida por el usuario.")
+
+                    s_idx = int(seg_start * sr)
+                    e_idx = min(len(samples), int(seg_end * sr))
+                    chunk_np = np.ascontiguousarray(samples[s_idx:e_idx], dtype=np.float32)
+                    if chunk_np.size < int(0.15 * sr):
+                        continue
+                    if float(np.max(np.abs(chunk_np))) < 1e-4:
+                        continue
+
+                    inputs = processor.apply_transcription_request(audio=chunk_np, language=lang_arg)
+                    moved: dict[str, Any] = {}
+                    for k, v in inputs.items():
+                        if hasattr(v, "to"):
+                            if hasattr(v, "is_floating_point") and v.is_floating_point():
+                                moved[k] = v.to(device=model.device, dtype=model_dtype)
+                            else:
+                                moved[k] = v.to(device=model.device)
+                        else:
+                            moved[k] = v
+
+                    with torch.inference_mode():
+                        output_ids = model.generate(**moved, max_new_tokens=512, do_sample=False)
+
+                    prompt_len = moved["input_ids"].shape[1]
+                    gen_ids = output_ids[0, prompt_len:]
+                    parsed = processor.decode(gen_ids, return_format="parsed")
+                    clean = str((parsed or {}).get("transcription") or "").strip()
+                    raw_det = str((parsed or {}).get("language") or "").strip()
+                    if raw_det and not detected_lang:
+                        detected_lang = lang_name_to_code.get(raw_det.lower(), raw_det.lower())
+
+                    if clean:
+                        segments.append({
+                            "start": round(float(seg_start), 2),
+                            "end": round(float(seg_end), 2),
+                            "text": clean,
+                        })
+                        text_parts.append(clean)
+
+                    if progress_callback and total_duration > 0:
+                        ratio = min(0.99, max(0.01, float(seg_end) / total_duration))
+                        progress_callback(ratio, detected_lang)
+
+                full_text = "\n".join(text_parts).strip() or "[No se detectó voz comprensible en la grabación]"
+                return {
+                    "text": full_text,
+                    "segments": segments,
+                    "language": detected_lang or (lang_arg or "auto"),
+                    "duration_sec": round(float(total_duration), 2),
                 }
             finally:
                 if enhanced_tmp is not None:
@@ -734,6 +962,14 @@ class WhisperService:
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Transcribe an audio file synchronously and emit progress callbacks."""
+        if self._backend == "qwen-torch":
+            return self._transcribe_qwen_torch(
+                audio_path=audio_path,
+                language=language,
+                progress_callback=progress_callback,
+                classroom_enhance=classroom_enhance,
+                cancel_event=cancel_event,
+            )
         if self._backend == "onnx-asr":
             return self._transcribe_onnx_asr(
                 audio_path=audio_path,
@@ -911,6 +1147,7 @@ class WhisperService:
         """Release transcription weights and any cached device memory."""
         mlx_model = self._model_name == PARAKEET_MODEL_ID or self._model_name in MLX_ASR_MODELS
         clear_mlx_cache = mlx_model and self.active_device == "metal"
+        clear_cuda_cache = self._backend == "qwen-torch" or self.active_device == "cuda"
         if self._model is not None:
             del self._model
             self._model = None
@@ -920,6 +1157,12 @@ class WhisperService:
         if self._onnx_vad is not None:
             del self._onnx_vad
             self._onnx_vad = None
+        if self._qwen_model is not None:
+            del self._qwen_model
+            self._qwen_model = None
+        if self._qwen_processor is not None:
+            del self._qwen_processor
+            self._qwen_processor = None
         self._backend = "faster-whisper"
         self._cpp_exe = None
         self._ggml_path = None
@@ -927,6 +1170,13 @@ class WhisperService:
         self.active_device = ""
         self.active_compute_type = ""
         gc.collect()
+        if clear_cuda_cache and QWEN_TORCH_SUPPORTED:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
         if clear_mlx_cache:
             import mlx.core as mx
 
@@ -934,3 +1184,127 @@ class WhisperService:
 
 
 whisper_service = WhisperService()
+
+
+def download_asr_model(model_name: str) -> dict[str, Any]:
+    """Explicitly download weights for a single user-selected ASR model preset."""
+    mid = (model_name or "").strip()
+    if not mid or mid.startswith("local:") or ".." in mid or "/" in mid or "\\" in mid:
+        raise ValueError("Solo se pueden descargar presets oficiales integrados.")
+
+    if mid in QWEN_TORCH_MODELS and not MLX_ASR_SUPPORTED:
+        if not QWEN_TORCH_SUPPORTED:
+            raise RuntimeError("Qwen3-ASR requiere PyTorch y transformers>=5.13 instalados.")
+        from huggingface_hub import snapshot_download
+
+        preset = QWEN_TORCH_MODELS[mid]
+        target_dir = ASR_MODELS_DIR / mid
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with _hf_online_context():
+            snapshot_download(preset["repo"], local_dir=str(target_dir), local_files_only=False)
+        return {"id": mid, "installed": True}
+
+    if mid in MLX_ASR_MODELS and MLX_ASR_SUPPORTED:
+        from huggingface_hub import snapshot_download
+
+        preset = MLX_ASR_MODELS[mid]
+        with _hf_online_context():
+            snapshot_download(preset["repo"], local_files_only=False)
+        return {"id": mid, "installed": True}
+
+    if mid in (PARAKEET_MODEL_ID, CANARY_MODEL_ID):
+        if mid == PARAKEET_MODEL_ID and PARAKEET_SUPPORTED:
+            from huggingface_hub import snapshot_download
+
+            PARAKEET_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+            with _hf_online_context():
+                snapshot_download(
+                    PARAKEET_MODEL_REPO,
+                    local_dir=PARAKEET_MODELS_DIR,
+                    allow_patterns=["config.json", "model.safetensors"],
+                )
+            return {"id": mid, "installed": True}
+        if not (PARAKEET_ONNX_SUPPORTED or CANARY_ONNX_SUPPORTED):
+            raise RuntimeError("Este modelo requiere 'onnx-asr' instalado en .venv.")
+        import onnx_asr
+
+        mapped = _ONNX_WHISPER_MAP[mid]
+        with _hf_online_context():
+            m = onnx_asr.load_model(mapped, quantization="int8", providers=["CPUExecutionProvider"])
+            v = onnx_asr.load_vad("silero", providers=["CPUExecutionProvider"])
+            del m, v
+        return {"id": mid, "installed": True}
+
+    if any(m["id"] == mid for m in WHISPER_MODELS):
+        if not FASTER_WHISPER_SUPPORTED:
+            raise RuntimeError(
+                "faster-whisper no está instalado en este perfil. Reinstala con setup.bat (perfil 2 o 3)."
+            )
+        from faster_whisper import download_model
+
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        with _hf_online_context():
+            download_model(mid, cache_dir=str(MODELS_DIR), local_files_only=False)
+        return {"id": mid, "installed": True}
+
+    raise ValueError(f"Modelo de transcripción desconocido: {mid}")
+
+
+def delete_asr_model(
+    model_name: str,
+    models_dir: Path = MODELS_DIR,
+    asr_dir: Path = ASR_MODELS_DIR,
+    hf_cache_dir: Path | None = None,
+) -> bool:
+    """Delete locally cached weights for a specific ASR preset without touching other models."""
+    mid = (model_name or "").strip()
+    if not mid or mid.startswith("local:") or ".." in mid or "/" in mid or "\\" in mid:
+        raise ValueError("No se puede eliminar un modelo personalizado desde este botón.")
+
+    removed = False
+    hf_cache = hf_cache_dir if hf_cache_dir is not None else _default_hf_cache_dir()
+
+    if mid in QWEN_TORCH_MODELS:
+        target = asr_dir / mid
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+            removed = True
+
+    if mid == PARAKEET_MODEL_ID:
+        if PARAKEET_SUPPORTED and PARAKEET_MODELS_DIR.exists():
+            shutil.rmtree(PARAKEET_MODELS_DIR, ignore_errors=True)
+            removed = True
+        onnx_dir = hf_cache / "models--istupakov--parakeet-tdt-0.6b-v3-onnx"
+        if onnx_dir.exists():
+            shutil.rmtree(onnx_dir, ignore_errors=True)
+            removed = True
+
+    if mid == CANARY_MODEL_ID:
+        onnx_dir = hf_cache / "models--istupakov--canary-1b-v2-onnx"
+        if onnx_dir.exists():
+            shutil.rmtree(onnx_dir, ignore_errors=True)
+            removed = True
+
+    if mid in MLX_ASR_MODELS:
+        slug = "models--" + MLX_ASR_MODELS[mid]["repo"].replace("/", "--")
+        mlx_dir = hf_cache / slug
+        if mlx_dir.exists():
+            shutil.rmtree(mlx_dir, ignore_errors=True)
+            removed = True
+
+    direct = models_dir / mid
+    if direct.is_dir() and (direct / "model.bin").is_file():
+        shutil.rmtree(direct, ignore_errors=True)
+        removed = True
+
+    if models_dir.is_dir():
+        suffix = f"--faster-whisper-{mid.lower()}"
+        for entry in list(models_dir.iterdir()):
+            if entry.is_dir() and entry.name.lower().endswith(suffix):
+                shutil.rmtree(entry, ignore_errors=True)
+                removed = True
+                lock_dir = models_dir / ".locks" / entry.name
+                if lock_dir.exists():
+                    shutil.rmtree(lock_dir, ignore_errors=True)
+
+    return removed

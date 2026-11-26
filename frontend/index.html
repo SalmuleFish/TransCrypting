@@ -7,7 +7,7 @@
   <meta name="color-scheme" content="light dark" />
   <title>TransCrypting — Transcripción, Resumen y Chat Local</title>
   <link rel="icon" type="image/x-icon" href="/icon.ico" />
-  <link rel="stylesheet" href="/styles.css?v=3" />
+  <link rel="stylesheet" href="/styles.css?v=7" />
 </head>
 <body>
   <div id="app-shell" class="studio-shell">
@@ -158,6 +158,8 @@
         <div id="session-list" class="session-list"></div>
       </aside>
 
+      <div id="drawer-backdrop" class="drawer-backdrop hidden" aria-hidden="true"></div>
+
       <main class="studio-main card workspace-card">
         <div id="empty-session-state" class="empty-state hidden">
           <div class="empty-card">
@@ -272,6 +274,11 @@
         </div>
 
         <div class="microphone-panel">
+          <div id="capture-mode-bar" class="capture-mode-bar" role="radiogroup" aria-label="Fuente de captura">
+            <button type="button" class="capture-mode-btn active" data-capture-mode="mic" aria-pressed="true" title="Graba únicamente tu micrófono">Mic</button>
+            <button type="button" class="capture-mode-btn" data-capture-mode="system" aria-pressed="false" title="Graba el audio que reproduce el equipo (solo si lo seleccionas)">Equipo</button>
+            <button type="button" class="capture-mode-btn" data-capture-mode="both" aria-pressed="false" title="Combina el audio del equipo y tu micrófono">Ambos</button>
+          </div>
           <button id="btn-microphone" type="button" class="pill-btn outline" aria-pressed="false">
             <svg aria-hidden="true" class="microphone-icon" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
               <rect x="9" y="2" width="6" height="13" rx="3"/>
@@ -283,6 +290,9 @@
             <span id="microphone-label">Grabar con micrófono</span>
             <span id="microphone-time" class="microphone-time hidden" aria-hidden="true">00:00</span>
           </button>
+          <div id="capture-level-wrap" class="capture-level-wrap hidden" aria-hidden="true">
+            <div id="capture-level-fill" class="capture-level-fill"></div>
+          </div>
           <label class="microphone-live-toggle">
             <input id="microphone-live" type="checkbox" /> Transcribir en vivo
           </label>
@@ -338,6 +348,10 @@
           <div class="field">
             <span class="field-label">Modelo de transcripción</span>
             <select id="set-whisper-model"></select>
+            <div id="asr-model-action-row" class="asr-model-action-row">
+              <span id="asr-model-status-pill" class="asr-model-status-pill"></span>
+              <button type="button" id="btn-asr-model-action" class="pill-btn outline xs">Descargar modelo</button>
+            </div>
           </div>
           <div class="field">
             <span class="field-label">Dispositivo de transcripción</span>
@@ -362,7 +376,7 @@
               <option value="it">Italiano</option>
             </select>
             <small id="parakeet-language-hint" class="hidden">Parakeet detecta el idioma automáticamente.</small>
-            <small id="nemotron-language-hint" class="hidden">Nemotron necesita que elijas el idioma del audio.</small>
+            <small id="nemotron-language-hint" class="hidden">Este modelo necesita que elijas el idioma del audio.</small>
           </div>
 
           <div class="field">
@@ -426,12 +440,60 @@
 
           <label class="toggle-row">
             <div class="toggle-copy">
+              <span class="toggle-title">Separar por hablantes (Diarización local)</span>
+              <small>Identifica Hablante 1, Hablante 2… automáticamente. En modo Ambos (llamada) separa 'Tú' del resto.</small>
+            </div>
+            <input id="set-enable-diarization" type="checkbox" class="bento-switch-input" checked />
+            <span class="bento-switch" aria-hidden="true"></span>
+          </label>
+
+          <label class="toggle-row">
+            <div class="toggle-copy">
               <span class="toggle-title">Razonamiento profundo (Thinking) en chat</span>
               <small>Permite que el modelo razone paso a paso en preguntas difíciles.</small>
             </div>
             <input id="set-enable-thinking" type="checkbox" class="bento-switch-input" />
             <span class="bento-switch" aria-hidden="true"></span>
           </label>
+        </div>
+
+        <div class="appearance-section">
+          <div class="appearance-head">
+            <span class="field-label">Personalización de interfaz</span>
+            <button type="button" id="btn-reset-appearance" class="studio-link-btn">Restablecer</button>
+          </div>
+
+          <div class="field">
+            <span class="field-label">Color de acento</span>
+            <div class="accent-controls-row">
+              <div id="accent-swatches" class="accent-swatches" role="radiogroup" aria-label="Color de acento">
+                <button type="button" class="accent-swatch active" data-accent="#c8ee26" style="background:#c8ee26" title="Lima" aria-label="Lima"></button>
+                <button type="button" class="accent-swatch" data-accent="#3b82f6" style="background:#3b82f6" title="Cobalto" aria-label="Cobalto"></button>
+                <button type="button" class="accent-swatch" data-accent="#10b981" style="background:#10b981" title="Esmeralda" aria-label="Esmeralda"></button>
+                <button type="button" class="accent-swatch" data-accent="#f59e0b" style="background:#f59e0b" title="Ámbar" aria-label="Ámbar"></button>
+                <button type="button" class="accent-swatch" data-accent="#f43f5e" style="background:#f43f5e" title="Coral" aria-label="Coral"></button>
+                <button type="button" class="accent-swatch" data-accent="#8b5cf6" style="background:#8b5cf6" title="Violeta" aria-label="Violeta"></button>
+              </div>
+              <label class="accent-custom-wrap" title="Elegir cualquier color personalizado">
+                <input id="set-accent-custom" type="color" value="#c8ee26" aria-label="Color personalizado" />
+                <span id="accent-hex-label" class="accent-hex-label">#C8EE26</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="field-header-row">
+              <span class="field-label">Tamaño de fuente</span>
+              <span id="font-scale-badge" class="card-badge lime">100% · Normal</span>
+            </div>
+            <div id="font-scale-group" class="seg-control-track" role="radiogroup" aria-label="Tamaño de fuente">
+              <button type="button" class="seg-control-item" data-font-scale="0.9">Pequeña</button>
+              <button type="button" class="seg-control-item active" data-font-scale="1">Normal</button>
+              <button type="button" class="seg-control-item" data-font-scale="1.1">Grande</button>
+              <button type="button" class="seg-control-item" data-font-scale="1.2">Extra</button>
+            </div>
+            <input id="set-font-scale" type="range" min="0.85" max="1.25" step="0.05" value="1" class="eco-range" aria-label="Ajuste fino de tamaño de fuente" />
+          </div>
         </div>
 
         <div class="modal-footer">

@@ -15,6 +15,7 @@ from typing import Any
 
 from backend.config import (
     AUDIO_DIR,
+    CANARY_MODEL_ID,
     DB_PATH,
     DEFAULT_IDLE_UNLOAD_SEC,
     DEFAULT_NEMOTRON_LANGUAGE,
@@ -131,11 +132,14 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "num_ctx": str(DEFAULT_NUM_CTX),
     "idle_unload_sec": str(DEFAULT_IDLE_UNLOAD_SEC),
     "classroom_audio_enhance": "true",
+    "enable_diarization": "true",
     "enable_thinking": "false",
     "eco_mode": "false",
     "auto_summarize": "true",
     "eco_cpu_threads": "2",
     "theme": "light",
+    "accent_color": "#c8ee26",
+    "font_scale": "1.0",
 }
 
 
@@ -330,6 +334,14 @@ class Database:
             if "enabled" not in rec_cols:
                 conn.execute(
                     "ALTER TABLE recordings ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"
+                )
+            if "capture_mode" not in rec_cols:
+                conn.execute(
+                    "ALTER TABLE recordings ADD COLUMN capture_mode TEXT NOT NULL DEFAULT ''"
+                )
+            if "tracks_path" not in rec_cols:
+                conn.execute(
+                    "ALTER TABLE recordings ADD COLUMN tracks_path TEXT NOT NULL DEFAULT ''"
                 )
             # Recover recordings & sources interrupted by an unexpected shutdown
             conn.execute(
@@ -563,6 +575,8 @@ class Database:
         playable_path: str,
         whisper_model: str = "",
         rec_id: str | None = None,
+        capture_mode: str = "",
+        tracks_path: str = "",
     ) -> dict[str, Any]:
         now = _utc_now()
         recording_id = rec_id or uuid.uuid4().hex[:12]
@@ -572,11 +586,21 @@ class Database:
                 """
                 INSERT INTO recordings (
                     id, session_id, filename, stored_path, playable_path,
-                    status, progress, stage, whisper_model, created_at
+                    capture_mode, tracks_path, status, progress, stage, whisper_model, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, 'queued', 0.0, 'En cola', ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0.0, 'En cola', ?, ?)
                 """,
-                (recording_id, session_id, filename, stored_path, playable_path, whisper_model, now),
+                (
+                    recording_id,
+                    session_id,
+                    filename,
+                    stored_path,
+                    playable_path,
+                    capture_mode,
+                    tracks_path,
+                    whisper_model,
+                    now,
+                ),
             )
             conn.execute(
                 "UPDATE sessions SET updated_at = ? WHERE id = ?",
@@ -735,7 +759,7 @@ class Database:
                 (_utc_now(), rec["session_id"]),
             )
             conn.commit()
-        for path_key in ("stored_path", "playable_path"):
+        for path_key in ("stored_path", "playable_path", "tracks_path"):
             p = rec.get(path_key)
             if p:
                 try:
@@ -743,6 +767,43 @@ class Database:
                 except OSError:
                     pass
         return rec
+
+    def update_recording_speakers(
+        self,
+        rec_id: str,
+        mapping: dict[str, str],
+    ) -> dict[str, Any] | None:
+        from backend.diarization_service import format_segments_plain_text
+
+        clean_map: dict[str, str] = {}
+        for k, v in (mapping or {}).items():
+            old_name = str(k or "").strip()
+            new_name = str(v or "").strip()[:40]
+            if old_name and new_name and old_name != new_name:
+                clean_map[old_name] = new_name
+
+        with self._lock:
+            rec = self.get_recording(rec_id)
+            if not rec:
+                return None
+            segments = rec.get("segments") or []
+            if clean_map and segments:
+                for seg in segments:
+                    spk = str(seg.get("speaker") or "").strip()
+                    if spk in clean_map:
+                        seg["speaker"] = clean_map[spk]
+                new_text = format_segments_plain_text(segments)
+                conn = self._get_conn()
+                conn.execute(
+                    "UPDATE recordings SET segments_json = ?, transcript_text = ? WHERE id = ?",
+                    (json.dumps(segments, ensure_ascii=False), new_text, rec_id),
+                )
+                conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                    (_utc_now(), rec["session_id"]),
+                )
+                conn.commit()
+        return self.get_recording(rec_id)
 
     # --- Sources (PDF / PPTX / DOCX / TXT / Image) ---
 
@@ -1298,13 +1359,29 @@ class Database:
             return False
         return default
 
+    @staticmethod
+    def _sanitize_accent_color(val: Any) -> str:
+        raw = str(val or "").strip().lower()
+        if re.fullmatch(r"#[0-9a-f]{6}", raw):
+            return raw
+        return "#c8ee26"
+
+    @staticmethod
+    def _sanitize_font_scale(val: Any) -> float:
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            return 1.0
+        clamped = max(0.85, min(1.25, num))
+        return round(clamped, 2)
+
     def get_settings(self) -> dict[str, Any]:
         with self._lock:
             conn = self._get_conn()
             rows = conn.execute("SELECT key, value FROM settings").fetchall()
             raw = {**DEFAULT_SETTINGS, **{r["key"]: r["value"] for r in rows}}
         language = raw["whisper_language"]
-        if raw["whisper_model"] == NEMOTRON_MODEL_ID and language in ("", "auto"):
+        if raw["whisper_model"] in (NEMOTRON_MODEL_ID, CANARY_MODEL_ID) and language in ("", "auto"):
             language = DEFAULT_NEMOTRON_LANGUAGE
         return {
             "ollama_model": raw["ollama_model"],
@@ -1314,21 +1391,31 @@ class Database:
             "num_ctx": int(raw["num_ctx"]),
             "idle_unload_sec": int(raw["idle_unload_sec"]),
             "classroom_audio_enhance": self._parse_bool(raw.get("classroom_audio_enhance", "true"), True),
+            "enable_diarization": self._parse_bool(raw.get("enable_diarization", "true"), True),
             "enable_thinking": self._parse_bool(raw.get("enable_thinking", "false"), False),
             "eco_mode": self._parse_bool(raw.get("eco_mode", "false"), False),
             "auto_summarize": self._parse_bool(raw["auto_summarize"], True),
             "eco_cpu_threads": max(1, int(raw.get("eco_cpu_threads", "2"))),
             "theme": "dark" if str(raw.get("theme", "light")).lower() == "dark" else "light",
+            "accent_color": self._sanitize_accent_color(raw.get("accent_color")),
+            "font_scale": self._sanitize_font_scale(raw.get("font_scale")),
         }
 
     def update_settings(self, updates: dict[str, Any]) -> dict[str, Any]:
         allowed = set(DEFAULT_SETTINGS.keys())
-        bool_keys = {"classroom_audio_enhance", "enable_thinking", "eco_mode", "auto_summarize"}
+        bool_keys = {"classroom_audio_enhance", "enable_diarization", "enable_thinking", "eco_mode", "auto_summarize"}
         with self._lock:
             conn = self._get_conn()
             for key, val in updates.items():
                 if key in allowed and val is not None:
-                    stored = ("true" if self._parse_bool(val) else "false") if key in bool_keys else str(val)
+                    if key in bool_keys:
+                        stored = "true" if self._parse_bool(val) else "false"
+                    elif key == "accent_color":
+                        stored = self._sanitize_accent_color(val)
+                    elif key == "font_scale":
+                        stored = str(self._sanitize_font_scale(val))
+                    else:
+                        stored = str(val)
                     conn.execute(
                         """
                         INSERT INTO settings (key, value) VALUES (?, ?)
