@@ -2407,6 +2407,10 @@ html[data-theme="dark"] .composer-dock::before {
   pointer-events: none;
 }
 
+.microphone-preview .live-preview-partial .segment-text {
+  color: var(--text-muted);
+}
+
 .recordings-list {
   flex: 1;
   min-height: 0;
