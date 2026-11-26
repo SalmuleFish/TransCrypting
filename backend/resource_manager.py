@@ -74,6 +74,7 @@ class ResourceManager:
         language: str = "auto",
         progress_callback: Callable[[float, str], None] | None = None,
         classroom_enhance: bool = True,
+        keep_loaded: bool = False,
     ) -> dict[str, Any]:
         """Run transcription with exclusive access to memory and release the model afterwards."""
         task = self._register_current_task()
@@ -122,8 +123,9 @@ class ResourceManager:
                     self.touch_activity()
                     return result
                 finally:
-                    whisper_service.unload()
-                    gc.collect()
+                    if not keep_loaded:
+                        whisper_service.unload()
+                        gc.collect()
                     self.phase = "idle"
                     self.active_model = ""
                     self.active_device = ""

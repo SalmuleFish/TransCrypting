@@ -72,7 +72,7 @@ from backend.source_service import (
     pages_to_full_text,
     prepare_image_base64,
 )
-from backend.whisper_service import WhisperCancelledError, prepare_audio_file
+from backend.whisper_service import WhisperCancelledError, _find_ffmpeg_exe, prepare_audio_file
 
 
 class SessionCreateRequest(BaseModel):
@@ -1185,7 +1185,7 @@ async def transcribe_live_recording(file: UploadFile = File(...)) -> dict[str, s
         try:
             await asyncio.to_thread(
                 subprocess.run,
-                ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(source),
+                [_find_ffmpeg_exe(), "-nostdin", "-loglevel", "error", "-i", str(source),
                  "-t", "15", "-vn", "-ar", "16000", "-ac", "1", str(audio)],
                 capture_output=True,
                 check=True,
@@ -1206,6 +1206,7 @@ async def transcribe_live_recording(file: UploadFile = File(...)) -> dict[str, s
                 device_pref=settings.get("whisper_device") or "auto",
                 language=settings.get("whisper_language") or "auto",
                 classroom_enhance=False,
+                keep_loaded=True,
             )
         except WhisperCancelledError as exc:
             raise HTTPException(status_code=499, detail="Vista previa detenida.") from exc

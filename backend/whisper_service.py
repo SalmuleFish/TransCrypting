@@ -205,6 +205,7 @@ _ONNX_WHISPER_MAP = {
     "medium": "onnx-community/whisper-medium",
     "large-v3-turbo": "onnx-community/whisper-large-v3-turbo",
     "large-v3": "onnx-community/whisper-large-v3",
+    PARAKEET_MODEL_ID: "nemo-parakeet-tdt-0.6b-v3",
 }
 
 
@@ -379,6 +380,33 @@ class WhisperService:
                 os.environ["HF_HUB_OFFLINE"] = prev_env
             hf_constants.HF_HUB_OFFLINE = prev_const
 
+    def _load_onnx_asr(self, model_name: str) -> str:
+        """Load Whisper or Parakeet via onnx-asr with CPU thread cap."""
+        import onnx_asr
+        import onnxruntime as ort
+
+        mapped = _ONNX_WHISPER_MAP.get(model_name.replace("local:", "").strip(), "whisper-base")
+        threads = self.eco_cpu_threads if self.eco_cpu_threads > 0 else max(2, min(6, (os.cpu_count() or 4) // 2))
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = max(1, int(threads))
+        opts.inter_op_num_threads = 1
+        self._onnx_model = onnx_asr.load_model(
+            mapped,
+            quantization="int8",
+            sess_options=opts,
+            providers=["CPUExecutionProvider"],
+        )
+        self._onnx_vad = onnx_asr.load_vad(
+            "silero",
+            sess_options=opts,
+            providers=["CPUExecutionProvider"],
+        )
+        self._backend = "onnx-asr"
+        self._model_name = model_name
+        self.active_device = "cpu"
+        self.active_compute_type = "onnx-int8"
+        return "cpu"
+
     def load(self, model_name: str, device_pref: str = "auto") -> str:
         """Load a transcription model on Metal, CUDA, or CPU (faster-whisper / onnx-asr / whisper.cpp)."""
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -391,7 +419,12 @@ class WhisperService:
         self.unload()
         if model_name == PARAKEET_MODEL_ID:
             if not PARAKEET_SUPPORTED:
-                raise RuntimeError("Parakeet v3 requiere Apple Silicon y el paquete parakeet-mlx.")
+                try:
+                    return self._load_onnx_asr(model_name)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Parakeet v3 requiere Apple Silicon (parakeet-mlx) o onnx-asr."
+                    ) from exc
             if pref == "cuda":
                 raise RuntimeError("Selecciona Automático o CPU para usar Parakeet v3.")
 
@@ -431,30 +464,7 @@ class WhisperService:
             from faster_whisper import WhisperModel
         except ImportError:
             try:
-                import onnx_asr
-                import onnxruntime as ort
-
-                mapped = _ONNX_WHISPER_MAP.get(model_name.replace("local:", "").strip(), "whisper-base")
-                threads = self.eco_cpu_threads if self.eco_cpu_threads > 0 else max(2, min(6, (os.cpu_count() or 4) // 2))
-                opts = ort.SessionOptions()
-                opts.intra_op_num_threads = max(1, int(threads))
-                opts.inter_op_num_threads = 1
-                self._onnx_model = onnx_asr.load_model(
-                    mapped,
-                    quantization="int8",
-                    sess_options=opts,
-                    providers=["CPUExecutionProvider"],
-                )
-                self._onnx_vad = onnx_asr.load_vad(
-                    "silero",
-                    sess_options=opts,
-                    providers=["CPUExecutionProvider"],
-                )
-                self._backend = "onnx-asr"
-                self._model_name = model_name
-                self.active_device = "cpu"
-                self.active_compute_type = "onnx-int8"
-                return "cpu"
+                return self._load_onnx_asr(model_name)
             except Exception as onnx_exc:
                 cpp_exe = _find_whisper_cpp_exe()
                 if not cpp_exe:
@@ -639,7 +649,7 @@ class WhisperService:
                 src_wav = enhanced_tmp if enhanced_tmp is not None else _convert_to_wav_16k(audio_path, wav_path)
                 adapter = self._onnx_model.with_vad(self._onnx_vad)
                 kwargs: dict[str, Any] = {}
-                if lang_arg:
+                if lang_arg and self._model_name != PARAKEET_MODEL_ID:
                     kwargs["language"] = lang_arg
                 seg_iter = adapter.recognize(str(src_wav), **kwargs)
 
@@ -661,6 +671,15 @@ class WhisperService:
                     if progress_callback and duration_sec > 0:
                         ratio = min(0.99, max(0.01, end_s / duration_sec))
                         progress_callback(ratio, lang_arg or "")
+
+                if not text_parts and duration_sec <= 20.0:
+                    direct_text = str(self._onnx_model.recognize(str(src_wav), **kwargs) or "").strip()
+                    if direct_text:
+                        text_parts.append(direct_text)
+                        segments.append({"start": 0.0, "end": round(float(duration_sec), 2), "text": direct_text})
+
+                if progress_callback and duration_sec > 0:
+                    progress_callback(0.99, lang_arg or "")
 
                 full_text = "\n".join(text_parts).strip() or "[No se detectó voz comprensible en la grabación]"
                 final_dur = duration_sec or (segments[-1]["end"] if segments else 0.0)

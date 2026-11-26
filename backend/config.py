@@ -26,6 +26,7 @@ WHISPER_METAL_SUPPORTED = sys.platform == "darwin" and platform.machine() == "ar
 PARAKEET_MODEL_ID = "parakeet-tdt-0.6b-v3"
 PARAKEET_MODEL_REPO = "mlx-community/parakeet-tdt-0.6b-v3"
 PARAKEET_SUPPORTED = WHISPER_METAL_SUPPORTED and find_spec("parakeet_mlx") is not None
+PARAKEET_ONNX_SUPPORTED = (not WHISPER_METAL_SUPPORTED) and find_spec("onnx_asr") is not None
 DEFAULT_WHISPER_MODEL = PARAKEET_MODEL_ID if PARAKEET_SUPPORTED else "large-v3-turbo"
 WHISPER_MODELS = [
     {
@@ -66,6 +67,8 @@ def list_available_whisper_models(models_dir: Path = MODELS_DIR) -> list[dict]:
     models = list(WHISPER_MODELS)
     if PARAKEET_SUPPORTED:
         models.append({"id": PARAKEET_MODEL_ID, "label": "Parakeet TDT 0.6B v3 (MLX · 25 idiomas)"})
+    elif PARAKEET_ONNX_SUPPORTED:
+        models.append({"id": PARAKEET_MODEL_ID, "label": "Parakeet TDT 0.6B v3 (ONNX · 25 idiomas)"})
     if models_dir.is_dir():
         for entry in sorted(models_dir.iterdir(), key=lambda p: p.name.lower()):
             if not entry.is_dir():
