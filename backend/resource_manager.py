@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
+from backend.config import PARAKEET_MODEL_ID
 from backend.database import db
 from backend.ollama_service import ollama_service
 from backend.whisper_service import WhisperCancelledError, whisper_service
@@ -74,7 +75,7 @@ class ResourceManager:
         progress_callback: Callable[[float, str], None] | None = None,
         classroom_enhance: bool = True,
     ) -> dict[str, Any]:
-        """Unload Ollama, run Whisper transcription, and always release Whisper afterwards."""
+        """Run transcription with exclusive access to memory and release the model afterwards."""
         task = self._register_current_task()
         cancel_ev = threading.Event()
         self._active_cancel_events.add(cancel_ev)
@@ -92,9 +93,9 @@ class ResourceManager:
                         raise WhisperCancelledError("Transcripción detenida por el usuario.")
 
                     self.phase = "whisper"
-                    self.active_model = f"whisper-{model_name}"
+                    self.active_model = model_name if model_name == PARAKEET_MODEL_ID else f"whisper-{model_name}"
 
-                    def _run_whisper() -> dict[str, Any]:
+                    def _run_transcription() -> dict[str, Any]:
                         if cancel_ev.is_set():
                             raise WhisperCancelledError("Transcripción detenida por el usuario.")
                         used_device = whisper_service.load(model_name=model_name, device_pref=device_pref)
@@ -107,7 +108,13 @@ class ResourceManager:
                             cancel_event=cancel_ev,
                         )
 
-                    result = await asyncio.to_thread(_run_whisper)
+                    worker = asyncio.create_task(asyncio.to_thread(_run_transcription))
+                    try:
+                        result = await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        cancel_ev.set()
+                        await asyncio.gather(worker, return_exceptions=True)
+                        raise
                     self.touch_activity()
                     return result
                 finally:
@@ -321,7 +328,7 @@ class ResourceManager:
         current = asyncio.current_task()
         cancelled_tasks = 0
         for task in list(self._active_tasks):
-            if task is not None and task is not current and not task.done():
+            if task is not None and task is not current and not task.done() and not task.cancelling():
                 task.cancel()
                 cancelled_tasks += 1
 

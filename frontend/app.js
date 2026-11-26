@@ -7,6 +7,7 @@ const SOURCE_EXTENSIONS = new Set([
   ".pdf", ".pptx", ".docx", ".txt", ".md", ".png", ".jpg", ".jpeg", ".webp", ".bmp",
 ]);
 const TAB_ORDER = ["summary", "transcript", "chat", "quiz", "podcast"];
+const PARAKEET_MODEL_ID = "parakeet-tdt-0.6b-v3";
 
 const state = {
   sessions: [],
@@ -43,6 +44,9 @@ const renderMemo = new Map();
 const customSelectControllers = new Map();
 let activeDropdownMenu = null;
 let activeDropdownWrapper = null;
+let microphoneCapture = null;
+let microphonePreview = null;
+let transcriptPlayback = null;
 
 function memoChanged(key, sig) {
   if (renderMemo.get(key) === sig) return false;
@@ -764,6 +768,7 @@ async function refreshSystemStatus(options = {}) {
 function renderTelemetry(data) {
   const hw = data.hardware || {};
   const res = data.resources || {};
+  const hasMetal = data.whisper_metal_supported;
   const settings = data.settings || {};
   const runningOllama = data.running_ollama_models || [];
 
@@ -777,6 +782,11 @@ function renderTelemetry(data) {
     vramText.textContent = `${hw.vram_used_mb} / ${hw.vram_total_mb} MB`;
     vramBar.style.width = `${Math.min(100, hw.vram_percent || 0)}%`;
     gpuTemp.textContent = `GPU ${hw.gpu_temp_c ?? "--"}°C · Uso ${hw.gpu_util_percent ?? 0}%`;
+  } else if (hasMetal) {
+    gpuLabel.textContent = "GPU Apple";
+    vramText.textContent = "Memoria unificada";
+    vramBar.style.width = "0%";
+    gpuTemp.textContent = "Metal";
   } else {
     gpuLabel.textContent = "GPU";
     vramText.textContent = "Modo CPU";
@@ -796,7 +806,7 @@ function renderTelemetry(data) {
 
   const vramPct = Math.round(hw.vram_percent || 0);
   if (vramChip) {
-    vramChip.textContent = hw.gpu_available ? `VRAM ${vramPct}%` : "CPU";
+    vramChip.textContent = hw.gpu_available ? `VRAM ${vramPct}%` : hasMetal ? "Metal" : "CPU";
   }
 
   if (res.phase === "podcast" || res.podcast_active) {
@@ -805,7 +815,8 @@ function renderTelemetry(data) {
     pillText.textContent = `Podcast ${podPct}%`;
   } else if (res.phase === "whisper") {
     pill.className = "mini-status active";
-    pillText.textContent = `Whisper ${(res.active_device || "").toUpperCase()}`;
+    const engine = res.active_model === PARAKEET_MODEL_ID ? "Parakeet" : "Whisper";
+    pillText.textContent = [engine, res.active_device?.toUpperCase()].filter(Boolean).join(" ");
   } else if (res.phase === "llm") {
     pill.className = "mini-status active";
     pillText.textContent = `IA ${res.active_model || activeLabel}`;
@@ -814,10 +825,10 @@ function renderTelemetry(data) {
     pillText.textContent = "Liberando...";
   } else if (runningOllama.length > 0) {
     pill.className = "mini-status active";
-    pillText.textContent = "En VRAM";
+    pillText.textContent = hasMetal ? "Modelo cargado" : "En VRAM";
   } else {
     pill.className = "mini-status idle";
-    pillText.textContent = "VRAM libre";
+    pillText.textContent = hasMetal ? "Listo" : "VRAM libre";
   }
 
   if (telTrigger) {
@@ -888,6 +899,7 @@ function applyPodcastLockToDOM(isBusy) {
   if (dropArea) {
     dropArea.classList.toggle("is-podcast-locked", isBusy);
   }
+  syncMicrophoneControls();
   if (telTrigger) {
     telTrigger.classList.toggle("podcast-live", isBusy);
   }
@@ -1026,6 +1038,8 @@ function switchTab(tabName, options = {}) {
     if (state.activeSession) {
       ensureDynamicSuggestions(state.activeSession);
     }
+  } else if (tabName === "transcript" && transcriptPlayback) {
+    syncTranscriptPlayback(audioPlayers.get(transcriptPlayback.recId), true);
   } else if (tabName === "quiz" && state.activeSession) {
     renderQuizTab(state.activeSession);
   } else if (tabName === "podcast" && state.activeSession) {
@@ -1324,10 +1338,25 @@ function getOrCreateAudio(rec) {
     audio.preload = "metadata";
     audio.dataset.recId = rec.id;
 
-    audio.addEventListener("timeupdate", () => syncPlayerCardDOM(rec.id));
-    audio.addEventListener("play", () => syncPlayerCardDOM(rec.id));
-    audio.addEventListener("pause", () => syncPlayerCardDOM(rec.id));
-    audio.addEventListener("ended", () => syncPlayerCardDOM(rec.id));
+    const syncPlayback = () => {
+      syncPlayerCardDOM(rec.id);
+      syncTranscriptPlayback(audio);
+    };
+    let playbackFrame = 0;
+    const followWords = () => {
+      playbackFrame = 0;
+      if (audio.paused || audio.ended) return;
+      syncTranscriptPlayback(audio);
+      playbackFrame = requestAnimationFrame(followWords);
+    };
+    audio.addEventListener("timeupdate", syncPlayback);
+    audio.addEventListener("play", () => {
+      syncPlayback();
+      if (!playbackFrame) playbackFrame = requestAnimationFrame(followWords);
+    });
+    audio.addEventListener("seeked", syncPlayback);
+    audio.addEventListener("pause", syncPlayback);
+    audio.addEventListener("ended", syncPlayback);
     audio.addEventListener("loadedmetadata", () => syncPlayerCardDOM(rec.id));
 
     audioPlayers.set(rec.id, audio);
@@ -1367,6 +1396,52 @@ function syncPlayerCardDOM(recId) {
   const speedBtn = card.querySelector(".speed-btn");
   if (speedBtn) {
     speedBtn.textContent = `${audio.playbackRate || 1}x`;
+  }
+}
+
+function syncTranscriptPlayback(audio, reveal = false) {
+  const playback = transcriptPlayback;
+  if (!audio || !playback || playback.recId !== audio.dataset.recId) return;
+
+  const time = audio.currentTime;
+  const segment = playback.rows.find((item) => time >= item.start && time < item.end);
+  const row = segment?.element || null;
+  const word = segment?.words.find((item) => time >= item.start && time < item.end)?.element || null;
+  const rowChanged = row !== playback.currentRow;
+  if (!rowChanged && word === playback.currentWord && !reveal) return;
+  if (rowChanged) {
+    playback.currentRow?.removeAttribute("aria-current");
+    row?.setAttribute("aria-current", "true");
+    playback.currentRow = row;
+  }
+  playback.currentWord?.classList.remove("is-speaking");
+  word?.classList.add("is-speaking");
+  playback.currentWord = word;
+  const target = word || ((rowChanged || reveal) ? row : null);
+  if (!target || state.activeTab !== "transcript") return;
+
+  const scroll = document.getElementById("center-scroll");
+  const viewport = scroll.getBoundingClientRect();
+  const line = target.getBoundingClientRect();
+  if (line.top < viewport.top || line.bottom > viewport.bottom) {
+    scroll.scrollTop += line.top - viewport.top - scroll.clientHeight / 3;
+  }
+}
+
+function showRecordingTranscript(recId) {
+  const session = state.activeSession;
+  if (!session || session.id !== state.activeSessionId || state.podcastBusy) return;
+
+  if (state.transcriptRecFilter !== recId) {
+    document.getElementById("center-scroll").scrollTop = 0;
+  }
+  state.transcriptRecFilter = recId;
+  document.getElementById("transcript-search").value = "";
+  renderTranscriptTab(session);
+  if (state.activeTab === "transcript") {
+    syncTranscriptPlayback(audioPlayers.get(recId), true);
+  } else {
+    switchTab("transcript");
   }
 }
 
@@ -1558,6 +1633,7 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
       if (audio.paused) {
         stopAllOtherAudio(rec.id);
         audio.play().catch((err) => showToast(`No se pudo reproducir: ${err.message}`, true));
+        showRecordingTranscript(rec.id);
       } else {
         audio.pause();
       }
@@ -1649,14 +1725,14 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
       const retransBtn = document.createElement("button");
       retransBtn.type = "button";
       retransBtn.className = "retranscribe-btn";
-      retransBtn.title = "Re-transcribir con la configuración actual de Whisper";
+      retransBtn.title = "Re-transcribir con el modelo seleccionado en Configuración";
       retransBtn.innerHTML = ICON_RETRANSCRIBE;
       retransBtn.onclick = (e) => {
         e.stopPropagation();
         const model = state.systemStatus?.settings?.whisper_model || "large-v3-turbo";
         openConfirm(
           "Re-transcribir grabación",
-          `¿Volver a transcribir "${rec.filename}" usando Whisper (${model}) y la mejora de audio para clases? Se actualizarán su transcripción y resumen.`,
+          `¿Volver a transcribir "${rec.filename}" con ${model}? Se actualizarán su transcripción y resumen.`,
           async () => {
             await api(`/api/sessions/${rec.session_id}/recordings/${rec.id}/retranscribe`, {
               method: "POST",
@@ -1979,8 +2055,12 @@ function seekRecording(recId, seconds, options = {}) {
   };
 
   const jump = () => {
+    if (state.activeRecordingId !== recId || state.activeSessionId !== rec.session_id) return;
     audio.currentTime = Math.max(0, Number(seconds) || 0);
     audio.play().catch(() => {});
+    if (state.activeTab !== "transcript" || state.transcriptRecFilter !== recId) {
+      showRecordingTranscript(recId);
+    }
     highlightCard();
   };
 
@@ -2152,14 +2232,16 @@ function renderSummaryTab(session, animateReveal = false) {
 }
 
 function renderTranscriptTab(session) {
-  const pane = document.getElementById("tab-transcript");
+  syncMicrophonePreview(session);
+  const pane = document.getElementById("transcript-content");
   const query = (document.getElementById("transcript-search").value || "").trim().toLowerCase();
-  const recordings = (session.recordings || []).filter((r) => r.transcript_text && r.enabled !== false);
+  const activeRec = (session.recordings || []).find((r) => r.id === state.transcriptRecFilter);
+  const recordings = (session.recordings || []).filter(
+    (r) => r === activeRec || (r.transcript_text && r.enabled !== false)
+  );
   const sources = (session.sources || []).filter((s) => s.extracted_text && s.enabled !== false);
 
-  if (state.transcriptRecFilter && !recordings.some((r) => r.id === state.transcriptRecFilter)) {
-    state.transcriptRecFilter = null;
-  }
+  state.transcriptRecFilter = activeRec?.id || null;
 
   const copyBtn = document.getElementById("btn-copy-transcript");
   if (copyBtn && !copyBtn.classList.contains("is-confirmed")) {
@@ -2170,10 +2252,12 @@ function renderTranscriptTab(session) {
     session.id,
     query,
     state.transcriptRecFilter || "grid",
-    recordings.map((r) => `${r.id}:${(r.transcript_text || "").length}:${(r.segments || []).length}`).join(","),
+    activeRec?.status || "",
+    recordings.map((r) => `${r.id}:${(r.transcript_text || "").length}:${(r.segments || []).length}:${r.whisper_model || ""}`).join(","),
     sources.map((s) => s.id).join(","),
   ].join("|");
   if (!memoChanged("content-pane", contentSig)) return;
+  transcriptPlayback = null;
 
   if (recordings.length === 0) {
     if (sources.length > 0) {
@@ -2198,11 +2282,11 @@ function renderTranscriptTab(session) {
 
   pane.innerHTML = "";
 
+  const searchPattern = query ? new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi") : null;
   const highlightMatch = (el, text) => {
-    if (query) {
+    if (searchPattern) {
       const safe = escapeHtml(text);
-      const re = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi");
-      el.innerHTML = safe.replace(re, '<mark class="hl">$1</mark>');
+      el.innerHTML = safe.replace(searchPattern, '<mark class="hl">$&</mark>');
     } else {
       el.textContent = text;
     }
@@ -2318,9 +2402,9 @@ function renderTranscriptTab(session) {
 
       const openDetail = () => {
         state.transcriptRecFilter = rec.id;
-        renderTranscriptTab(session);
         const scroll = document.getElementById("center-scroll");
         if (scroll) scroll.scrollTop = 0;
+        renderTranscriptTab(session);
       };
       card.onclick = openDetail;
       card.onkeydown = (e) => {
@@ -2342,8 +2426,6 @@ function renderTranscriptTab(session) {
   }
 
   // --- Focused Audio Transcript Detail View ---
-  const activeRec = recordings.find((r) => r.id === state.transcriptRecFilter) || recordings[0];
-
   const navBar = document.createElement("div");
   navBar.className = "transcript-detail-nav";
 
@@ -2384,7 +2466,8 @@ function renderTranscriptTab(session) {
     <span>🎙 ${escapeHtml(activeRec.filename)}</span>
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
       <button type="button" class="pill-btn outline xs transcript-detail-play-btn" title="Reproducir este audio">▶ Escuchar</button>
-      <span class="card-badge">${formatDuration(activeRec.duration_sec)} · Clic en tiempo para reproducir</span>
+      ${activeRec.whisper_model && activeRec.transcript_text ? `<span class="card-badge">${escapeHtml(activeRec.whisper_model)}</span>` : ""}
+      <span class="card-badge">${formatDuration(activeRec.duration_sec)}${activeRec.segments?.length ? " · Pulsa una frase para escucharla" : ""}</span>
     </div>
   `;
   header.querySelector(".transcript-detail-play-btn").onclick = () => {
@@ -2392,7 +2475,21 @@ function renderTranscriptTab(session) {
   };
   card.appendChild(header);
 
+  if (!activeRec.transcript_text) {
+    const message = document.createElement("p");
+    message.className = "rec-empty";
+    message.textContent = activeRec.status === "error"
+      ? activeRec.error_message || "No se pudo transcribir este audio."
+      : activeRec.status === "ready"
+        ? "Este audio no tiene texto transcrito."
+        : "La transcripción aparecerá aquí cuando esté lista.";
+    card.appendChild(message);
+    pane.appendChild(card);
+    return;
+  }
+
   const segs = activeRec.segments || [];
+  const rows = [];
   let matchedAny = false;
   if (segs.length > 0) {
     for (const seg of segs) {
@@ -2403,18 +2500,63 @@ function renderTranscriptTab(session) {
       const row = document.createElement("div");
       row.className = "segment-row";
 
+      const playSegment = () => seekRecording(activeRec.id, seg.start, { pulse: true });
       const tsBtn = document.createElement("button");
       tsBtn.className = "timestamp-btn";
       tsBtn.textContent = formatDuration(seg.start);
-      tsBtn.onclick = () => seekRecording(activeRec.id, seg.start, { pulse: true });
+      tsBtn.onclick = playSegment;
 
       const textEl = document.createElement("div");
       textEl.className = "segment-text";
-      highlightMatch(textEl, text);
+      const words = document.createElement("span");
+      words.className = "segment-words";
+      words.onclick = () => {
+        if (window.getSelection()?.isCollapsed !== false) playSegment();
+      };
+      const start = Number(seg.start);
+      const end = Number(seg.end);
+      const parts = Array.from(text.matchAll(/\S+/g));
+      const timings = seg.words?.length === parts.length ? seg.words : null;
+      const matches = searchPattern ? Array.from(text.matchAll(searchPattern)) : [];
+      let matchIndex = 0;
+      let offset = 0;
+      const timedWords = parts.map((partMatch, i) => {
+        const part = partMatch[0];
+        const partStart = partMatch.index;
+        const partEnd = partStart + part.length;
+        words.append(text.slice(offset, partStart));
+        offset = partEnd;
+
+        const word = document.createElement("span");
+        word.className = "segment-word";
+        let cursor = partStart;
+        while (matchIndex < matches.length && matches[matchIndex].index < partEnd) {
+          const matchStart = matches[matchIndex].index;
+          const matchEnd = matchStart + matches[matchIndex][0].length;
+          if (matchEnd > cursor) {
+            const mark = document.createElement("mark");
+            mark.className = "hl";
+            mark.textContent = text.slice(Math.max(cursor, matchStart), Math.min(partEnd, matchEnd));
+            word.append(text.slice(cursor, Math.max(cursor, matchStart)), mark);
+            cursor = Math.min(partEnd, matchEnd);
+          }
+          if (matchEnd > partEnd) break;
+          matchIndex += 1;
+        }
+        word.append(text.slice(cursor, partEnd));
+        words.appendChild(word);
+
+        const wordStart = timings?.[i].start ?? start + (end - start) * i / parts.length;
+        const wordEnd = timings?.[i].end ?? start + (end - start) * (i + 1) / parts.length;
+        return { start: wordStart, end: wordEnd, element: word };
+      });
+      words.append(text.slice(offset));
+      textEl.appendChild(words);
 
       row.appendChild(tsBtn);
       row.appendChild(textEl);
       card.appendChild(row);
+      rows.push({ start, end, element: row, words: timedWords });
     }
   } else if (!query || activeRec.transcript_text.toLowerCase().includes(query)) {
     matchedAny = true;
@@ -2432,6 +2574,9 @@ function renderTranscriptTab(session) {
   }
 
   pane.appendChild(card);
+  transcriptPlayback = { recId: activeRec.id, rows, currentRow: null, currentWord: null };
+  const audio = audioPlayers.get(activeRec.id);
+  if (audio && (!audio.paused || audio.currentTime > 0)) syncTranscriptPlayback(audio);
 }
 
 // --- Interactive Customizable Exam Studio ---
@@ -3861,6 +4006,224 @@ function renderPodcastTab(session) {
 
 // --- Upload Recordings & Sources ---
 
+async function uploadRecordingFiles(sessionId, files) {
+  const body = new FormData();
+  files.forEach((file) => body.append("files", file));
+  return api(`/api/sessions/${sessionId}/recordings`, { method: "POST", body });
+}
+
+function syncMicrophoneControls() {
+  const btn = document.getElementById("btn-microphone");
+  const recording = microphoneCapture?.recorder?.state === "recording";
+  btn.disabled = !recording && (Boolean(microphoneCapture) || state.podcastBusy);
+  btn.setAttribute("aria-pressed", String(recording));
+  document.getElementById("microphone-label").textContent = recording
+    ? "Detener grabación"
+    : "Grabar con micrófono";
+  document.getElementById("microphone-live").disabled = Boolean(microphoneCapture) || state.podcastBusy;
+  document.getElementById("microphone-time").classList.toggle("hidden", !recording);
+}
+
+function syncMicrophonePreview(session) {
+  if (microphonePreview?.sessionId === session?.id && microphonePreview?.recordingId) {
+    const recording = session.recordings?.find((item) => item.id === microphonePreview.recordingId);
+    if (recording?.transcript_text) {
+      state.transcriptRecFilter ||= recording.id;
+      microphonePreview = null;
+    } else if (recording?.status === "ready" || recording?.status === "error") {
+      document.getElementById("microphone-live-status").textContent =
+        recording.error_message || "La transcripción final quedó sin texto.";
+    }
+  }
+  document.getElementById("microphone-live-panel").classList.toggle(
+    "hidden", !microphonePreview || microphonePreview.sessionId !== session?.id,
+  );
+}
+
+async function transcribeMicrophoneFragment(capture, parts, startSec) {
+  if (capture.previewRequest || capture.recorder.state !== "recording" || !parts.length) return;
+
+  const controller = new AbortController();
+  capture.previewRequest = controller;
+  const status = document.getElementById("microphone-live-status");
+  const preview = document.getElementById("microphone-preview");
+  const body = new FormData();
+  body.append("file", new Blob(parts, { type: parts[0].type }), `fragmento.${capture.extension}`);
+  try {
+    const { text } = await api("/api/recordings/live-transcript", {
+      method: "POST",
+      body,
+      signal: controller.signal,
+    });
+    if (controller.signal.aborted) return;
+    if (text) {
+      const follow = preview.scrollHeight - preview.scrollTop - preview.clientHeight <= 24;
+      const row = document.createElement("div");
+      row.className = "segment-row";
+      const stamp = document.createElement("span");
+      stamp.className = "timestamp-btn";
+      stamp.textContent = formatDuration(startSec);
+      const words = document.createElement("div");
+      words.className = "segment-text";
+      words.textContent = text;
+      row.append(stamp, words);
+      preview.append(row);
+      if (follow) preview.scrollTop = preview.scrollHeight;
+    }
+    status.textContent = preview.textContent ? "Grabando…" : "Esperando voz…";
+  } catch (err) {
+    if (!controller.signal.aborted) status.textContent = err.message;
+  } finally {
+    capture.previewRequest = null;
+  }
+}
+
+function startMicrophoneFragment(capture) {
+  if (capture.recorder.state !== "recording") return;
+
+  try {
+    const recorder = new MediaRecorder(capture.stream, { mimeType: capture.recorder.mimeType });
+    const startSec = (performance.now() - capture.startedAt) / 1000;
+    const parts = [];
+    capture.previewRecorder = recorder;
+    recorder.ondataavailable = ({ data }) => { if (data.size) parts.push(data); };
+    recorder.onstop = () => transcribeMicrophoneFragment(capture, parts, startSec);
+    recorder.start();
+    capture.previewTimer = setTimeout(() => {
+      if (recorder.state === "recording") recorder.stop();
+      startMicrophoneFragment(capture);
+    }, capture.previewIntervalMs);
+  } catch (_) {
+    document.getElementById("microphone-live-status").textContent =
+      "La vista previa no está disponible. El audio se transcribirá al detener la grabación.";
+  }
+}
+
+async function saveMicrophoneCapture(capture, parts) {
+  clearInterval(capture.clock);
+  clearTimeout(capture.previewTimer);
+  capture.previewRequest?.abort();
+  if (capture.previewRecorder?.state === "recording") capture.previewRecorder.stop();
+  capture.stream.getTracks().forEach((track) => track.stop());
+  syncMicrophoneControls();
+
+  const status = document.getElementById("microphone-status");
+  const liveStatus = capture.live ? document.getElementById("microphone-live-status") : null;
+  let file;
+  try {
+    if (!parts.length) {
+      status.textContent = "No se recibió audio del micrófono.";
+      if (liveStatus) liveStatus.textContent = status.textContent;
+      return;
+    }
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    file = new File(parts, `Micrófono-${stamp}.${capture.extension}`, { type: parts[0].type });
+    status.textContent = "Guardando grabación…";
+    if (liveStatus) liveStatus.textContent = status.textContent;
+    const [recording] = await uploadRecordingFiles(capture.sessionId, [file]);
+    status.textContent = "Grabación guardada. Transcripción en cola.";
+    if (liveStatus) {
+      microphonePreview.recordingId = recording.id;
+      liveStatus.textContent = "Preparando la transcripción completa…";
+    }
+  } catch (err) {
+    status.textContent = err.message;
+    if (liveStatus) liveStatus.textContent = err.message;
+    if (file) {
+      const download = document.getElementById("microphone-download");
+      if (download.hasAttribute("href")) URL.revokeObjectURL(download.href);
+      download.href = URL.createObjectURL(file);
+      download.download = file.name;
+      download.classList.remove("hidden");
+    }
+    return;
+  } finally {
+    microphoneCapture = null;
+    syncMicrophoneControls();
+  }
+
+  try {
+    if (state.activeSessionId === capture.sessionId) {
+      await selectSession(capture.sessionId);
+      if (state.activeSessionId === capture.sessionId && !state.podcastBusy) switchTab("transcript");
+    }
+    await loadSessions(false);
+  } catch (err) {
+    showToast(err.message, true);
+  }
+}
+
+async function toggleMicrophoneCapture() {
+  if (microphoneCapture?.recorder?.state === "recording") {
+    microphoneCapture.recorder.stop();
+    syncMicrophoneControls();
+    return;
+  }
+  if (microphoneCapture || state.podcastBusy) return;
+
+  const status = document.getElementById("microphone-status");
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    status.textContent = "El navegador no permite grabar desde esta página.";
+    return;
+  }
+
+  const settings = state.systemStatus?.settings;
+  const capture = {
+    sessionId: state.activeSessionId,
+    live: document.getElementById("microphone-live").checked,
+    previewIntervalMs: settings?.whisper_model === PARAKEET_MODEL_ID && settings.whisper_device === "auto" ? 4000 : 8000,
+  };
+  microphoneCapture = capture;
+  status.textContent = "Esperando permiso del micrófono…";
+  syncMicrophoneControls();
+
+  try {
+    capture.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (!capture.sessionId) {
+      await createNewSession();
+      capture.sessionId = state.activeSessionId;
+    }
+    if (!capture.sessionId || state.podcastBusy) throw new Error("Espera a que termine el podcast.");
+
+    const mimeType = ["audio/webm;codecs=opus", "audio/mp4", "audio/ogg;codecs=opus"]
+      .find((type) => MediaRecorder.isTypeSupported(type));
+    const recorder = new MediaRecorder(capture.stream, mimeType ? { mimeType } : undefined);
+    const parts = [];
+    capture.recorder = recorder;
+    recorder.ondataavailable = ({ data }) => { if (data.size) parts.push(data); };
+    recorder.onstop = () => saveMicrophoneCapture(capture, parts);
+    recorder.onerror = () => showToast("El micrófono interrumpió la grabación.", true);
+    recorder.start();
+    const container = recorder.mimeType.split(";")[0];
+    capture.extension = { "audio/mp4": "m4a", "video/mp4": "mp4", "audio/ogg": "ogg" }[container] || "webm";
+
+    capture.startedAt = performance.now();
+    const clock = document.getElementById("microphone-time");
+    clock.textContent = "00:00";
+    capture.clock = setInterval(() => { clock.textContent = formatElapsedClock(performance.now() - capture.startedAt); }, 1000);
+    status.textContent = capture.live ? "" : "Se transcribirá al detener la grabación.";
+    syncMicrophoneControls();
+    if (capture.live) {
+      microphonePreview = { sessionId: capture.sessionId };
+      document.getElementById("microphone-preview").replaceChildren();
+      document.getElementById("microphone-live-status").textContent = "Esperando el primer fragmento…";
+      syncMicrophonePreview(state.activeSession);
+      if (state.activeSessionId === capture.sessionId) {
+        switchTab("transcript");
+        document.getElementById("center-scroll").scrollTop = 0;
+      }
+      startMicrophoneFragment(capture);
+    }
+  } catch (err) {
+    capture.stream?.getTracks().forEach((track) => track.stop());
+    status.textContent = err.name === "NotAllowedError" || err.name === "NotFoundError"
+      ? "Comprueba que el micrófono esté conectado y que el navegador tenga permiso."
+      : err.message;
+    microphoneCapture = null;
+    syncMicrophoneControls();
+  }
+}
+
 async function uploadFiles(fileList) {
   if (state.podcastBusy) {
     showToast("Las cargas están pausadas mientras se genera el podcast.", true);
@@ -3898,12 +4261,7 @@ async function uploadFiles(fileList) {
     showToast(`Indexando ${totalCount} fuente(s) localmente...`);
 
     if (audioFiles.length > 0) {
-      const fdAudio = new FormData();
-      audioFiles.forEach((f) => fdAudio.append("files", f));
-      await api(`/api/sessions/${state.activeSessionId}/recordings`, {
-        method: "POST",
-        body: fdAudio,
-      });
+      await uploadRecordingFiles(state.activeSessionId, audioFiles);
     }
 
     if (sourceFiles.length > 0) {
@@ -4441,14 +4799,21 @@ function populateSettingsFromStatus(status) {
     whisperSelect.appendChild(opt);
   }
   whisperSelect.value = settings.whisper_model || "large-v3-turbo";
+  whisperSelect.onchange = () => {
+    document.getElementById("parakeet-language-hint").classList.toggle(
+      "hidden", whisperSelect.value !== PARAKEET_MODEL_ID
+    );
+  };
+  whisperSelect.onchange();
 
   const whisperDeviceSelect = document.getElementById("set-whisper-device");
   const hasCuda = Boolean(status?.hardware?.gpu_available);
   const autoOpt = whisperDeviceSelect.querySelector('option[value="auto"]');
   const cudaOpt = whisperDeviceSelect.querySelector('option[value="cuda"]');
   if (autoOpt) {
-    autoOpt.textContent = hasCuda
-      ? "Automático (GPU CUDA con respaldo CPU)"
+    const gpuBackend = status?.whisper_metal_supported ? "Metal" : hasCuda ? "CUDA" : "";
+    autoOpt.textContent = gpuBackend
+      ? `Automático (GPU ${gpuBackend} con respaldo CPU)`
       : "Automático (solo CPU en este equipo)";
   }
   if (cudaOpt) {
@@ -4628,6 +4993,13 @@ function initEvents() {
     e.target.value = "";
   };
 
+  document.getElementById("btn-microphone").onclick = toggleMicrophoneCapture;
+  window.addEventListener("beforeunload", (e) => {
+    if (!microphoneCapture) return;
+    e.preventDefault();
+    e.returnValue = true;
+  });
+
   document.getElementById("btn-quick-attach").onclick = () => {
     document.getElementById("audio-file-input").click();
   };
@@ -4714,12 +5086,11 @@ function initEvents() {
 
   document.getElementById("btn-copy-transcript").onclick = async () => {
     if (!state.activeSession) return;
-    const recs = (state.activeSession.recordings || []).filter(
-      (r) => r.transcript_text && r.enabled !== false
+    const selected = (state.activeSession.recordings || []).filter(
+      (r) => r.transcript_text && (state.transcriptRecFilter
+        ? r.id === state.transcriptRecFilter
+        : r.enabled !== false)
     );
-    const selected = state.transcriptRecFilter
-      ? recs.filter((r) => r.id === state.transcriptRecFilter)
-      : recs;
     const blocks = selected.map((r) => `=== ${r.filename} ===\n${r.transcript_text}`);
     const text = blocks.join("\n\n");
     if (!text) return;

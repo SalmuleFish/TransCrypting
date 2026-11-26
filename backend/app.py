@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import re
+import subprocess
+import tempfile
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -19,12 +21,15 @@ from pydantic import BaseModel
 
 from backend.config import (
     AUDIO_DIR,
+    DEFAULT_WHISPER_MODEL,
     FRONTEND_DIR,
+    PARAKEET_MODEL_ID,
     PODCASTS_DIR,
     SOURCES_DIR,
     SUPPORTED_AUDIO_EXTENSIONS,
     SUPPORTED_SOURCE_EXTENSIONS,
     TTS_MODELS_DIR,
+    WHISPER_METAL_SUPPORTED,
     ensure_directories,
     list_available_whisper_models,
 )
@@ -265,7 +270,8 @@ class ProcessingPipeline:
             return
 
         settings = db.get_settings()
-        whisper_model = settings.get("whisper_model") or "large-v3-turbo"
+        whisper_model = settings.get("whisper_model") or DEFAULT_WHISPER_MODEL
+        engine_label = "Parakeet v3" if whisper_model == PARAKEET_MODEL_ID else f"Whisper ({whisper_model})"
         whisper_device = settings.get("whisper_device") or "auto"
         whisper_lang = settings.get("whisper_language") or "auto"
         classroom_enhance = bool(settings.get("classroom_audio_enhance", True))
@@ -281,12 +287,12 @@ class ProcessingPipeline:
             rec_id,
             "transcribing",
             0.08,
-            f"Cargando Whisper ({whisper_model})...",
+            f"Cargando {engine_label}...",
             duration_sec=duration_sec,
             playable_path=str(playable_path),
         )
 
-        # 2. Exclusive transcription with faster-whisper
+        # 2. Exclusive transcription
         last_reported = 0.08
 
         def _on_progress(ratio: float, detected_lang: str) -> None:
@@ -315,7 +321,7 @@ class ProcessingPipeline:
             db.update_recording_error(rec_id, "Transcripción detenida manualmente.")
             return
         except Exception as exc:
-            db.update_recording_error(rec_id, f"Error al transcribir con Whisper: {exc}")
+            db.update_recording_error(rec_id, f"Error al transcribir con {engine_label}: {exc}")
             return
 
         # Re-check recording still exists (user might have deleted it while processing)
@@ -839,6 +845,7 @@ async def system_status(refresh_models: bool = False) -> dict[str, Any]:
         "ollama_models": ollama_models,
         "running_ollama_models": running_ollama,
         "whisper_models": list_available_whisper_models(),
+        "whisper_metal_supported": WHISPER_METAL_SUPPORTED,
         "settings": settings,
     }
 
@@ -1156,6 +1163,57 @@ async def delete_session(session_id: str) -> dict[str, bool]:
 
 # --- Recordings ---
 
+@app.post("/api/recordings/live-transcript")
+async def transcribe_live_recording(file: UploadFile = File(...)) -> dict[str, str]:
+    _require_not_podcast_busy()
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in SUPPORTED_AUDIO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Formato de audio no soportado.")
+
+    limit = 3 * 1024 * 1024
+    try:
+        data = await file.read(limit + 1)
+    finally:
+        await file.close()
+    if not data or len(data) > limit:
+        raise HTTPException(status_code=400, detail="El fragmento debe tener entre 1 byte y 3 MB.")
+
+    with tempfile.TemporaryDirectory(prefix="transcrypting-live-") as directory:
+        source = Path(directory) / f"fragment{ext}"
+        audio = Path(directory) / "fragment.wav"
+        source.write_bytes(data)
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(source),
+                 "-t", "15", "-vn", "-ar", "16000", "-ac", "1", str(audio)],
+                capture_output=True,
+                check=True,
+                timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(status_code=422, detail="No se pudo leer el fragmento del micrófono.") from exc
+
+        if resource_manager.phase != "idle":
+            raise HTTPException(status_code=409, detail="La IA está ocupada. El micrófono sigue grabando.")
+
+        settings = db.get_settings()
+        try:
+            result = await resource_manager.transcribe_exclusive(
+                audio_path=audio,
+                model_name=settings.get("whisper_model") or DEFAULT_WHISPER_MODEL,
+                device_pref=settings.get("whisper_device") or "auto",
+                language=settings.get("whisper_language") or "auto",
+                classroom_enhance=False,
+            )
+        except WhisperCancelledError as exc:
+            raise HTTPException(status_code=499, detail="Vista previa detenida.") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="No se pudo transcribir el fragmento del micrófono.") from exc
+    return {"text": result["text"]}
+
+
 def _sanitize_filename(name: str) -> str:
     base = Path(name or "audio.wav").name
     cleaned = re.sub(r"[^A-Za-z0-9áéíóúÁÉÍÓÚñÑüÜ._\- ]+", "_", base).strip()
@@ -1176,7 +1234,7 @@ async def upload_recordings(
     session_audio_dir = AUDIO_DIR / session_id
     session_audio_dir.mkdir(parents=True, exist_ok=True)
     settings = db.get_settings()
-    whisper_model = settings.get("whisper_model") or "large-v3-turbo"
+    whisper_model = settings.get("whisper_model") or DEFAULT_WHISPER_MODEL
 
     created: list[dict[str, Any]] = []
     first_stem: str | None = None
@@ -1222,7 +1280,7 @@ async def upload_recordings(
 
 @app.post("/api/sessions/{session_id}/recordings/{rec_id}/retranscribe")
 async def retranscribe_recording(session_id: str, rec_id: str) -> dict[str, Any]:
-    """Re-run Whisper transcription and summarization with current settings."""
+    """Re-run transcription and summarization with current settings."""
     _require_not_podcast_busy()
     rec = db.get_recording(rec_id)
     if not rec or rec["session_id"] != session_id:

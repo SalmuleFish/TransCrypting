@@ -99,7 +99,7 @@ Flexible compatibility with any Ollama LLM, Whisper / CTranslate2 model, and Kok
 ### Modular Models (Bring Your Own Models)
 Open **Settings** (gear icon) and click **`¿Cómo instalar modelos?`** for the built-in copyable command guide:
 - **Ollama LLMs (Summaries / Chat / Exams / Podcast Scripts)**: pull any model with `ollama pull <model>` (`qwen2.5:1.5b`, `gemma4:e2b`, `llama3.2:3b`, `gemma4:e4b`, `qwen3:8b`, `qwen3.5:9b`, etc.) and click **Actualizar lista**. For image vision analysis, choose a vision-capable model such as `gemma4:e4b` or `gemma4:e2b`.
-- **Whisper (Audio Transcription)**: switch between `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, and `large-v3`, or drop any custom **CTranslate2** folder (`model.bin` + `config.json`) inside `data/models/whisper/<your-model>/`.
+- **Audio transcription**: choose a Whisper preset, add a custom **CTranslate2** folder in `data/models/whisper/`, or select [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) on Apple Silicon. Parakeet uses the GPU via MLX in Automatic mode, detects the language from the audio, and downloads its weights on first use.
 - **Kokoro-82M / Piper TTS Voices (Podcasts)**: **Kokoro-82M ONNX** weights (`kokoro-v1.0.onnx` and `voices-v1.0.bin`) are downloaded once on demand into `data/models/tts/kokoro/` (with Piper fallback in `data/models/tts/`).
 
 ---

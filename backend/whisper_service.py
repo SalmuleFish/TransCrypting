@@ -1,9 +1,11 @@
-"""Local faster-whisper transcription and ffmpeg audio preparation."""
+"""Local Whisper and Parakeet transcription and ffmpeg audio preparation."""
 
 from __future__ import annotations
 
 import gc
+import logging
 import os
+import re
 import site
 import subprocess
 import sysconfig
@@ -11,7 +13,18 @@ import threading
 from pathlib import Path
 from typing import Any, Callable
 
-from backend.config import HTML5_PLAYABLE_EXTENSIONS, MODELS_DIR
+from backend.config import (
+    HTML5_PLAYABLE_EXTENSIONS,
+    MODELS_DIR,
+    PARAKEET_MODEL_ID,
+    PARAKEET_MODEL_REPO,
+    PARAKEET_MODELS_DIR,
+    PARAKEET_SUPPORTED,
+    WHISPER_METAL_SUPPORTED,
+    WHISPER_MODELS,
+)
+
+logger = logging.getLogger(__name__)
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _DLL_HANDLES: list[Any] = []
@@ -20,6 +33,22 @@ _CUDA_DIRS_REGISTERED = False
 
 class WhisperCancelledError(RuntimeError):
     """Raised when an active Whisper transcription is stopped by the user."""
+
+
+def _parakeet_word_timings(tokens: list[Any]) -> list[dict[str, float]]:
+    words = []
+    offset = 0
+    last_word_end = -1
+    for token in tokens:
+        for piece in re.finditer(r"\S+", token.text):
+            end = round(token.end, 2)
+            if offset + piece.start() == last_word_end:
+                words[-1]["end"] = max(words[-1]["end"], end)
+            else:
+                words.append({"start": round(token.start, 2), "end": end})
+            last_word_end = offset + piece.end()
+        offset += len(token.text)
+    return words
 
 
 def register_cuda_dlls() -> list[str]:
@@ -164,7 +193,7 @@ def enhance_audio_for_speech(src_path: Path) -> Path | None:
 
 
 class WhisperService:
-    """Manages local faster-whisper loading, transcription, and explicit VRAM cleanup."""
+    """Manage local transcription models and release them between workloads."""
 
     def __init__(self) -> None:
         self._model: Any = None
@@ -221,10 +250,7 @@ class WhisperService:
             hf_constants.HF_HUB_OFFLINE = prev_const
 
     def load(self, model_name: str, device_pref: str = "auto") -> str:
-        """Load WhisperModel onto GPU (int8_float16) or CPU (int8) with automatic fallback."""
-        register_cuda_dlls()
-        from faster_whisper import WhisperModel
-
+        """Load a transcription model on Metal, CUDA, or CPU."""
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         pref = (device_pref or "auto").lower()
 
@@ -233,9 +259,49 @@ class WhisperService:
                 return self.active_device
 
         self.unload()
+        if model_name == PARAKEET_MODEL_ID:
+            if not PARAKEET_SUPPORTED:
+                raise RuntimeError("Parakeet v3 requiere Apple Silicon y el paquete parakeet-mlx.")
+            if pref == "cuda":
+                raise RuntimeError("Selecciona Automático o CPU para usar Parakeet v3.")
+
+            import mlx.core as mx
+            from huggingface_hub import snapshot_download
+            from parakeet_mlx import from_pretrained
+
+            if not all((PARAKEET_MODELS_DIR / name).is_file() for name in ("config.json", "model.safetensors")):
+                snapshot_download(
+                    PARAKEET_MODEL_REPO,
+                    local_dir=PARAKEET_MODELS_DIR,
+                    allow_patterns=["config.json", "model.safetensors"],
+                )
+            device = "metal" if pref != "cpu" and mx.metal.is_available() else "cpu"
+            with mx.stream(mx.gpu if device == "metal" else mx.cpu):
+                self._model = from_pretrained(str(PARAKEET_MODELS_DIR))
+            self._model_name = model_name
+            self.active_device = device
+            return self.active_device
+
+        if (
+            pref == "auto"
+            and WHISPER_METAL_SUPPORTED
+            and any(model["id"] == model_name for model in WHISPER_MODELS)
+        ):
+            try:
+                self._model = self._load_metal(model_name)
+            except Exception as exc:
+                logger.warning("No se pudo cargar Whisper con Metal. Usando CPU: %s", exc)
+            else:
+                self._model_name = model_name
+                self.active_device = "metal"
+                return self.active_device
+
+        register_cuda_dlls()
+        from faster_whisper import WhisperModel
+
         model_source = self._resolve_model_source(model_name)
 
-        if pref in ("auto", "cuda"):
+        if pref == "cuda" or (pref == "auto" and not WHISPER_METAL_SUPPORTED):
             try:
                 self._model = WhisperModel(
                     model_source,
@@ -267,6 +333,31 @@ class WhisperService:
         self.active_compute_type = "int8"
         return "cpu"
 
+    def _load_metal(self, model_name: str) -> Any:
+        from huggingface_hub import hf_hub_download
+        from pywhispercpp.model import Model
+
+        if "MTL :" not in Model.system_info():
+            raise RuntimeError("La instalación de whisper.cpp no incluye Metal.")
+
+        model_dir = MODELS_DIR / "ggml"
+        variant = "large-v3-turbo-q5_0" if model_name == "large-v3-turbo" else model_name
+        model_path = model_dir / f"ggml-{variant}.bin"
+        if not model_path.is_file():
+            model_path = Path(
+                hf_hub_download("ggerganov/whisper.cpp", model_path.name, local_dir=model_dir)
+            )
+        model = Model(
+            str(model_path),
+            context_params={"use_gpu": True},
+            params_sampling_strategy=1,
+            beam_search={"beam_size": 5, "patience": -1.0},
+            print_progress=False,
+        )
+        if model._ctx is None:
+            raise RuntimeError("whisper.cpp no pudo inicializar el modelo.")
+        return model
+
     def transcribe(
         self,
         audio_path: Path,
@@ -278,7 +369,9 @@ class WhisperService:
         """Transcribe an audio file synchronously and emit progress callbacks."""
         model = self._model
         if model is None:
-            raise RuntimeError("WhisperModel no está cargado.")
+            raise RuntimeError("El modelo de transcripción no está cargado.")
+        use_parakeet = self._model_name == PARAKEET_MODEL_ID
+        use_whisper_metal = not use_parakeet and self.active_device == "metal"
 
         if cancel_event is not None and cancel_event.is_set():
             raise WhisperCancelledError("Transcripción detenida por el usuario.")
@@ -295,48 +388,99 @@ class WhisperService:
             if cancel_event is not None and cancel_event.is_set():
                 raise WhisperCancelledError("Transcripción detenida por el usuario.")
 
-            transcribe_kwargs: dict[str, Any] = {
-                "language": lang_arg,
-                "beam_size": 5,
-                "multilingual": (lang_arg is None),
-                "condition_on_previous_text": False,
-                "repetition_penalty": 1.15,
-                "no_repeat_ngram_size": 3,
-                "hallucination_silence_threshold": 2.0,
-                "vad_filter": True,
-                "vad_parameters": {
-                    "threshold": 0.35,
-                    "min_silence_duration_ms": 700,
-                    "speech_pad_ms": 400,
-                },
-            }
-            segments_iter, info = model.transcribe(str(target_audio), **transcribe_kwargs)
+            if use_parakeet:
+                import mlx.core as mx
 
-            total_duration = float(getattr(info, "duration", 0.0) or 0.0)
-            detected_lang = getattr(info, "language", "") or (lang_arg or "")
+                completed_samples = 0
+
+                def on_chunk(end: int, total: int) -> None:
+                    nonlocal completed_samples
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise WhisperCancelledError("Transcripción detenida por el usuario.")
+                    if progress_callback and completed_samples:
+                        progress_callback(min(0.99, completed_samples / total), "")
+                    completed_samples = end
+
+                total_duration = probe_duration_sec(target_audio)
+                detected_lang = ""
+                with mx.stream(mx.gpu if self.active_device == "metal" else mx.cpu):
+                    result = model.transcribe(
+                        target_audio,
+                        chunk_duration=45.0,
+                        overlap_duration=5.0,
+                        chunk_callback=on_chunk,
+                    )
+                if cancel_event is not None and cancel_event.is_set():
+                    raise WhisperCancelledError("Transcripción detenida por el usuario.")
+                segments_iter = ((seg.start, seg.end, seg.text, seg.tokens) for seg in result.sentences)
+            elif use_whisper_metal:
+                from _pywhispercpp import whisper_full_lang_id, whisper_lang_str
+                from faster_whisper.audio import decode_audio
+
+                audio = decode_audio(str(target_audio), sampling_rate=16000)
+                total_duration = audio.size / 16000
+                if cancel_event is not None and cancel_event.is_set():
+                    raise WhisperCancelledError("Transcripción detenida por el usuario.")
+
+                def on_segment(segment: Any) -> None:
+                    if progress_callback is not None and total_duration > 0:
+                        ratio = min(0.99, max(0.01, segment.t1 / 100 / total_duration))
+                        progress_callback(ratio, lang_arg or "")
+
+                raw_segments = model.transcribe(
+                    audio,
+                    language=lang_arg or "auto",
+                    new_segment_callback=on_segment if progress_callback else None,
+                    abort_callback=cancel_event.is_set if cancel_event is not None else None,
+                )
+                if cancel_event is not None and cancel_event.is_set():
+                    raise WhisperCancelledError("Transcripción detenida por el usuario.")
+                detected_lang = whisper_lang_str(whisper_full_lang_id(model._ctx)) or ""
+                segments_iter = ((seg.t0 / 100, seg.t1 / 100, seg.text, None) for seg in raw_segments)
+            else:
+                raw_segments, info = model.transcribe(
+                    str(target_audio),
+                    language=lang_arg,
+                    beam_size=5,
+                    multilingual=(lang_arg is None),
+                    condition_on_previous_text=False,
+                    repetition_penalty=1.15,
+                    no_repeat_ngram_size=3,
+                    hallucination_silence_threshold=2.0,
+                    vad_filter=True,
+                    vad_parameters={
+                        "threshold": 0.35,
+                        "min_silence_duration_ms": 700,
+                        "speech_pad_ms": 400,
+                    },
+                )
+                total_duration = float(getattr(info, "duration", 0.0) or 0.0)
+                detected_lang = getattr(info, "language", "") or (lang_arg or "")
+                segments_iter = ((seg.start, seg.end, seg.text, None) for seg in raw_segments)
 
             segments: list[dict[str, Any]] = []
             text_parts: list[str] = []
             last_norm = ""
 
-            for seg in segments_iter:
+            for start, end, text, tokens in segments_iter:
                 if cancel_event is not None and cancel_event.is_set():
                     raise WhisperCancelledError("Transcripción detenida por el usuario.")
-                clean = (seg.text or "").strip()
+                clean = (text or "").strip()
                 if clean:
                     norm = clean.lower()
-                    if norm != last_norm:
-                        segments.append(
-                            {
-                                "start": round(float(seg.start), 2),
-                                "end": round(float(seg.end), 2),
-                                "text": clean,
-                            }
-                        )
+                    if use_parakeet or norm != last_norm:
+                        segment = {
+                            "start": round(float(start), 2),
+                            "end": round(float(end), 2),
+                            "text": clean,
+                        }
+                        if tokens is not None:
+                            segment["words"] = _parakeet_word_timings(tokens)
+                        segments.append(segment)
                         text_parts.append(clean)
                         last_norm = norm
-                if progress_callback and total_duration > 0:
-                    ratio = min(0.99, max(0.01, float(seg.end) / total_duration))
+                if not use_parakeet and not use_whisper_metal and progress_callback and total_duration > 0:
+                    ratio = min(0.99, max(0.01, float(end) / total_duration))
                     progress_callback(ratio, detected_lang)
 
             full_text = "\n".join(text_parts).strip()
@@ -357,7 +501,8 @@ class WhisperService:
                     pass
 
     def unload(self) -> None:
-        """Immediately release Whisper model weights from VRAM/RAM."""
+        """Release transcription weights and any cached device memory."""
+        clear_mlx_cache = self._model_name == PARAKEET_MODEL_ID and self.active_device == "metal"
         if self._model is not None:
             del self._model
             self._model = None
@@ -365,6 +510,10 @@ class WhisperService:
         self.active_device = ""
         self.active_compute_type = ""
         gc.collect()
+        if clear_mlx_cache:
+            import mlx.core as mx
+
+            mx.clear_cache()
 
 
 whisper_service = WhisperService()

@@ -223,7 +223,14 @@
 
           <div id="center-scroll" class="ws-scroll">
             <div id="tab-summary" class="tab-pane"></div>
-            <div id="tab-transcript" class="tab-pane hidden"></div>
+            <div id="tab-transcript" class="tab-pane hidden">
+              <section id="microphone-live-panel" class="content-card hidden" aria-labelledby="microphone-live-title">
+                <h2 id="microphone-live-title" class="content-card-header">Transcripción en vivo</h2>
+                <p id="microphone-live-status" class="microphone-status" role="status"></p>
+                <div id="microphone-preview" class="microphone-preview" role="log" aria-label="Texto reconocido" tabindex="0"></div>
+              </section>
+              <div id="transcript-content" class="tab-pane"></div>
+            </div>
             <div id="tab-chat" class="tab-pane hidden">
               <div id="chat-messages" class="chat-messages"></div>
               <div id="quick-prompts" class="quick-prompts hidden"></div>
@@ -264,6 +271,25 @@
           </div>
         </div>
 
+        <div class="microphone-panel">
+          <button id="btn-microphone" type="button" class="pill-btn outline" aria-pressed="false">
+            <svg aria-hidden="true" class="microphone-icon" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <rect x="9" y="2" width="6" height="13" rx="3"/>
+              <path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M9 22h6"/>
+            </svg>
+            <svg aria-hidden="true" class="microphone-stop-icon" viewBox="0 0 24 24" width="17" height="17" fill="currentColor">
+              <rect x="5" y="5" width="14" height="14" rx="2"/>
+            </svg>
+            <span id="microphone-label">Grabar con micrófono</span>
+            <span id="microphone-time" class="microphone-time hidden" aria-hidden="true">00:00</span>
+          </button>
+          <label class="microphone-live-toggle">
+            <input id="microphone-live" type="checkbox" /> Transcribir en vivo
+          </label>
+          <p id="microphone-status" class="microphone-status" role="status"></p>
+          <a id="microphone-download" class="microphone-status hidden">Descargar audio sin guardar</a>
+        </div>
+
         <div id="recordings-list" class="recordings-list"></div>
 
         <div id="upload-drop-area" class="drop-mini">
@@ -296,7 +322,7 @@
           <div class="field-header-row">
             <span class="field-label">Modelo de lenguaje (Ollama local)</span>
             <div class="field-actions-inline">
-              <button type="button" id="btn-refresh-models" class="pill-btn outline xs" title="Volver a escanear modelos instalados en Ollama y Whisper">
+              <button type="button" id="btn-refresh-models" class="pill-btn outline xs" title="Volver a escanear modelos de lenguaje y transcripción">
                 Actualizar lista
               </button>
               <button type="button" id="btn-open-models-guide" class="pill-btn info-lime xs" title="Ver guía para instalar tus propios modelos locales">
@@ -310,13 +336,13 @@
 
         <div class="field-row">
           <div class="field">
-            <span class="field-label">Modelo Whisper (transcripción)</span>
+            <span class="field-label">Modelo de transcripción</span>
             <select id="set-whisper-model"></select>
           </div>
           <div class="field">
-            <span class="field-label">Dispositivo Whisper</span>
+            <span class="field-label">Dispositivo de transcripción</span>
             <select id="set-whisper-device">
-              <option value="auto">Automático (GPU CUDA con respaldo CPU)</option>
+              <option value="auto">Automático</option>
               <option value="cuda">Solo GPU CUDA</option>
               <option value="cpu">Solo CPU</option>
             </select>
@@ -335,6 +361,7 @@
               <option value="de">Alemán</option>
               <option value="it">Italiano</option>
             </select>
+            <small id="parakeet-language-hint" class="hidden">Parakeet detecta el idioma automáticamente.</small>
           </div>
 
           <div class="field">

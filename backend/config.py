@@ -1,5 +1,8 @@
 """Central configuration for TransCrypting (100% local execution)."""
 
+import platform
+import sys
+from importlib.util import find_spec
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -8,6 +11,7 @@ AUDIO_DIR = DATA_DIR / "audio"
 SOURCES_DIR = DATA_DIR / "sources"
 PODCASTS_DIR = DATA_DIR / "podcasts"
 MODELS_DIR = DATA_DIR / "models" / "whisper"
+PARAKEET_MODELS_DIR = DATA_DIR / "models" / "parakeet"
 TTS_MODELS_DIR = DATA_DIR / "models" / "tts"
 KOKORO_MODELS_DIR = TTS_MODELS_DIR / "kokoro"
 DB_PATH = DATA_DIR / "transcript.db"
@@ -17,7 +21,12 @@ HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 
-DEFAULT_WHISPER_MODEL = "large-v3-turbo"
+DEFAULT_WHISPER_DEVICE = "auto"
+WHISPER_METAL_SUPPORTED = sys.platform == "darwin" and platform.machine() == "arm64"
+PARAKEET_MODEL_ID = "parakeet-tdt-0.6b-v3"
+PARAKEET_MODEL_REPO = "mlx-community/parakeet-tdt-0.6b-v3"
+PARAKEET_SUPPORTED = WHISPER_METAL_SUPPORTED and find_spec("parakeet_mlx") is not None
+DEFAULT_WHISPER_MODEL = PARAKEET_MODEL_ID if PARAKEET_SUPPORTED else "large-v3-turbo"
 WHISPER_MODELS = [
     {
         "id": "tiny",
@@ -53,8 +62,10 @@ WHISPER_MODELS = [
 
 
 def list_available_whisper_models(models_dir: Path = MODELS_DIR) -> list[dict]:
-    """Return built-in Whisper presets plus any custom CTranslate2 folders placed in data/models/whisper/."""
+    """Return local transcription presets and custom CTranslate2 models."""
     models = list(WHISPER_MODELS)
+    if PARAKEET_SUPPORTED:
+        models.append({"id": PARAKEET_MODEL_ID, "label": "Parakeet TDT 0.6B v3 (MLX · 25 idiomas)"})
     if models_dir.is_dir():
         for entry in sorted(models_dir.iterdir(), key=lambda p: p.name.lower()):
             if not entry.is_dir():
@@ -71,7 +82,6 @@ def list_available_whisper_models(models_dir: Path = MODELS_DIR) -> list[dict]:
                 )
     return models
 
-DEFAULT_WHISPER_DEVICE = "auto"
 DEFAULT_WHISPER_LANGUAGE = "auto"
 DEFAULT_NUM_CTX = 8192
 DEFAULT_IDLE_UNLOAD_SEC = 180
