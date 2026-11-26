@@ -565,6 +565,7 @@ def synthesize_podcast_audio(
     models_dir: Path = TTS_MODELS_DIR,
     progress_callback: Callable[[float, str], None] | None = None,
     cancel_event: threading.Event | None = None,
+    cpu_threads: int = 0,
 ) -> tuple[float, str]:
     """
     Synthesize all dialogue turns into one local 24000 Hz mono WAV file.
@@ -598,7 +599,20 @@ def synthesize_podcast_audio(
             progress_callback=progress_callback,
         )
         _check_podcast_cancel(cancel_event)
-        kokoro_engine = Kokoro(str(model_path), str(voices_path))
+        if cpu_threads > 0 and hasattr(Kokoro, "from_session"):
+            import onnxruntime as ort
+
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = max(1, int(cpu_threads))
+            opts.inter_op_num_threads = 1
+            sess = ort.InferenceSession(
+                str(model_path),
+                sess_options=opts,
+                providers=["CPUExecutionProvider"],
+            )
+            kokoro_engine = Kokoro.from_session(sess, str(voices_path))
+        else:
+            kokoro_engine = Kokoro(str(model_path), str(voices_path))
     except PodcastCancelledError:
         raise
     except Exception:

@@ -1754,11 +1754,16 @@ async def _run_podcast_job(
                 indexed_chunks=indexed_hits,
             )
             keep_alive = f"{max(30, idle_unload_sec)}s"
+            eco_mode = bool(settings.get("eco_mode", False))
+            eco_cpu_threads = int(settings.get("eco_cpu_threads") or 2)
             raw_script = await ollama_service.generate_complete(
                 model=ollama_model,
                 messages=msgs,
                 num_ctx=num_ctx,
                 keep_alive=keep_alive,
+                eco_mode=eco_mode,
+                eco_cpu_threads=eco_cpu_threads,
+                num_predict=1400 if eco_mode else None,
             )
             if cancel_event is not None and cancel_event.is_set():
                 raise PodcastCancelledError()
@@ -1780,6 +1785,8 @@ async def _run_podcast_job(
                 resource_manager.podcast_stage = label
                 db.update_podcast_progress(podcast_id, "synthesizing", pct, label)
 
+            eco_mode = bool(settings.get("eco_mode", False))
+            eco_cpu_threads = int(settings.get("eco_cpu_threads") or 2)
             return synthesize_podcast_audio(
                 turns=turns,
                 output_path=out_path,
@@ -1787,6 +1794,7 @@ async def _run_podcast_job(
                 models_dir=TTS_MODELS_DIR,
                 progress_callback=_synth_progress,
                 cancel_event=cancel_event,
+                cpu_threads=eco_cpu_threads if eco_mode else 0,
             )
 
         duration_sec, tts_engine = await resource_manager.run_podcast_exclusive(

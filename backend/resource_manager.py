@@ -98,6 +98,10 @@ class ResourceManager:
                     def _run_transcription() -> dict[str, Any]:
                         if cancel_ev.is_set():
                             raise WhisperCancelledError("Transcripción detenida por el usuario.")
+                        settings = db.get_settings()
+                        eco_mode = bool(settings.get("eco_mode", False))
+                        eco_threads = int(settings.get("eco_cpu_threads") or 2)
+                        whisper_service.eco_cpu_threads = eco_threads if eco_mode else 0
                         used_device = whisper_service.load(model_name=model_name, device_pref=device_pref)
                         self.active_device = used_device
                         return whisper_service.transcribe(

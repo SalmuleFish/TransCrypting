@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import os
 import re
+import shutil
 import site
 import subprocess
 import sysconfig
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Callable
+
+import httpx
 
 from backend.config import (
     HTML5_PLAYABLE_EXTENSIONS,
@@ -100,7 +105,7 @@ def probe_duration_sec(file_path: Path) -> float:
     try:
         res = subprocess.run(
             [
-                "ffprobe",
+                _find_ffprobe_exe(),
                 "-v",
                 "error",
                 "-show_entries",
@@ -132,7 +137,7 @@ def prepare_audio_file(src_path: Path, dest_dir: Path) -> tuple[float, Path]:
     try:
         res = subprocess.run(
             [
-                "ffmpeg",
+                _find_ffmpeg_exe(),
                 "-y",
                 "-i",
                 str(src_path),
@@ -163,7 +168,7 @@ def enhance_audio_for_speech(src_path: Path) -> Path | None:
     try:
         res = subprocess.run(
             [
-                "ffmpeg",
+                _find_ffmpeg_exe(),
                 "-y",
                 "-i",
                 str(src_path),
@@ -192,18 +197,143 @@ def enhance_audio_for_speech(src_path: Path) -> Path | None:
     return None
 
 
+_HF_WHISPER_CPP_BASE = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
+_ONNX_WHISPER_MAP = {
+    "tiny": "onnx-community/whisper-tiny",
+    "base": "whisper-base",
+    "small": "onnx-community/whisper-small",
+    "medium": "onnx-community/whisper-medium",
+    "large-v3-turbo": "onnx-community/whisper-large-v3-turbo",
+    "large-v3": "onnx-community/whisper-large-v3",
+}
+
+
+def _find_ffmpeg_exe() -> str:
+    """Locate ffmpeg executable on PATH or WinGet Links."""
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    winget_link = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Links" / "ffmpeg.exe"
+    if winget_link.is_file():
+        return str(winget_link)
+    return "ffmpeg"
+
+
+def _find_ffprobe_exe() -> str:
+    """Locate ffprobe executable on PATH or WinGet Links."""
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    winget_link = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Links" / "ffprobe.exe"
+    if winget_link.is_file():
+        return str(winget_link)
+    return "ffprobe"
+
+
+def _find_whisper_cpp_exe() -> str | None:
+    """Locate whisper.cpp CLI binary in data/models/whisper/bin or system PATH."""
+    bin_dir = MODELS_DIR / "bin"
+    for name in ("whisper-cli.exe", "whisper-cli", "main.exe"):
+        candidate = bin_dir / name
+        if candidate.is_file():
+            return str(candidate)
+    for name in ("whisper-cli", "whisper-cpp"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _ensure_ggml_model(model_name: str, eco_mode: bool = False) -> Path:
+    """Resolve or download quantized GGML model for whisper.cpp into data/models/whisper/ggml/."""
+    ggml_dir = MODELS_DIR / "ggml"
+    ggml_dir.mkdir(parents=True, exist_ok=True)
+    clean_name = model_name.replace("local:", "").strip()
+
+    # Check if user placed a custom .bin directly
+    custom = ggml_dir / f"ggml-{clean_name}.bin"
+    if custom.is_file() and custom.stat().st_size > 1_000_000:
+        return custom
+
+    quant_candidates = (
+        [f"ggml-{clean_name}-q5_1.bin", f"ggml-{clean_name}.bin"]
+        if eco_mode and clean_name in ("tiny", "base", "small")
+        else [f"ggml-{clean_name}.bin", f"ggml-{clean_name}-q5_1.bin"]
+    )
+    for fname in quant_candidates:
+        target = ggml_dir / fname
+        if target.is_file() and target.stat().st_size > 1_000_000:
+            return target
+
+    for fname in quant_candidates:
+        url = f"{_HF_WHISPER_CPP_BASE}/{fname}"
+        target = ggml_dir / fname
+        tmp = target.with_suffix(".bin.part")
+        try:
+            with httpx.stream("GET", url, follow_redirects=True, timeout=180.0) as resp:
+                if resp.status_code >= 400:
+                    continue
+                with tmp.open("wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=1024 * 256):
+                        if chunk:
+                            f.write(chunk)
+            tmp.replace(target)
+            return target
+        except Exception:
+            tmp.unlink(missing_ok=True)
+
+    raise RuntimeError(
+        f"No se pudo descargar el modelo GGML '{clean_name}' para whisper.cpp en {ggml_dir}."
+    )
+
+
+def _convert_to_wav_16k(src_path: Path, dest_wav: Path) -> Path:
+    """Convert any audio file to 16kHz mono PCM WAV via ffmpeg."""
+    res = subprocess.run(
+        [
+            _find_ffmpeg_exe(),
+            "-y",
+            "-i",
+            str(src_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(dest_wav),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        creationflags=_NO_WINDOW,
+    )
+    if res.returncode != 0 or not dest_wav.is_file():
+        raise RuntimeError(
+            "ffmpeg es necesario para convertir el audio a WAV 16kHz para whisper.cpp."
+        )
+    return dest_wav
+
+
 class WhisperService:
-    """Manage local transcription models and release them between workloads."""
+    """Manage local Whisper / Parakeet / ONNX transcription models and release them between workloads."""
 
     def __init__(self) -> None:
         self._model: Any = None
+        self._onnx_model: Any = None
+        self._onnx_vad: Any = None
         self._model_name: str = ""
+        self._backend: str = "faster-whisper"
+        self._cpp_exe: str | None = None
+        self._ggml_path: Path | None = None
+        self.eco_cpu_threads: int = 0
         self.active_device: str = ""
         self.active_compute_type: str = ""
 
     @property
     def is_loaded(self) -> bool:
-        return self._model is not None
+        return self._model is not None or self._onnx_model is not None or self._ggml_path is not None
 
     def _resolve_model_source(self, model_name: str) -> str:
         """Use local CTranslate2 folder or cached Whisper weights; otherwise download once to MODELS_DIR."""
@@ -250,11 +380,11 @@ class WhisperService:
             hf_constants.HF_HUB_OFFLINE = prev_const
 
     def load(self, model_name: str, device_pref: str = "auto") -> str:
-        """Load a transcription model on Metal, CUDA, or CPU."""
+        """Load a transcription model on Metal, CUDA, or CPU (faster-whisper / onnx-asr / whisper.cpp)."""
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         pref = (device_pref or "auto").lower()
 
-        if self._model is not None and self._model_name == model_name:
+        if self.is_loaded and self._model_name == model_name:
             if pref == "auto" or pref == self.active_device:
                 return self.active_device
 
@@ -296,9 +426,51 @@ class WhisperService:
                 self.active_device = "metal"
                 return self.active_device
 
-        register_cuda_dlls()
-        from faster_whisper import WhisperModel
+        try:
+            register_cuda_dlls()
+            from faster_whisper import WhisperModel
+        except ImportError:
+            try:
+                import onnx_asr
+                import onnxruntime as ort
 
+                mapped = _ONNX_WHISPER_MAP.get(model_name.replace("local:", "").strip(), "whisper-base")
+                threads = self.eco_cpu_threads if self.eco_cpu_threads > 0 else max(2, min(6, (os.cpu_count() or 4) // 2))
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = max(1, int(threads))
+                opts.inter_op_num_threads = 1
+                self._onnx_model = onnx_asr.load_model(
+                    mapped,
+                    quantization="int8",
+                    sess_options=opts,
+                    providers=["CPUExecutionProvider"],
+                )
+                self._onnx_vad = onnx_asr.load_vad(
+                    "silero",
+                    sess_options=opts,
+                    providers=["CPUExecutionProvider"],
+                )
+                self._backend = "onnx-asr"
+                self._model_name = model_name
+                self.active_device = "cpu"
+                self.active_compute_type = "onnx-int8"
+                return "cpu"
+            except Exception as onnx_exc:
+                cpp_exe = _find_whisper_cpp_exe()
+                if not cpp_exe:
+                    raise RuntimeError(
+                        "Transcripción de audio no disponible: instala 'onnx-asr[hub]' (ARM64) "
+                        f"o coloca 'whisper-cli.exe' en '{MODELS_DIR / 'bin'}'. Detalle: {onnx_exc}"
+                    ) from onnx_exc
+                self._backend = "whisper.cpp"
+                self._cpp_exe = cpp_exe
+                self._ggml_path = _ensure_ggml_model(model_name, eco_mode=self.eco_cpu_threads > 0)
+                self._model_name = model_name
+                self.active_device = "cpu"
+                self.active_compute_type = "ggml"
+                return "cpu"
+
+        self._backend = "faster-whisper"
         model_source = self._resolve_model_source(model_name)
 
         if pref == "cuda" or (pref == "auto" and not WHISPER_METAL_SUPPORTED):
@@ -319,8 +491,7 @@ class WhisperService:
                         f"No se pudo cargar Whisper en GPU CUDA: {exc}"
                     ) from exc
 
-        # CPU fallback scaled dynamically to host cores
-        threads = max(4, min(12, (os.cpu_count() or 8) // 2))
+        threads = self.eco_cpu_threads if self.eco_cpu_threads > 0 else max(4, min(12, (os.cpu_count() or 8) // 2))
         self._model = WhisperModel(
             model_source,
             device="cpu",
@@ -358,6 +529,151 @@ class WhisperService:
             raise RuntimeError("whisper.cpp no pudo inicializar el modelo.")
         return model
 
+    def _transcribe_whisper_cpp(
+        self,
+        audio_path: Path,
+        language: str = "auto",
+        progress_callback: Callable[[float, str], None] | None = None,
+        classroom_enhance: bool = True,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        if not self._cpp_exe or not self._ggml_path:
+            raise RuntimeError("whisper.cpp no está cargado.")
+
+        threads = self.eco_cpu_threads if self.eco_cpu_threads > 0 else max(2, min(6, (os.cpu_count() or 4) // 2))
+        lang_arg = "auto" if not language or language == "auto" else language
+        duration_sec = probe_duration_sec(audio_path)
+
+        with tempfile.TemporaryDirectory(prefix="wcpp_") as tmp_dir:
+            tmp_root = Path(tmp_dir)
+            wav_path = tmp_root / "input_16k.wav"
+            enhanced_tmp = enhance_audio_for_speech(audio_path) if classroom_enhance else None
+            try:
+                src_wav = enhanced_tmp if enhanced_tmp is not None else _convert_to_wav_16k(audio_path, wav_path)
+                out_prefix = tmp_root / "result"
+                cmd = [
+                    self._cpp_exe,
+                    "-m",
+                    str(self._ggml_path),
+                    "-f",
+                    str(src_wav),
+                    "-l",
+                    lang_arg,
+                    "-t",
+                    str(threads),
+                    "-oj",
+                    "-of",
+                    str(out_prefix),
+                ]
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    creationflags=_NO_WINDOW,
+                )
+                while proc.poll() is None:
+                    if cancel_event is not None and cancel_event.is_set():
+                        proc.terminate()
+                        raise WhisperCancelledError("Transcripción detenida por el usuario.")
+                    import time as _time
+                    _time.sleep(0.25)
+
+                if proc.returncode != 0:
+                    err = (proc.stderr.read() if proc.stderr else b"").decode("utf-8", errors="ignore")
+                    raise RuntimeError(f"whisper.cpp falló ({proc.returncode}): {err.strip()}")
+
+                json_file = Path(f"{out_prefix}.json")
+                data = json.loads(json_file.read_text(encoding="utf-8")) if json_file.is_file() else {}
+                detected_lang = str((data.get("result") or {}).get("language") or ("" if lang_arg == "auto" else lang_arg))
+                raw_items = data.get("transcription") or []
+
+                segments: list[dict[str, Any]] = []
+                text_parts: list[str] = []
+                last_norm = ""
+                for item in raw_items:
+                    clean = str(item.get("text") or "").strip()
+                    offsets = item.get("offsets") or {}
+                    start_s = round(float(offsets.get("from", 0)) / 1000.0, 2)
+                    end_s = round(float(offsets.get("to", 0)) / 1000.0, 2)
+                    if clean:
+                        norm = clean.lower()
+                        if norm != last_norm:
+                            segments.append({"start": start_s, "end": end_s, "text": clean})
+                            text_parts.append(clean)
+                            last_norm = norm
+
+                if progress_callback:
+                    progress_callback(0.99, detected_lang)
+
+                full_text = "\n".join(text_parts).strip() or "[No se detectó voz comprensible en la grabación]"
+                final_dur = duration_sec or (segments[-1]["end"] if segments else 0.0)
+                return {
+                    "text": full_text,
+                    "segments": segments,
+                    "language": detected_lang,
+                    "duration_sec": round(float(final_dur), 2),
+                }
+            finally:
+                if enhanced_tmp is not None:
+                    enhanced_tmp.unlink(missing_ok=True)
+
+    def _transcribe_onnx_asr(
+        self,
+        audio_path: Path,
+        language: str = "auto",
+        progress_callback: Callable[[float, str], None] | None = None,
+        classroom_enhance: bool = True,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        if self._onnx_model is None or self._onnx_vad is None:
+            raise RuntimeError("Modelo onnx-asr no está cargado.")
+
+        lang_arg = None if not language or language == "auto" else language
+        duration_sec = probe_duration_sec(audio_path)
+
+        with tempfile.TemporaryDirectory(prefix="onnx_asr_") as tmp_dir:
+            tmp_root = Path(tmp_dir)
+            wav_path = tmp_root / "input_16k.wav"
+            enhanced_tmp = enhance_audio_for_speech(audio_path) if classroom_enhance else None
+            try:
+                src_wav = enhanced_tmp if enhanced_tmp is not None else _convert_to_wav_16k(audio_path, wav_path)
+                adapter = self._onnx_model.with_vad(self._onnx_vad)
+                kwargs: dict[str, Any] = {}
+                if lang_arg:
+                    kwargs["language"] = lang_arg
+                seg_iter = adapter.recognize(str(src_wav), **kwargs)
+
+                segments: list[dict[str, Any]] = []
+                text_parts: list[str] = []
+                last_norm = ""
+                for seg in seg_iter:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise WhisperCancelledError("Transcripción detenida por el usuario.")
+                    clean = str(getattr(seg, "text", "") or "").strip()
+                    start_s = round(float(getattr(seg, "start", 0.0) or 0.0), 2)
+                    end_s = round(float(getattr(seg, "end", 0.0) or 0.0), 2)
+                    if clean:
+                        norm = clean.lower()
+                        if norm != last_norm:
+                            segments.append({"start": start_s, "end": end_s, "text": clean})
+                            text_parts.append(clean)
+                            last_norm = norm
+                    if progress_callback and duration_sec > 0:
+                        ratio = min(0.99, max(0.01, end_s / duration_sec))
+                        progress_callback(ratio, lang_arg or "")
+
+                full_text = "\n".join(text_parts).strip() or "[No se detectó voz comprensible en la grabación]"
+                final_dur = duration_sec or (segments[-1]["end"] if segments else 0.0)
+                return {
+                    "text": full_text,
+                    "segments": segments,
+                    "language": lang_arg or "auto",
+                    "duration_sec": round(float(final_dur), 2),
+                }
+            finally:
+                if enhanced_tmp is not None:
+                    enhanced_tmp.unlink(missing_ok=True)
+
     def transcribe(
         self,
         audio_path: Path,
@@ -367,6 +683,23 @@ class WhisperService:
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Transcribe an audio file synchronously and emit progress callbacks."""
+        if self._backend == "onnx-asr":
+            return self._transcribe_onnx_asr(
+                audio_path=audio_path,
+                language=language,
+                progress_callback=progress_callback,
+                classroom_enhance=classroom_enhance,
+                cancel_event=cancel_event,
+            )
+        if self._backend == "whisper.cpp":
+            return self._transcribe_whisper_cpp(
+                audio_path=audio_path,
+                language=language,
+                progress_callback=progress_callback,
+                classroom_enhance=classroom_enhance,
+                cancel_event=cancel_event,
+            )
+
         model = self._model
         if model is None:
             raise RuntimeError("El modelo de transcripción no está cargado.")
@@ -506,6 +839,15 @@ class WhisperService:
         if self._model is not None:
             del self._model
             self._model = None
+        if self._onnx_model is not None:
+            del self._onnx_model
+            self._onnx_model = None
+        if self._onnx_vad is not None:
+            del self._onnx_vad
+            self._onnx_vad = None
+        self._backend = "faster-whisper"
+        self._cpp_exe = None
+        self._ggml_path = None
         self._model_name = ""
         self.active_device = ""
         self.active_compute_type = ""
