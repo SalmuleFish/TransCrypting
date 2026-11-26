@@ -23,6 +23,7 @@ from backend.config import (
     AUDIO_DIR,
     DEFAULT_WHISPER_MODEL,
     FRONTEND_DIR,
+    MLX_ASR_MODELS,
     PARAKEET_MODEL_ID,
     PODCASTS_DIR,
     SOURCES_DIR,
@@ -75,6 +76,9 @@ from backend.source_service import (
 from backend.whisper_service import WhisperCancelledError, _find_ffmpeg_exe, prepare_audio_file
 
 
+RECORDING_SUMMARY_MAX_TOKENS = 768
+
+
 class SessionCreateRequest(BaseModel):
     title: str = "Nueva conversación"
 
@@ -93,6 +97,7 @@ class SettingsUpdateRequest(BaseModel):
     classroom_audio_enhance: bool | None = None
     enable_thinking: bool | None = None
     eco_mode: bool | None = None
+    auto_summarize: bool | None = None
     eco_cpu_threads: int | None = None
     theme: str | None = None
 
@@ -150,6 +155,10 @@ class QuizGradeRequest(BaseModel):
     expected_answer: str = ""
     timestamp: str = ""
     user_answer: str
+
+
+def _auto_summaries_enabled(settings: dict[str, Any]) -> bool:
+    return settings["auto_summarize"] and not settings["eco_mode"]
 
 
 class ProcessingPipeline:
@@ -271,7 +280,9 @@ class ProcessingPipeline:
 
         settings = db.get_settings()
         whisper_model = settings.get("whisper_model") or DEFAULT_WHISPER_MODEL
-        engine_label = "Parakeet v3" if whisper_model == PARAKEET_MODEL_ID else f"Whisper ({whisper_model})"
+        engine_label = MLX_ASR_MODELS.get(whisper_model, {}).get("engine") or (
+            "Parakeet v3" if whisper_model == PARAKEET_MODEL_ID else f"Whisper ({whisper_model})"
+        )
         whisper_device = settings.get("whisper_device") or "auto"
         whisper_lang = settings.get("whisper_language") or "auto"
         classroom_enhance = bool(settings.get("classroom_audio_enhance", True))
@@ -354,13 +365,14 @@ class ProcessingPipeline:
                 chunks=rec_chunks,
             )
 
-        if bool(settings.get("eco_mode", False)):
+        settings = db.get_settings()
+        if not _auto_summaries_enabled(settings):
             db.update_recording_summary(
                 rec_id=rec_id,
-                summary_text="",
+                summary_text=(rec_indexed or {}).get("summary_text", ""),
                 status="ready",
                 progress=1.0,
-                stage="Indexado (Modo Eco)",
+                stage="Indexado (Modo Eco)" if settings["eco_mode"] else "Transcripción lista",
             )
             return
 
@@ -369,7 +381,7 @@ class ProcessingPipeline:
             rec_id,
             "summarizing",
             0.80,
-            "Generando resumen con modelo local...",
+            "Transcripción lista · generando resumen...",
         )
 
         try:
@@ -390,6 +402,8 @@ class ProcessingPipeline:
                 model_name=ollama_model,
                 num_ctx=num_ctx,
                 idle_unload_sec=idle_unload_sec,
+                num_predict=RECORDING_SUMMARY_MAX_TOKENS,
+                operation_label="Resumen del audio",
             )
         except (GenerationAbortedError, asyncio.CancelledError):
             db.update_recording_summary(
@@ -418,7 +432,7 @@ class ProcessingPipeline:
             s for s in db.list_sources(session_id)
             if s.get("status") == "ready" and s.get("enabled", True)
         ]
-        if other_ready_recs or other_ready_srcs:
+        if (other_ready_recs or other_ready_srcs) and _auto_summaries_enabled(db.get_settings()):
             db.update_recording_summary(
                 rec_id=rec_id,
                 summary_text=summary_text,
@@ -471,7 +485,7 @@ class ProcessingPipeline:
         source_type = src.get("source_type") or detect_source_type(src["filename"])
 
         ollama_model = ""
-        if not eco_mode:
+        if source_type == "image" and not eco_mode:
             ollama_model = await ollama_service.resolve_default_model(
                 settings.get("ollama_model", "")
             )
@@ -578,16 +592,18 @@ class ProcessingPipeline:
                 chunks=chunks,
             )
 
-        if not db.get_source(source_id):
+        indexed_src = db.get_source(source_id)
+        if not indexed_src:
             return
 
-        if eco_mode:
+        settings = db.get_settings()
+        if not _auto_summaries_enabled(settings):
             db.update_source_summary(
                 source_id=source_id,
-                summary_text="",
+                summary_text=indexed_src.get("summary_text", ""),
                 status="ready",
                 progress=1.0,
-                stage="Indexado (Modo Eco)",
+                stage="Indexado (Modo Eco)" if settings["eco_mode"] else "Indexado y listo",
             )
             return
 
@@ -597,6 +613,12 @@ class ProcessingPipeline:
             if source_type == "image" and used_vision and len(extracted_text) <= 2200:
                 summary_text = extracted_text
             else:
+                if not ollama_model:
+                    ollama_model = await ollama_service.resolve_default_model(
+                        settings.get("ollama_model", "")
+                    )
+                    if not settings.get("ollama_model") and ollama_model:
+                        db.update_settings({"ollama_model": ollama_model})
                 summary_msgs = build_source_summary_messages(
                     filename=src["filename"],
                     source_type=source_type,
@@ -637,7 +659,7 @@ class ProcessingPipeline:
             s for s in db.list_sources(session_id)
             if s.get("id") != source_id and s.get("status") == "ready" and s.get("enabled", True)
         ]
-        if other_ready_recs or other_ready_srcs:
+        if (other_ready_recs or other_ready_srcs) and _auto_summaries_enabled(db.get_settings()):
             db.update_source_summary(
                 source_id=source_id,
                 summary_text=summary_text,
@@ -678,6 +700,9 @@ pipeline = ProcessingPipeline()
 
 async def generate_and_save_suggestions(session_id: str) -> list[dict[str, str]]:
     """Ask the local LLM to generate 3 tailored quick-prompt suggestions across active sources."""
+    settings = db.get_settings()
+    if not _auto_summaries_enabled(settings):
+        return []
     detail = db.get_session_detail(session_id)
     if not detail:
         return []
@@ -693,7 +718,6 @@ async def generate_and_save_suggestions(session_id: str) -> list[dict[str, str]]
     if total_ready == 0:
         return []
 
-    settings = db.get_settings()
     num_ctx = int(settings.get("num_ctx") or 8192)
     idle_unload_sec = int(settings.get("idle_unload_sec") or 180)
     ollama_model = await ollama_service.resolve_default_model(settings.get("ollama_model", ""))
@@ -708,6 +732,8 @@ async def generate_and_save_suggestions(session_id: str) -> list[dict[str, str]]
         model_name=ollama_model,
         num_ctx=min(num_ctx, 4096),
         idle_unload_sec=idle_unload_sec,
+        num_predict=384,
+        operation_label="Sugerencias",
     )
     prompts = parse_suggestions_json(raw, recording_count=total_ready)
     db.update_session_suggestions(session_id, prompts)
@@ -735,7 +761,7 @@ def _schedule_combined_summary_refresh(session_id: str) -> None:
         db.update_session_summary(session_id, "")
         return
 
-    if bool(db.get_settings().get("eco_mode", False)):
+    if not _auto_summaries_enabled(db.get_settings()):
         return
 
     async def _runner() -> None:
@@ -785,12 +811,16 @@ async def regenerate_combined_summary_if_needed(
     idle_unload_sec = int(settings.get("idle_unload_sec") or 180)
     ollama_model = await ollama_service.resolve_default_model(settings.get("ollama_model", ""))
 
-    msgs = build_combined_summary_messages(ready_recs, sources=ready_srcs)
+    msgs = build_combined_summary_messages(
+        ready_recs, sources=ready_srcs, max_input_chars=min(12000, num_ctx)
+    )
     combined = await resource_manager.summarize_exclusive(
         messages=msgs,
         model_name=ollama_model,
         num_ctx=num_ctx,
         idle_unload_sec=idle_unload_sec,
+        num_predict=1024,
+        operation_label="Resumen integrado",
     )
     db.update_session_summary(session_id, combined)
     return combined
@@ -882,6 +912,11 @@ async def system_stop() -> dict[str, Any]:
         "cancelled_pipeline": cancelled_pipeline,
         **stop_info,
     }
+
+
+@app.post("/api/system/stop-active/{operation_id}")
+async def system_stop_active(operation_id: str) -> dict[str, bool]:
+    return {"stopped": resource_manager.stop_operation(operation_id)}
 
 
 @app.get("/api/settings")
@@ -1208,7 +1243,7 @@ async def transcribe_live_recording(file: UploadFile = File(...)) -> dict[str, s
                 classroom_enhance=False,
                 keep_loaded=True,
             )
-        except WhisperCancelledError as exc:
+        except (WhisperCancelledError, asyncio.CancelledError) as exc:
             raise HTTPException(status_code=499, detail="Vista previa detenida.") from exc
         except Exception as exc:
             raise HTTPException(status_code=503, detail="No se pudo transcribir el fragmento del micrófono.") from exc
@@ -1504,6 +1539,8 @@ async def resummarize_session(
                 model_name=ollama_model,
                 num_ctx=num_ctx,
                 idle_unload_sec=idle_unload_sec,
+                num_predict=RECORDING_SUMMARY_MAX_TOKENS,
+                operation_label="Resumen del audio",
             )
             db.update_recording_summary(rec["id"], summary_text)
 

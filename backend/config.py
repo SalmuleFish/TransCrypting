@@ -27,7 +27,32 @@ PARAKEET_MODEL_ID = "parakeet-tdt-0.6b-v3"
 PARAKEET_MODEL_REPO = "mlx-community/parakeet-tdt-0.6b-v3"
 PARAKEET_SUPPORTED = WHISPER_METAL_SUPPORTED and find_spec("parakeet_mlx") is not None
 PARAKEET_ONNX_SUPPORTED = (not WHISPER_METAL_SUPPORTED) and find_spec("onnx_asr") is not None
-DEFAULT_WHISPER_MODEL = PARAKEET_MODEL_ID if PARAKEET_SUPPORTED else "large-v3-turbo"
+MLX_ASR_SUPPORTED = WHISPER_METAL_SUPPORTED and find_spec("mlx_audio") is not None
+NEMOTRON_MODEL_ID = "nemotron-labs-unified-asr-0.6b"
+MLX_ASR_MODELS = {
+    "qwen3-asr-0.6b": {
+        "repo": "mlx-community/Qwen3-ASR-0.6B-bf16",
+        "label": "Qwen3-ASR 0.6B (MLX · BF16)",
+        "engine": "Qwen3-ASR 0.6B",
+    },
+    "qwen3-asr-1.7b": {
+        "repo": "mlx-community/Qwen3-ASR-1.7B-bf16",
+        "label": "Qwen3-ASR 1.7B (MLX · BF16)",
+        "engine": "Qwen3-ASR 1.7B",
+    },
+    NEMOTRON_MODEL_ID: {
+        "repo": "mlx-community/nemotron-labs-unified-asr-0.6b-bf16",
+        "label": "Nemotron Labs Unified ASR 0.6B (MLX · BF16)",
+        "engine": "Nemotron 0.6B",
+        "requires_language": True,
+    },
+}
+if MLX_ASR_SUPPORTED:
+    DEFAULT_WHISPER_MODEL = NEMOTRON_MODEL_ID
+elif PARAKEET_SUPPORTED:
+    DEFAULT_WHISPER_MODEL = PARAKEET_MODEL_ID
+else:
+    DEFAULT_WHISPER_MODEL = "large-v3-turbo"
 WHISPER_MODELS = [
     {
         "id": "tiny",
@@ -66,9 +91,14 @@ def list_available_whisper_models(models_dir: Path = MODELS_DIR) -> list[dict]:
     """Return local transcription presets and custom CTranslate2 models."""
     models = list(WHISPER_MODELS)
     if PARAKEET_SUPPORTED:
-        models.append({"id": PARAKEET_MODEL_ID, "label": "Parakeet TDT 0.6B v3 (MLX · 25 idiomas)"})
+        models.append({"id": PARAKEET_MODEL_ID, "label": "Parakeet TDT 0.6B v3 (MLX · 25 idiomas)", "engine": "Parakeet"})
     elif PARAKEET_ONNX_SUPPORTED:
-        models.append({"id": PARAKEET_MODEL_ID, "label": "Parakeet TDT 0.6B v3 (ONNX · 25 idiomas)"})
+        models.append({"id": PARAKEET_MODEL_ID, "label": "Parakeet TDT 0.6B v3 (ONNX · 25 idiomas)", "engine": "Parakeet"})
+    if MLX_ASR_SUPPORTED:
+        models.extend(
+            {"id": model_id, **{key: value for key, value in model.items() if key != "repo"}}
+            for model_id, model in MLX_ASR_MODELS.items()
+        )
     if models_dir.is_dir():
         for entry in sorted(models_dir.iterdir(), key=lambda p: p.name.lower()):
             if not entry.is_dir():
@@ -86,6 +116,7 @@ def list_available_whisper_models(models_dir: Path = MODELS_DIR) -> list[dict]:
     return models
 
 DEFAULT_WHISPER_LANGUAGE = "auto"
+DEFAULT_NEMOTRON_LANGUAGE = "es"
 DEFAULT_NUM_CTX = 8192
 DEFAULT_IDLE_UNLOAD_SEC = 180
 

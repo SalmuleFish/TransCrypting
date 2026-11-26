@@ -2944,6 +2944,11 @@ html[data-theme="dark"] .composer-dock::before {
   background: var(--obsidian);
 }
 
+.bento-switch-input:focus-visible + .bento-switch {
+  outline: 2px solid var(--text-dark);
+  outline-offset: 3px;
+}
+
 .bento-switch-input:checked + .bento-switch::after {
   transform: translateX(20px);
   background: var(--lime);

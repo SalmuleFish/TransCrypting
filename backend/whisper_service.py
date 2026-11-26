@@ -1,4 +1,4 @@
-"""Local Whisper and Parakeet transcription and ffmpeg audio preparation."""
+"""Local audio transcription and ffmpeg audio preparation."""
 
 from __future__ import annotations
 
@@ -20,7 +20,10 @@ import httpx
 
 from backend.config import (
     HTML5_PLAYABLE_EXTENSIONS,
+    MLX_ASR_MODELS,
+    MLX_ASR_SUPPORTED,
     MODELS_DIR,
+    NEMOTRON_MODEL_ID,
     PARAKEET_MODEL_ID,
     PARAKEET_MODEL_REPO,
     PARAKEET_MODELS_DIR,
@@ -417,6 +420,35 @@ class WhisperService:
                 return self.active_device
 
         self.unload()
+        if model_name in MLX_ASR_MODELS:
+            preset = MLX_ASR_MODELS[model_name]
+            if not MLX_ASR_SUPPORTED:
+                raise RuntimeError(f"{preset['engine']} requiere Apple Silicon y el paquete mlx-audio.")
+            if pref == "cuda":
+                raise RuntimeError(f"Selecciona Automático o CPU para usar {preset['engine']}.")
+
+            import mlx.core as mx
+            from huggingface_hub import snapshot_download
+            from huggingface_hub.errors import LocalEntryNotFoundError
+            from mlx_audio.stt import load
+
+            patterns = ["*.json", "*.safetensors", "*.txt", "*.model"]
+            try:
+                snapshot = Path(snapshot_download(preset["repo"], local_files_only=True, allow_patterns=patterns))
+            except LocalEntryNotFoundError:
+                snapshot = None
+            files = ("config.json", "model.safetensors", "tokenizer.model") if model_name == NEMOTRON_MODEL_ID else (
+                "config.json", "model.safetensors", "vocab.json", "merges.txt", "preprocessor_config.json", "tokenizer_config.json",
+            )
+            if snapshot is None or not all((snapshot / name).is_file() for name in files):
+                snapshot = Path(snapshot_download(preset["repo"], allow_patterns=patterns))
+            device = "metal" if pref != "cpu" and mx.metal.is_available() else "cpu"
+            with mx.stream(mx.gpu if device == "metal" else mx.cpu):
+                self._model = load(str(snapshot))
+            self._model_name = model_name
+            self.active_device = device
+            return device
+
         if model_name == PARAKEET_MODEL_ID:
             if not PARAKEET_SUPPORTED:
                 try:
@@ -723,12 +755,16 @@ class WhisperService:
         if model is None:
             raise RuntimeError("El modelo de transcripción no está cargado.")
         use_parakeet = self._model_name == PARAKEET_MODEL_ID
-        use_whisper_metal = not use_parakeet and self.active_device == "metal"
+        use_mlx_asr = self._model_name in MLX_ASR_MODELS
+        use_nemotron = self._model_name == NEMOTRON_MODEL_ID
+        use_whisper_metal = not (use_parakeet or use_mlx_asr) and self.active_device == "metal"
 
         if cancel_event is not None and cancel_event.is_set():
             raise WhisperCancelledError("Transcripción detenida por el usuario.")
 
         lang_arg = None if not language or language == "auto" else language
+        if use_nemotron and lang_arg is None:
+            raise RuntimeError("Selecciona el idioma del audio en Ajustes para usar Nemotron.")
         enhanced_tmp: Path | None = None
         target_audio = audio_path
         if classroom_enhance:
@@ -765,6 +801,25 @@ class WhisperService:
                 if cancel_event is not None and cancel_event.is_set():
                     raise WhisperCancelledError("Transcripción detenida por el usuario.")
                 segments_iter = ((seg.start, seg.end, seg.text, seg.tokens) for seg in result.sentences)
+            elif use_mlx_asr:
+                import mlx.core as mx
+                from faster_whisper.audio import decode_audio
+
+                audio = decode_audio(str(target_audio), sampling_rate=16000)
+                total_duration = audio.size / 16000
+                if cancel_event is not None and cancel_event.is_set():
+                    raise WhisperCancelledError("Transcripción detenida por el usuario.")
+                detected_lang = lang_arg or ""
+                with mx.stream(mx.gpu if self.active_device == "metal" else mx.cpu):
+                    if use_nemotron:
+                        result = model.generate(audio, language=lang_arg)
+                        segments_iter = ((seg.start, seg.end, seg.text, seg.tokens) for seg in result.sentences)
+                    else:
+                        result = model.generate(audio, language=lang_arg, chunk_duration=45.0)
+                        detected_lang = detected_lang or next((lang for lang in result.language if lang), "")
+                        segments_iter = ((seg["start"], seg["end"], seg["text"], None) for seg in result.segments)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise WhisperCancelledError("Transcripción detenida por el usuario.")
             elif use_whisper_metal:
                 from _pywhispercpp import whisper_full_lang_id, whisper_lang_str
                 from faster_whisper.audio import decode_audio
@@ -854,7 +909,8 @@ class WhisperService:
 
     def unload(self) -> None:
         """Release transcription weights and any cached device memory."""
-        clear_mlx_cache = self._model_name == PARAKEET_MODEL_ID and self.active_device == "metal"
+        mlx_model = self._model_name == PARAKEET_MODEL_ID or self._model_name in MLX_ASR_MODELS
+        clear_mlx_cache = mlx_model and self.active_device == "metal"
         if self._model is not None:
             del self._model
             self._model = None

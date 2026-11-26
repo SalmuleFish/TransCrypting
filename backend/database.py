@@ -17,10 +17,12 @@ from backend.config import (
     AUDIO_DIR,
     DB_PATH,
     DEFAULT_IDLE_UNLOAD_SEC,
+    DEFAULT_NEMOTRON_LANGUAGE,
     DEFAULT_NUM_CTX,
     DEFAULT_WHISPER_DEVICE,
     DEFAULT_WHISPER_LANGUAGE,
     DEFAULT_WHISPER_MODEL,
+    NEMOTRON_MODEL_ID,
     PODCASTS_DIR,
     SOURCES_DIR,
 )
@@ -131,6 +133,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "classroom_audio_enhance": "true",
     "enable_thinking": "false",
     "eco_mode": "false",
+    "auto_summarize": "true",
     "eco_cpu_threads": "2",
     "theme": "light",
 }
@@ -1300,23 +1303,27 @@ class Database:
             conn = self._get_conn()
             rows = conn.execute("SELECT key, value FROM settings").fetchall()
             raw = {**DEFAULT_SETTINGS, **{r["key"]: r["value"] for r in rows}}
+        language = raw["whisper_language"]
+        if raw["whisper_model"] == NEMOTRON_MODEL_ID and language in ("", "auto"):
+            language = DEFAULT_NEMOTRON_LANGUAGE
         return {
             "ollama_model": raw["ollama_model"],
             "whisper_model": raw["whisper_model"],
             "whisper_device": raw["whisper_device"],
-            "whisper_language": raw["whisper_language"],
+            "whisper_language": language,
             "num_ctx": int(raw["num_ctx"]),
             "idle_unload_sec": int(raw["idle_unload_sec"]),
             "classroom_audio_enhance": self._parse_bool(raw.get("classroom_audio_enhance", "true"), True),
             "enable_thinking": self._parse_bool(raw.get("enable_thinking", "false"), False),
             "eco_mode": self._parse_bool(raw.get("eco_mode", "false"), False),
+            "auto_summarize": self._parse_bool(raw["auto_summarize"], True),
             "eco_cpu_threads": max(1, int(raw.get("eco_cpu_threads", "2"))),
             "theme": "dark" if str(raw.get("theme", "light")).lower() == "dark" else "light",
         }
 
     def update_settings(self, updates: dict[str, Any]) -> dict[str, Any]:
         allowed = set(DEFAULT_SETTINGS.keys())
-        bool_keys = {"classroom_audio_enhance", "enable_thinking", "eco_mode"}
+        bool_keys = {"classroom_audio_enhance", "enable_thinking", "eco_mode", "auto_summarize"}
         with self._lock:
             conn = self._get_conn()
             for key, val in updates.items():

@@ -7,7 +7,7 @@
   <meta name="color-scheme" content="light dark" />
   <title>TransCrypting — Transcripción, Resumen y Chat Local</title>
   <link rel="icon" type="image/x-icon" href="/icon.ico" />
-  <link rel="stylesheet" href="/styles.css?v=2" />
+  <link rel="stylesheet" href="/styles.css?v=3" />
 </head>
 <body>
   <div id="app-shell" class="studio-shell">
@@ -47,10 +47,10 @@
           id="btn-stop-ai"
           type="button"
           class="stop-ai-pill hidden"
-          title="Detener de forma forzada cualquier generación o procesamiento de IA activo"
+          title="Detener la tarea activa"
         >
           <span class="stop-sq" aria-hidden="true"></span>
-          <span>Detener IA</span>
+          <span>Detener</span>
         </button>
 
         <div class="telemetry-anchor">
@@ -362,6 +362,7 @@
               <option value="it">Italiano</option>
             </select>
             <small id="parakeet-language-hint" class="hidden">Parakeet detecta el idioma automáticamente.</small>
+            <small id="nemotron-language-hint" class="hidden">Nemotron necesita que elijas el idioma del audio.</small>
           </div>
 
           <div class="field">
@@ -386,6 +387,16 @@
         </div>
 
         <div class="toggles-group">
+          <label class="toggle-row">
+            <div class="toggle-copy">
+              <span class="toggle-title" id="auto-summarize-label">Resúmenes y sugerencias automáticos</span>
+              <small id="auto-summarize-help">Al desactivarlo, las fuentes quedan listas tras la transcripción o indexación. Puedes pedir el resumen desde la pestaña Resumen.</small>
+            </div>
+            <input id="set-auto-summarize" type="checkbox" role="switch" class="bento-switch-input"
+              aria-labelledby="auto-summarize-label" aria-describedby="auto-summarize-help" checked />
+            <span class="bento-switch" aria-hidden="true"></span>
+          </label>
+
           <label class="toggle-row">
             <div class="toggle-copy">
               <span class="toggle-title">Modo Eco / Laptop (ahorro de batería)</span>

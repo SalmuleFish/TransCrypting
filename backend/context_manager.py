@@ -388,6 +388,7 @@ def build_recording_summary_messages(
         truncated_note = "Nota: la transcripción es extensa y fue condensada a sus secciones principales.\n"
 
     duration_str = format_timestamp(duration_sec) if duration_sec > 0 else "desconocida"
+    max_words = max(100, min(400, len(clean_text) // 40))
     system_prompt = (
         "Eres un asistente experto en análisis de grabaciones de audio y clases. "
         "Responde siempre en español claro y estructurado. "
@@ -397,7 +398,8 @@ def build_recording_summary_messages(
     user_prompt = (
         f"Archivo de audio: {filename} (duración: {duration_str})\n"
         f"{truncated_note}\n"
-        "Genera un resumen útil y bien organizado en Markdown con estas secciones:\n"
+        f"Resume en un máximo de {max_words} palabras. Evita repetir información entre secciones.\n"
+        "Usa estas secciones en Markdown:\n"
         "### Resumen general\n"
         "Párrafo breve explicando de qué trata la grabación.\n\n"
         "### Puntos clave\n"
@@ -415,10 +417,25 @@ def build_recording_summary_messages(
 def build_combined_summary_messages(
     recordings: list[dict[str, Any]],
     sources: list[dict[str, Any]] | None = None,
+    *,
+    max_input_chars: int = 12000,
 ) -> list[dict[str, str]]:
     """Build prompt messages to synthesize multiple enabled recordings and sources in one conversation."""
     active_recs = [r for r in recordings if r.get("enabled", True) and (r.get("summary_text") or r.get("transcript_text"))]
     active_srcs = [s for s in (sources or []) if s.get("enabled", True) and (s.get("summary_text") or s.get("extracted_text"))]
+    total_items = len(active_recs) + len(active_srcs)
+    chars_per_item = min(2500, max(1, max_input_chars // max(1, total_items)))
+
+    def excerpt(summary: str) -> str:
+        if len(summary) <= chars_per_item:
+            return summary
+        marker = "\n[…]\n"
+        if chars_per_item < len(marker) + 2:
+            return summary[:chars_per_item]
+        remaining = chars_per_item - len(marker)
+        head = remaining // 2
+        return summary[:head] + marker + summary[-(remaining - head):]
+
     parts = []
     for idx, rec in enumerate(active_recs, start=1):
         duration_str = format_timestamp(float(rec.get("duration_sec") or 0.0))
@@ -426,7 +443,7 @@ def build_combined_summary_messages(
         if not summary:
             summary = (rec.get("transcript_text") or "")[:2000].strip()
         parts.append(
-            f"=== Grabación {idx}: {rec['filename']} (duración {duration_str}) ===\n{summary}"
+            f"=== Grabación {idx}: {rec['filename']} (duración {duration_str}) ===\n{excerpt(summary)}"
         )
 
     for idx, src in enumerate(active_srcs, start=1):
@@ -435,10 +452,9 @@ def build_combined_summary_messages(
             summary = (src.get("extracted_text") or "")[:2000].strip()
         kind = str(src.get("source_type") or "documento").upper()
         parts.append(
-            f"=== Fuente {idx} ({kind}): {src['filename']} ===\n{summary}"
+            f"=== Fuente {idx} ({kind}): {src['filename']} ===\n{excerpt(summary)}"
         )
 
-    total_items = len(active_recs) + len(active_srcs)
     joined = "\n\n".join(parts)
     system_prompt = (
         "Eres un asistente experto en sintetizar múltiples fuentes de estudio (grabaciones, PDFs, diapositivas e imágenes) de una misma conversación. "
@@ -447,11 +463,12 @@ def build_combined_summary_messages(
     user_prompt = (
         f"Esta conversación contiene {total_items} fuente(s) activa(s) "
         f"({len(active_recs)} grabación(es) y {len(active_srcs)} documento(s)/imagen(es)). "
-        "Crea un resumen unificado en Markdown que conecte toda la información:\n"
+        "Escribe un resumen unificado en Markdown de hasta 400 palabras. "
+        "Evita repetir información entre secciones.\n"
         "### Síntesis global\n"
         "Panorama general considerando todas las fuentes activas.\n\n"
         "### Qué aporta cada fuente y cómo se complementan\n"
-        "- Menciona explícitamente los puntos clave o aportes por archivo.\n\n"
+        "- Usa una viñeta breve por archivo para explicar su aporte.\n\n"
         "### Conclusiones y puntos clave consolidados\n"
         "- Lista final de conceptos esenciales, acuerdos o pendientes vigentes.\n\n"
         f"Resúmenes individuales:\n{joined}"
