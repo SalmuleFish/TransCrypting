@@ -7,7 +7,7 @@
   <meta name="color-scheme" content="light dark" />
   <title>TransCrypting — Transcripción, Resumen y Chat Local</title>
   <link rel="icon" type="image/x-icon" href="/icon.ico" />
-  <link rel="stylesheet" href="/styles.css?v=7" />
+  <link rel="stylesheet" href="/styles.css?v=10" />
 </head>
 <body>
   <div id="app-shell" class="studio-shell">
@@ -525,12 +525,12 @@
   <div id="rename-modal" class="modal-backdrop">
     <div class="modal-card compact">
       <div class="modal-header">
-        <h2>Renombrar conversación</h2>
+        <h2 id="rename-modal-title">Renombrar conversación</h2>
         <button id="btn-close-rename" class="icon-ghost">✕</button>
       </div>
       <form id="rename-form" class="modal-body">
         <label class="field">
-          <span>Nombre de la conversación</span>
+          <span id="rename-label">Nombre de la conversación</span>
           <input
             id="rename-input"
             type="text"
@@ -662,6 +662,6 @@
 
   <div id="toast-container" class="toast-container"></div>
 
-  <script src="/app.js"></script>
+  <script src="/app.js?v=10"></script>
 </body>
 </html>

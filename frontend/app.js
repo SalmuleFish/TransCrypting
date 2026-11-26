@@ -19,8 +19,10 @@ const state = {
   activeTab: "summary",
   isStreaming: false,
   isResummarizing: false,
+  summarizingRecId: null,
   chatAbortController: null,
   resummarizeAbortController: null,
+  recSummaryAbortController: null,
   quizAbortController: null,
   quizGradeAbortController: null,
   stoppingAI: false,
@@ -39,6 +41,8 @@ const state = {
   cancellingPodcastId: null,
   transcriptRecFilter: null,
   transcriptSpeakerFilter: null,
+  collapsedRecSummaries: new Set(),
+  renameTarget: null,
   captureMode: "mic",
 };
 
@@ -339,78 +343,181 @@ function enhanceTimestampsInHtml(html) {
   return parts.join("").replace(/@@PROTECTED_CODE_(\d+)@@/g, (_, idx) => protectedCode[Number(idx)] || "");
 }
 
+function splitMdTableRow(line) {
+  const safe = line.replace(/\\\|/g, "\u0001");
+  const rawCells = safe.split("|");
+  if (rawCells.length && rawCells[0].trim() === "") rawCells.shift();
+  if (rawCells.length && rawCells[rawCells.length - 1].trim() === "") rawCells.pop();
+  return rawCells.map((c) => c.trim().replace(/\u0001/g, "|"));
+}
+
+function parseMdTableAlignments(line) {
+  if (!line || !line.includes("|")) return null;
+  const cells = splitMdTableRow(line);
+  if (!cells.length) return null;
+  const aligns = [];
+  for (const cell of cells) {
+    if (!/^:?-{2,}:?$/.test(cell)) return null;
+    if (cell.startsWith(":") && cell.endsWith(":")) aligns.push("center");
+    else if (cell.endsWith(":")) aligns.push("right");
+    else aligns.push("left");
+  }
+  return aligns;
+}
+
 function renderMarkdown(raw, withTimestampPills = false) {
-  const escaped = escapeHtml(raw || "");
+  const escaped = escapeHtml(raw || "").replace(/\r\n/g, "\n");
   const codeBlocks = [];
-  const text = escaped.replace(/```([\s\S]*?)```/g, (_, code) => {
+  const makeCodeHtml = (lang, code) => {
     const idx = codeBlocks.length;
-    codeBlocks.push(`<pre><code>${code.trim()}</code></pre>`);
-    return `@@CODEBLOCK_${idx}@@`;
-  });
+    const label = (lang || "").trim() || "código";
+    const body = (code || "").replace(/^\n+|\n+$/g, "");
+    codeBlocks.push(
+      `<div class="md-code-block"><div class="md-code-head"><span class="md-code-lang">${label}</span><button type="button" class="md-code-copy">Copiar</button></div><pre><code>${body}</code></pre></div>`
+    );
+    return `\n@@CODEBLOCK_${idx}@@\n`;
+  };
+
+  let text = escaped.replace(/```([a-zA-Z0-9_+-]*)[ \t]*\n?([\s\S]*?)```/g, (_, lang, code) => makeCodeHtml(lang, code));
+  // Gracefully close trailing unclosed fence during live token streaming
+  text = text.replace(/```([a-zA-Z0-9_+-]*)[ \t]*\n([\s\S]*)$/, (_, lang, code) => makeCodeHtml(lang, code));
+
+  const formatInline = (line) => {
+    const inlineCodes = [];
+    let masked = (line || "").replace(/`([^`\n]+)`/g, (_, code) => {
+      const idx = inlineCodes.length;
+      inlineCodes.push(`<code>${code}</code>`);
+      return `\u0002IC_${idx}\u0003`;
+    });
+    masked = masked
+      .replace(/\*\*\*([^*\n]+)\*\*\*/g, "<strong><em>$1</em></strong>")
+      .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/~~([^~\n]+)~~/g, "<del>$1</del>")
+      .replace(/(^|[\s(>])\*([^*\n]+)\*(?=[\s.,;:!?)]|$)/g, "$1<em>$2</em>")
+      .replace(/(^|[\s(>])_([^_\n]+)_(?=[\s.,;:!?)]|$)/g, "$1<em>$2</em>");
+    return masked.replace(/\u0002IC_(\d+)\u0003/g, (_, idx) => inlineCodes[Number(idx)] || "");
+  };
 
   const lines = text.split("\n");
   const out = [];
-  let inList = false;
+  let listTag = null;
+  let quoteLines = null;
 
-  const formatInline = (line) =>
-    line
-      .replace(/`([^`]+)`/g, "<code>$1</code>")
-      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s.,;:!?)]|$)/g, "$1<em>$2</em>")
-      .replace(/(^|[\s(])_([^_\n]+)_(?=[\s.,;:!?)]|$)/g, "$1<em>$2</em>");
+  const closeList = () => {
+    if (listTag) {
+      out.push(`</${listTag}>`);
+      listTag = null;
+    }
+  };
+  const flushQuote = () => {
+    if (quoteLines) {
+      out.push(`<blockquote>${quoteLines.map((l) => formatInline(l)).join("<br/>")}</blockquote>`);
+      quoteLines = null;
+    }
+  };
 
-  for (const rawLine of lines) {
+  for (let i = 0; i < lines.length; i += 1) {
+    const rawLine = lines[i];
     const line = rawLine.trimEnd();
-    if (/^@@CODEBLOCK_\d+@@$/.test(line.trim())) {
-      if (inList) {
-        out.push("</ul>");
-        inList = false;
-      }
-      out.push(line.trim());
+    const trimmed = line.trim();
+
+    const codeMatch = trimmed.match(/^@@CODEBLOCK_(\d+)@@$/);
+    if (codeMatch) {
+      closeList();
+      flushQuote();
+      out.push(trimmed);
       continue;
     }
 
-    const heading = line.match(/^(#{1,4})\s+(.*)$/);
-    if (heading) {
-      if (inList) {
-        out.push("</ul>");
-        inList = false;
+    const quote = line.match(/^\s*&gt;\s?(.*)$/);
+    if (quote) {
+      closeList();
+      if (!quoteLines) quoteLines = [];
+      quoteLines.push(quote[1]);
+      continue;
+    }
+    flushQuote();
+
+    // GFM Table: header row containing '|' followed by valid separator row
+    if (trimmed.includes("|") && i + 1 < lines.length) {
+      const aligns = parseMdTableAlignments(lines[i + 1].trim());
+      if (aligns) {
+        closeList();
+        const headerCells = splitMdTableRow(trimmed);
+        const colCount = Math.max(aligns.length, headerCells.length);
+        const ths = Array.from({ length: colCount }, (_, c) => {
+          const align = aligns[c] && aligns[c] !== "left" ? ` style="text-align:${aligns[c]}"` : "";
+          return `<th${align}>${formatInline(headerCells[c] || "")}</th>`;
+        }).join("");
+
+        i += 2;
+        const bodyRows = [];
+        while (i < lines.length) {
+          const rowLine = lines[i].trim();
+          if (!rowLine || !rowLine.includes("|") || /^@@CODEBLOCK_\d+@@$/.test(rowLine) || /^(#{1,6})\s/.test(rowLine)) {
+            i -= 1;
+            break;
+          }
+          const cells = splitMdTableRow(rowLine);
+          if (!cells.length) {
+            i -= 1;
+            break;
+          }
+          const tds = Array.from({ length: colCount }, (_, c) => {
+            const align = aligns[c] && aligns[c] !== "left" ? ` style="text-align:${aligns[c]}"` : "";
+            return `<td${align}>${formatInline(cells[c] || "")}</td>`;
+          }).join("");
+          bodyRows.push(`<tr>${tds}</tr>`);
+          i += 1;
+        }
+        const tbodyHtml = bodyRows.length ? `<tbody>${bodyRows.join("")}</tbody>` : "";
+        out.push(`<div class="md-table-wrap"><table class="md-table"><thead><tr>${ths}</tr></thead>${tbodyHtml}</table></div>`);
+        continue;
       }
+    }
+
+    if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      closeList();
+      out.push('<hr class="md-hr" />');
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      closeList();
       const lvl = heading[1].length;
       out.push(`<h${lvl}>${formatInline(heading[2])}</h${lvl}>`);
       continue;
     }
 
-    const quote = line.match(/^&gt;\s?(.*)$/);
-    if (quote) {
-      if (inList) {
-        out.push("</ul>");
-        inList = false;
+    const ulMatch = line.match(/^\s*[-*•]\s+(.*)$/);
+    const olMatch = !ulMatch ? line.match(/^\s*\d+[.)]\s+(.*)$/) : null;
+    if (ulMatch || olMatch) {
+      const targetTag = ulMatch ? "ul" : "ol";
+      if (listTag && listTag !== targetTag) closeList();
+      if (!listTag) {
+        out.push(`<${targetTag}>`);
+        listTag = targetTag;
       }
-      out.push(`<blockquote>${formatInline(quote[1])}</blockquote>`);
+      let itemBody = ulMatch ? ulMatch[1] : olMatch[1];
+      const taskMatch = itemBody.match(/^\[(x|X| )\]\s+(.*)$/);
+      if (taskMatch) {
+        const checked = taskMatch[1].toLowerCase() === "x";
+        itemBody = `<span class="md-task-box ${checked ? "done" : ""}" aria-hidden="true">${checked ? "✓" : ""}</span><span>${formatInline(taskMatch[2])}</span>`;
+        out.push(`<li class="md-task-item">${itemBody}</li>`);
+      } else {
+        out.push(`<li>${formatInline(itemBody)}</li>`);
+      }
       continue;
     }
 
-    const bullet = line.match(/^\s*[-*•]\s+(.*)$/) || line.match(/^\s*\d+\.\s+(.*)$/);
-    if (bullet) {
-      if (!inList) {
-        out.push("<ul>");
-        inList = true;
-      }
-      out.push(`<li>${formatInline(bullet[1])}</li>`);
-      continue;
-    }
-
-    if (inList) {
-      out.push("</ul>");
-      inList = false;
-    }
-
-    if (line.trim() === "") continue;
+    closeList();
+    if (trimmed === "") continue;
     out.push(`<p>${formatInline(line)}</p>`);
   }
 
-  if (inList) out.push("</ul>");
+  closeList();
+  flushQuote();
   let html = out.join("").replace(/@@CODEBLOCK_(\d+)@@/g, (_, idx) => codeBlocks[Number(idx)] || "");
   if (withTimestampPills) {
     html = enhanceTimestampsInHtml(html);
@@ -424,6 +531,7 @@ const ICON_PLAY = `<svg viewBox="0 0 24 24" width="13" height="13" fill="current
 const ICON_PAUSE = `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
 const ICON_TRASH = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>`;
 const ICON_RETRANSCRIBE = `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>`;
+const ICON_RENAME = `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>`;
 const ICON_CHEVRON = `<svg class="bento-select-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`;
 const ICON_CHECK = `<svg class="bento-select-check" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
 const ICON_SPARKLE = `<svg class="chip-sparkle" viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M12 2.5L14.4 9.6L21.5 12L14.4 14.4L12 21.5L9.6 14.4L2.5 12L9.6 9.6Z"/></svg>`;
@@ -708,7 +816,11 @@ function closeConfirm() {
 
 function openRenameModal() {
   if (!state.activeSession) return;
+  state.renameTarget = { kind: "session", id: state.activeSession.id };
+  document.getElementById("rename-modal-title").textContent = "Renombrar conversación";
+  document.getElementById("rename-label").textContent = "Nombre de la conversación";
   const input = document.getElementById("rename-input");
+  input.placeholder = "Ej. Clase de Ética — Repaso";
   input.value = state.activeSession.title || "";
   openModal("rename-modal");
   setTimeout(() => {
@@ -717,7 +829,32 @@ function openRenameModal() {
   }, 60);
 }
 
+function openSourceRenameModal(kind, item) {
+  if (!item || !item.id) return;
+  const sessionId = item.session_id || state.activeSessionId;
+  if (!sessionId) return;
+  state.renameTarget = { kind, sessionId, id: item.id };
+  document.getElementById("rename-modal-title").textContent =
+    kind === "recording" ? "Renombrar audio" : "Renombrar fuente";
+  document.getElementById("rename-label").textContent = "Nombre de la fuente";
+  const input = document.getElementById("rename-input");
+  input.placeholder = kind === "recording" ? "Ej. Clase 04 — Introducción.wav" : "Ej. Guía Unidad 2.pdf";
+  const current = item.filename || "";
+  input.value = current;
+  openModal("rename-modal");
+  setTimeout(() => {
+    input.focus();
+    const dot = current.lastIndexOf(".");
+    if (dot > 0 && dot < current.length - 1) {
+      input.setSelectionRange(0, dot);
+    } else {
+      input.select();
+    }
+  }, 60);
+}
+
 function closeRenameModal() {
+  state.renameTarget = null;
   closeModal("rename-modal");
 }
 
@@ -729,7 +866,7 @@ function isAbortError(err) {
 }
 
 function isAnyAIWorkActive() {
-  if (state.isStreaming || state.isResummarizing || state.podcastBusy) return true;
+  if (state.isStreaming || state.isResummarizing || state.summarizingRecId || state.podcastBusy) return true;
   const res = state.systemStatus?.resources;
   if (res?.active_operation) return true;
   if (res?.phase && ["llm", "whisper", "podcast"].includes(res.phase)) return true;
@@ -779,6 +916,7 @@ async function stopActiveAIOperation() {
   try {
     if (state.chatAbortController) state.chatAbortController.abort();
     if (state.resummarizeAbortController) state.resummarizeAbortController.abort();
+    if (state.recSummaryAbortController) state.recSummaryAbortController.abort();
     if (state.quizAbortController) state.quizAbortController.abort();
     if (state.quizGradeAbortController) state.quizGradeAbortController.abort();
 
@@ -816,6 +954,9 @@ async function forceStopAllAI(options = {}) {
     }
     if (state.resummarizeAbortController) {
       state.resummarizeAbortController.abort();
+    }
+    if (state.recSummaryAbortController) {
+      state.recSummaryAbortController.abort();
     }
     if (state.quizAbortController) {
       state.quizAbortController.abort();
@@ -857,6 +998,70 @@ async function stopResummarizeGeneration() {
     state.resummarizeAbortController.abort();
   }
   await stopBackendAIGeneration();
+}
+
+async function stopRecordingSummaryGeneration() {
+  if (state.recSummaryAbortController) {
+    state.recSummaryAbortController.abort();
+  }
+  await stopBackendAIGeneration();
+}
+
+async function generateRecordingSummary(recId) {
+  if (!state.activeSessionId || !recId || state.podcastBusy) return;
+  if (state.summarizingRecId === recId) {
+    await stopRecordingSummaryGeneration();
+    return;
+  }
+  if (state.summarizingRecId) {
+    showToast("Ya se está generando el resumen de otro audio.");
+    return;
+  }
+
+  const sessionId = state.activeSessionId;
+  const controller = new AbortController();
+  state.recSummaryAbortController = controller;
+  state.summarizingRecId = recId;
+  state.collapsedRecSummaries.delete(recId);
+  syncGlobalStopButton();
+  invalidateMemo("content-pane");
+  if (state.activeSession) {
+    renderTranscriptTab(state.activeSession);
+  }
+
+  try {
+    const fresh = await api(`/api/sessions/${sessionId}/resummarize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({ recording_id: recId, update_combined: false }),
+    });
+    if (state.activeSessionId === sessionId) {
+      state.activeSession = fresh;
+      invalidateMemo("summary-pane");
+      invalidateMemo("content-pane");
+      renderSummaryTab(fresh);
+    }
+    showToast("Resumen del audio actualizado.");
+  } catch (err) {
+    if (controller.signal.aborted || isAbortError(err)) {
+      showToast("Resumen detenido.");
+    } else {
+      showToast(err.message, true);
+    }
+  } finally {
+    if (state.recSummaryAbortController === controller) {
+      state.recSummaryAbortController = null;
+    }
+    if (state.summarizingRecId === recId) {
+      state.summarizingRecId = null;
+    }
+    syncGlobalStopButton();
+    invalidateMemo("content-pane");
+    if (state.activeSession) {
+      renderTranscriptTab(state.activeSession);
+    }
+  }
 }
 
 async function stopQuizGeneration() {
@@ -1876,6 +2081,17 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     };
 
     if (!isWorking) {
+      const renameRecBtn = document.createElement("button");
+      renameRecBtn.type = "button";
+      renameRecBtn.className = "rename-source-btn";
+      renameRecBtn.title = "Renombrar audio";
+      renameRecBtn.innerHTML = ICON_RENAME;
+      renameRecBtn.onclick = (e) => {
+        e.stopPropagation();
+        openSourceRenameModal("recording", rec);
+      };
+      rightBtns.appendChild(renameRecBtn);
+
       const retransBtn = document.createElement("button");
       retransBtn.type = "button";
       retransBtn.className = "retranscribe-btn";
@@ -2093,6 +2309,17 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     }
 
     if (!isWorking) {
+      const renameSrcBtn = document.createElement("button");
+      renameSrcBtn.type = "button";
+      renameSrcBtn.className = "rename-source-btn";
+      renameSrcBtn.title = "Renombrar fuente";
+      renameSrcBtn.innerHTML = ICON_RENAME;
+      renameSrcBtn.onclick = (e) => {
+        e.stopPropagation();
+        openSourceRenameModal("source", src);
+      };
+      rightBtns.appendChild(renameSrcBtn);
+
       const reprocessBtn = document.createElement("button");
       reprocessBtn.type = "button";
       reprocessBtn.className = "retranscribe-btn";
@@ -2241,7 +2468,7 @@ function resolveRecordingForTimestamp(triggerEl, seconds) {
   );
   if (recordings.length === 0) return null;
 
-  const explicitRecId = triggerEl?.dataset?.recId;
+  const explicitRecId = triggerEl?.dataset?.recId || triggerEl?.closest("[data-rec-id]")?.dataset?.recId;
   if (explicitRecId && recordings.some((r) => r.id === explicitRecId)) {
     return explicitRecId;
   }
@@ -2338,8 +2565,8 @@ function renderSummaryTab(session, animateReveal = false) {
   const summarySig = [
     session.id,
     session.combined_summary || "",
-    readyRecs.map((r) => `${r.id}:${(r.summary_text || "").length}:${r.whisper_model || ""}`).join(","),
-    readySrcs.map((s) => `${s.id}:${(s.summary_text || "").length}:${s.page_count || 0}`).join(","),
+    readyRecs.map((r) => `${r.id}:${r.filename}:${(r.summary_text || "").length}:${r.whisper_model || ""}`).join(","),
+    readySrcs.map((s) => `${s.id}:${s.filename}:${(s.summary_text || "").length}:${s.page_count || 0}`).join(","),
   ].join("|");
   if (!animateReveal && !memoChanged("summary-pane", summarySig)) return;
   if (animateReveal) renderMemo.set("summary-pane", summarySig);
@@ -2376,10 +2603,17 @@ function renderSummaryTab(session, animateReveal = false) {
         <button type="button" class="pill-btn dark sm eco-generate-summary-btn">Generar resumen ahora</button>
       </div>`;
 
+  const cardClass = summaryMarkdown
+    ? `content-card combined ai-summary-glow ${revealClass}`
+    : `content-card combined ${revealClass}`;
+  const headerTitle = summaryMarkdown
+    ? `<span class="ai-summary-title-group"><span class="ai-sparkle-badge" aria-hidden="true">✦ IA</span><span>Resumen general de la sesión</span></span>`
+    : `<span>Resumen general de la sesión</span>`;
+
   pane.innerHTML = `
-    <div class="content-card combined ${revealClass}">
+    <div class="${cardClass}">
       <div class="content-card-header">
-        <span>Resumen general de la sesión</span>
+        ${headerTitle}
         <span class="card-badge lime">${totalActive} fuente(s) activa(s)</span>
       </div>
       ${chipsHtml ? `<div class="summary-sources-strip">${chipsHtml}</div>` : ""}
@@ -2432,9 +2666,11 @@ function renderTranscriptTab(session) {
     state.transcriptRecFilter || "grid",
     state.transcriptSpeakerFilter || "",
     activeRec?.status || "",
+    state.summarizingRecId || "",
+    state.podcastBusy ? "1" : "0",
     activeSpkList.join(","),
-    recordings.map((r) => `${r.id}:${(r.transcript_text || "").length}:${(r.segments || []).length}:${r.whisper_model || ""}`).join(","),
-    sources.map((s) => s.id).join(","),
+    recordings.map((r) => `${r.id}:${r.filename}:${r.status || ""}:${(r.transcript_text || "").length}:${(r.segments || []).length}:${(r.summary_text || "").length}:${r.whisper_model || ""}`).join(","),
+    sources.map((s) => `${s.id}:${s.filename}`).join(","),
   ].join("|");
   if (!memoChanged("content-pane", contentSig)) return;
   transcriptPlayback = null;
@@ -2478,7 +2714,7 @@ function renderTranscriptTab(session) {
     galleryHead.className = "transcript-gallery-head";
     galleryHead.innerHTML = `
       <span class="transcript-gallery-title">Audios transcritos (${recordings.length})</span>
-      <span class="transcript-gallery-hint">Haz clic en un audio para leer su transcripción completa</span>
+      <span class="transcript-gallery-hint">Haz clic en un audio para consultar su resumen individual y transcripción completa</span>
     `;
     pane.appendChild(galleryHead);
 
@@ -2562,6 +2798,20 @@ function renderTranscriptTab(session) {
         : `${wordCount} palabras`;
       meta.appendChild(segInfo);
 
+      const hasSummary = Boolean((rec.summary_text || "").trim());
+      const isRecSummarizing = state.summarizingRecId === rec.id || rec.status === "summarizing";
+      if (isRecSummarizing) {
+        const sumBadge = document.createElement("span");
+        sumBadge.className = "transcript-summary-badge is-loading";
+        sumBadge.textContent = "Resumiendo…";
+        meta.appendChild(sumBadge);
+      } else if (hasSummary) {
+        const sumBadge = document.createElement("span");
+        sumBadge.className = "transcript-summary-badge";
+        sumBadge.textContent = "✦ Resumen IA";
+        meta.appendChild(sumBadge);
+      }
+
       if (query && matchCount > 0) {
         const matchBadge = document.createElement("span");
         matchBadge.className = "transcript-match-badge";
@@ -2577,7 +2827,8 @@ function renderTranscriptTab(session) {
 
       const foot = document.createElement("div");
       foot.className = "transcript-card-foot";
-      foot.innerHTML = `<span>Abrir transcripción completa</span><span>→</span>`;
+      const footLabel = hasSummary ? "Ver resumen y transcripción" : "Abrir transcripción completa";
+      foot.innerHTML = `<span>${footLabel}</span><span>→</span>`;
       card.appendChild(foot);
 
       const openDetail = () => {
@@ -2647,11 +2898,15 @@ function renderTranscriptTab(session) {
   header.innerHTML = `
     <span>🎙 ${escapeHtml(activeRec.filename)}</span>
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      <button type="button" class="pill-btn outline xs transcript-detail-rename-btn" title="Renombrar audio">Renombrar</button>
       <button type="button" class="pill-btn outline xs transcript-detail-play-btn" title="Reproducir este audio">▶ Escuchar</button>
       ${activeRec.whisper_model && activeRec.transcript_text ? `<span class="card-badge">${escapeHtml(activeRec.whisper_model)}</span>` : ""}
       <span class="card-badge">${formatDuration(activeRec.duration_sec)}${activeRec.segments?.length ? " · Pulsa una frase para escucharla" : ""}</span>
     </div>
   `;
+  header.querySelector(".transcript-detail-rename-btn").onclick = () => {
+    openSourceRenameModal("recording", activeRec);
+  };
   header.querySelector(".transcript-detail-play-btn").onclick = () => {
     seekRecording(activeRec.id, 0, { pulse: true });
   };
@@ -2669,6 +2924,92 @@ function renderTranscriptTab(session) {
     pane.appendChild(card);
     return;
   }
+
+  const isRecSummarizing = state.summarizingRecId === activeRec.id || activeRec.status === "summarizing";
+  const recSummaryText = (activeRec.summary_text || "").trim();
+  const summaryBox = document.createElement("div");
+  summaryBox.className = "transcript-rec-summary-card";
+  summaryBox.dataset.recId = activeRec.id;
+
+  if (isRecSummarizing) {
+    const stopScope = state.summarizingRecId === activeRec.id ? "rec-summary" : "";
+    summaryBox.classList.add("ai-summary-glow", "is-generating");
+    summaryBox.innerHTML = `
+      <div class="transcript-rec-summary-head">
+        <span class="ai-summary-title-group">
+          <span class="ai-sparkle-badge" aria-hidden="true">✦ IA</span>
+          <span class="transcript-rec-summary-title">Resumen de este audio</span>
+        </span>
+      </div>
+      <div class="transcript-rec-summary-body">
+        ${buildSkeletonHtml(`${getActiveModelLabel()} está resumiendo este audio...`, true, stopScope)}
+      </div>
+    `;
+  } else if (recSummaryText) {
+    const isCollapsed = state.collapsedRecSummaries.has(activeRec.id);
+    summaryBox.classList.add("ai-summary-glow");
+    if (isCollapsed) summaryBox.classList.add("is-collapsed");
+    const disableGen = Boolean(state.podcastBusy || state.summarizingRecId);
+    summaryBox.innerHTML = `
+      <div class="transcript-rec-summary-head">
+        <button type="button" class="transcript-rec-summary-toggle" aria-expanded="${!isCollapsed}">
+          <svg class="transcript-rec-summary-chevron" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+          <span class="ai-sparkle-badge" aria-hidden="true">✦ IA</span>
+          <span>Resumen de este audio</span>
+        </button>
+        <div class="transcript-rec-summary-actions">
+          <button type="button" class="pill-btn outline xs rec-summary-copy-btn" title="Copiar resumen de este audio">Copiar</button>
+          <button type="button" class="pill-btn outline xs rec-summary-regen-btn" title="Regenerar resumen individual"${disableGen ? " disabled" : ""}>Regenerar</button>
+        </div>
+      </div>
+      <div class="transcript-rec-summary-body">
+        <div class="md">${renderMarkdown(recSummaryText, true)}</div>
+      </div>
+    `;
+    const toggleBtn = summaryBox.querySelector(".transcript-rec-summary-toggle");
+    toggleBtn.onclick = () => {
+      const collapsedNow = summaryBox.classList.toggle("is-collapsed");
+      toggleBtn.setAttribute("aria-expanded", String(!collapsedNow));
+      if (collapsedNow) {
+        state.collapsedRecSummaries.add(activeRec.id);
+      } else {
+        state.collapsedRecSummaries.delete(activeRec.id);
+      }
+    };
+    const copySumBtn = summaryBox.querySelector(".rec-summary-copy-btn");
+    copySumBtn.onclick = async () => {
+      if (!navigator.clipboard?.writeText) return;
+      await navigator.clipboard.writeText(recSummaryText);
+      const prev = copySumBtn.textContent;
+      copySumBtn.textContent = "✓ Copiado";
+      copySumBtn.classList.add("is-confirmed");
+      showToast("Resumen del audio copiado.");
+      setTimeout(() => {
+        copySumBtn.classList.remove("is-confirmed");
+        copySumBtn.textContent = prev;
+      }, 1600);
+    };
+    summaryBox.querySelector(".rec-summary-regen-btn").onclick = () => {
+      generateRecordingSummary(activeRec.id);
+    };
+  } else {
+    const disableGen = Boolean(state.podcastBusy || state.summarizingRecId);
+    summaryBox.classList.add("is-empty");
+    summaryBox.innerHTML = `
+      <div class="transcript-rec-summary-empty">
+        <div class="transcript-rec-summary-empty-copy">
+          <span class="transcript-rec-summary-title">Resumen individual</span>
+          <span class="transcript-rec-summary-hint">Aún no se ha generado un resumen para esta grabación.</span>
+        </div>
+        <button type="button" class="pill-btn dark xs rec-summary-gen-btn"${disableGen ? " disabled" : ""}>Generar resumen</button>
+      </div>
+    `;
+    summaryBox.querySelector(".rec-summary-gen-btn").onclick = () => {
+      generateRecordingSummary(activeRec.id);
+    };
+  }
+
+  card.appendChild(summaryBox);
 
   const segs = activeRec.segments || [];
   const speakerCounts = new Map();
@@ -6044,26 +6385,48 @@ function initEvents() {
   document.getElementById("btn-cancel-rename").onclick = closeRenameModal;
   document.getElementById("rename-form").onsubmit = async (e) => {
     e.preventDefault();
-    if (!state.activeSession) return;
+    const target = state.renameTarget || (state.activeSession ? { kind: "session", id: state.activeSession.id } : null);
+    if (!target) return;
     const input = document.getElementById("rename-input");
     const next = input.value.trim();
     if (!next) return;
     const saveBtn = document.getElementById("btn-save-rename");
     saveBtn.disabled = true;
     try {
-      await api(`/api/sessions/${state.activeSession.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: next }),
-      });
-      closeRenameModal();
-      await selectSession(state.activeSession.id);
-      await loadSessions(false);
-      const titleEl = document.getElementById("session-title");
-      titleEl.classList.remove("flash-confirm");
-      void titleEl.offsetWidth;
-      titleEl.classList.add("flash-confirm");
-      showToast("Nombre actualizado.");
+      if (target.kind === "recording" || target.kind === "source") {
+        const segment = target.kind === "recording" ? "recordings" : "sources";
+        const fresh = await api(`/api/sessions/${target.sessionId}/${segment}/${target.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ filename: next }),
+        });
+        closeRenameModal();
+        if (state.activeSessionId === target.sessionId) {
+          state.activeSession = fresh;
+          invalidateMemo("sources-structure");
+          invalidateMemo("summary-pane");
+          invalidateMemo("content-pane");
+          invalidateMemo("quiz-pane");
+          invalidateMemo("podcast-pane");
+          renderActiveSession(fresh);
+        }
+        await loadSessions(false);
+        showToast("Nombre de fuente actualizado.");
+      } else {
+        await api(`/api/sessions/${target.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: next }),
+        });
+        closeRenameModal();
+        await selectSession(target.id);
+        await loadSessions(false);
+        const titleEl = document.getElementById("session-title");
+        titleEl.classList.remove("flash-confirm");
+        void titleEl.offsetWidth;
+        titleEl.classList.add("flash-confirm");
+        showToast("Nombre actualizado.");
+      }
     } catch (err) {
       showToast(err.message, true);
     } finally {
@@ -6144,10 +6507,14 @@ function initEvents() {
         stopActiveChatGeneration();
       } else if (scope === "resummarize") {
         stopResummarizeGeneration();
+      } else if (scope === "rec-summary") {
+        stopRecordingSummaryGeneration();
       } else if (scope === "quiz-gen") {
         stopQuizGeneration();
       } else if (scope === "quiz-grade") {
         stopQuizGrading();
+      } else if (state.summarizingRecId) {
+        stopRecordingSummaryGeneration();
       } else if (state.isResummarizing) {
         stopResummarizeGeneration();
       } else if (state.activeSessionId && sessionQuizzes.get(state.activeSessionId)?.loading) {
@@ -6173,6 +6540,22 @@ function initEvents() {
       const src = (state.activeSession?.sources || []).find((s) => s.id === srcPill.dataset.sourceId);
       if (src) {
         openSourceViewer(src, srcPill.dataset.locator || "");
+      }
+      return;
+    }
+
+    const copyCodeBtn = e.target.closest(".md-code-copy");
+    if (copyCodeBtn) {
+      const codeEl = copyCodeBtn.closest(".md-code-block")?.querySelector("pre code");
+      if (codeEl && navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(codeEl.textContent || "").then(() => {
+          copyCodeBtn.textContent = "✓ Copiado";
+          copyCodeBtn.classList.add("copied");
+          setTimeout(() => {
+            copyCodeBtn.textContent = "Copiar";
+            copyCodeBtn.classList.remove("copied");
+          }, 1500);
+        }).catch(() => {});
       }
     }
   });

@@ -2247,3 +2247,164 @@ def test_quiz_pdf_whitespace_compaction_budget_and_truncated_salvage() -> None:
     assert len(salvaged) == 2
     assert salvaged[0]["question"] == "¿Qué es IK?"
     assert salvaged[1]["correct_index"] == 1
+
+
+def test_individual_recording_summary_endpoint_and_timestamps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+    import backend.app as app_mod
+    from backend.context_manager import build_recording_summary_messages, format_transcript_for_llm
+
+    rec_sample = {
+        "filename": "reunion.wav",
+        "duration_sec": 75.0,
+        "transcript_text": "Revisamos el despliegue [01:05] con el equipo.",
+        "segments": [
+            {"start": 5.0, "end": 10.0, "speaker": "Ana", "text": "Revisamos el despliegue."},
+            {"start": 65.0, "end": 72.0, "speaker": "Tú", "text": "Confirmamos la fecha del viernes."},
+        ],
+    }
+    formatted = format_transcript_for_llm(rec_sample)
+    assert "[00:05] Ana:" in formatted
+    assert "[01:05] Tú:" in formatted
+    prompt_msgs = build_recording_summary_messages("reunion.wav", formatted, 75.0)
+    assert "[MM:SS]" in prompt_msgs[0]["content"]
+    assert "[01:05] Tú:" in prompt_msgs[1]["content"]
+
+    test_db = Database(db_path=tmp_path / "rec_summary.db", audio_dir=tmp_path / "audio")
+    test_db.init_db()
+    test_db.update_settings({"eco_mode": True, "auto_summarize": False, "ollama_model": "gemma4:e4b"})
+    sess = test_db.create_session("Sesión individual")
+    rec1 = test_db.create_recording(sess["id"], "audio1.wav", "audio1.wav", "audio1.wav")
+    rec2 = test_db.create_recording(sess["id"], "audio2.wav", "audio2.wav", "audio2.wav")
+    test_db.update_recording_transcript(
+        rec1["id"],
+        "Primer bloque de prueba.",
+        [{"start": 12.0, "end": 18.0, "speaker": "Hablante 1", "text": "Primer bloque de prueba."}],
+        "es",
+        18.0,
+        "parakeet",
+    )
+    test_db.update_recording_transcript(
+        rec2["id"],
+        "Segundo audio sin cambios.",
+        [{"start": 4.0, "end": 8.0, "speaker": "Tú", "text": "Segundo audio sin cambios."}],
+        "es",
+        8.0,
+        "parakeet",
+    )
+    # Keep rec1 disabled to verify explicit single-recording resummarize still works on demand
+    test_db.set_recording_enabled(rec1["id"], False)
+
+    captured_prompts: list[str] = []
+
+    async def fake_summarize(messages, model_name, num_ctx, idle_unload_sec, **kwargs):
+        captured_prompts.append(messages[-1]["content"])
+        return "### Resumen general\nResumen individual con cita [00:12]."
+
+    combined_called = {"count": 0}
+
+    async def fake_combined(session_id: str, extra_rec_id: str | None = None):
+        combined_called["count"] += 1
+
+    monkeypatch.setattr(app_mod, "db", test_db)
+    monkeypatch.setattr(app_mod.resource_manager, "summarize_exclusive", fake_summarize)
+    monkeypatch.setattr(app_mod, "regenerate_combined_summary_if_needed", fake_combined)
+
+    client = TestClient(app_mod.app)
+    res = client.post(
+        f"/api/sessions/{sess['id']}/resummarize",
+        json={"recording_id": rec1["id"], "update_combined": False},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    recs_by_id = {r["id"]: r for r in body["recordings"]}
+    assert recs_by_id[rec1["id"]]["summary_text"] == "### Resumen general\nResumen individual con cita [00:12]."
+    assert recs_by_id[rec2["id"]]["summary_text"] == ""
+    assert combined_called["count"] == 0
+    assert len(captured_prompts) == 1
+    assert "[00:12] Hablante 1: Primer bloque de prueba." in captured_prompts[0]
+    test_db.close()
+
+
+def test_rename_recording_and_source_updates_db_and_fts5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+    import backend.app as app_mod
+
+    test_db = Database(db_path=tmp_path / "rename_sources.db", audio_dir=tmp_path / "audio")
+    test_db.init_db()
+    sess = test_db.create_session("Redes")
+    rec = test_db.create_recording(sess["id"], "grabacion_raw.wav", "grabacion_raw.wav", "grabacion_raw.wav")
+    test_db.update_recording_transcript(
+        rec["id"],
+        "Conceptos iniciales de enrutamiento.",
+        [{"start": 0.0, "end": 4.0, "text": "Conceptos iniciales de enrutamiento."}],
+        "es",
+        4.0,
+        "parakeet",
+    )
+    test_db.update_recording_summary(rec["id"], "")
+    test_db.replace_item_chunks(
+        session_id=sess["id"],
+        item_kind="recording",
+        item_id=rec["id"],
+        filename="grabacion_raw.wav",
+        source_type="audio",
+        chunks=[{"locator": "00:00", "content": "Conceptos iniciales de enrutamiento."}],
+    )
+
+    src = test_db.create_source(sess["id"], "doc_sin_nombre.pdf", "pdf", "doc_sin_nombre.pdf")
+    test_db.update_source_content(
+        src["id"],
+        "Tabla de subredes.",
+        [{"locator": "p. 1", "text": "Tabla de subredes."}],
+        1,
+    )
+    test_db.update_source_summary(src["id"], "")
+    test_db.replace_item_chunks(
+        session_id=sess["id"],
+        item_kind="source",
+        item_id=src["id"],
+        filename="doc_sin_nombre.pdf",
+        source_type="pdf",
+        chunks=[{"locator": "p. 1", "content": "Tabla de subredes."}],
+    )
+
+    monkeypatch.setattr(app_mod, "db", test_db)
+    client = TestClient(app_mod.app)
+
+    res_rec = client.patch(
+        f"/api/sessions/{sess['id']}/recordings/{rec['id']}",
+        json={"filename": "Clase de Redes 01.wav"},
+    )
+    assert res_rec.status_code == 200
+    recs = {r["id"]: r for r in res_rec.json()["recordings"]}
+    assert recs[rec["id"]]["filename"] == "Clase de Redes 01.wav"
+    assert recs[rec["id"]]["enabled"] is True
+
+    res_src = client.patch(
+        f"/api/sessions/{sess['id']}/sources/{src['id']}",
+        json={"filename": "Guia TCP-IP.pdf"},
+    )
+    assert res_src.status_code == 200
+    srcs = {s["id"]: s for s in res_src.json()["sources"]}
+    assert srcs[src["id"]]["filename"] == "Guia TCP-IP.pdf"
+    assert srcs[src["id"]]["enabled"] is True
+
+    # Empty filename must be rejected cleanly
+    res_empty = client.patch(
+        f"/api/sessions/{sess['id']}/sources/{src['id']}",
+        json={"filename": "   "},
+    )
+    assert res_empty.status_code == 400
+
+    # FTS5 index must reflect the updated filenames
+    rec_hits = test_db.search_session_chunks(sess["id"], "Redes", limit=5)
+    assert any(h["item_id"] == rec["id"] and h["filename"] == "Clase de Redes 01.wav" for h in rec_hits)
+    src_hits = test_db.search_session_chunks(sess["id"], "TCP", limit=5)
+    assert any(h["item_id"] == src["id"] and h["filename"] == "Guia TCP-IP.pdf" for h in src_hits)
+
+    test_db.close()

@@ -51,6 +51,7 @@ from backend.context_manager import (
     build_suggestions_messages,
     estimate_session_context_usage,
     extract_relevant_excerpt,
+    format_transcript_for_llm,
     format_transcript_with_timestamps,
     is_true_false_unbalanced,
     parse_grade_json,
@@ -103,7 +104,7 @@ from backend.whisper_service import (
 )
 
 
-RECORDING_SUMMARY_MAX_TOKENS = 768
+RECORDING_SUMMARY_MAX_TOKENS = 960
 _logger = logging.getLogger(__name__)
 _model_download_lock = asyncio.Lock()
 _downloading_model_id: str | None = None
@@ -142,10 +143,12 @@ class ChatRequest(BaseModel):
 class ResummarizeRequest(BaseModel):
     recording_id: str | None = None
     source_id: str | None = None
+    update_combined: bool = True
 
 
 class EnableToggleRequest(BaseModel):
-    enabled: bool
+    enabled: bool | None = None
+    filename: str | None = None
 
 
 class SystemCaptureStartRequest(BaseModel):
@@ -572,9 +575,10 @@ class ProcessingPipeline:
             if not settings.get("ollama_model"):
                 db.update_settings({"ollama_model": ollama_model})
 
+            rec_for_summary = format_transcript_for_llm(rec_indexed) if rec_indexed else transcript_text
             summary_msgs = build_recording_summary_messages(
                 filename=rec["filename"],
-                transcript_text=transcript_text,
+                transcript_text=rec_for_summary,
                 duration_sec=final_duration,
                 max_input_chars=max(8000, int(num_ctx * 2.2)),
             )
@@ -1708,8 +1712,16 @@ async def toggle_recording_enabled(
     rec = db.get_recording(rec_id)
     if not rec or rec["session_id"] != session_id:
         raise HTTPException(status_code=404, detail="Grabación no encontrada.")
-    db.set_recording_enabled(rec_id, payload.enabled)
-    _schedule_combined_summary_refresh(session_id)
+    if payload.enabled is None and payload.filename is None:
+        raise HTTPException(status_code=400, detail="No se indicaron cambios.")
+    if payload.filename is not None:
+        clean = " ".join(payload.filename.split()).strip()[:160]
+        if not clean:
+            raise HTTPException(status_code=400, detail="El nombre de la fuente no puede estar vacío.")
+        db.rename_recording(rec_id, clean)
+    if payload.enabled is not None:
+        db.set_recording_enabled(rec_id, payload.enabled)
+        _schedule_combined_summary_refresh(session_id)
     return _build_session_response(session_id)
 
 
@@ -1817,8 +1829,16 @@ async def toggle_source_enabled(
     src = db.get_source(source_id)
     if not src or src["session_id"] != session_id:
         raise HTTPException(status_code=404, detail="Fuente no encontrada.")
-    db.set_source_enabled(source_id, payload.enabled)
-    _schedule_combined_summary_refresh(session_id)
+    if payload.enabled is None and payload.filename is None:
+        raise HTTPException(status_code=400, detail="No se indicaron cambios.")
+    if payload.filename is not None:
+        clean = " ".join(payload.filename.split()).strip()[:160]
+        if not clean:
+            raise HTTPException(status_code=400, detail="El nombre de la fuente no puede estar vacío.")
+        db.rename_source(source_id, clean)
+    if payload.enabled is not None:
+        db.set_source_enabled(source_id, payload.enabled)
+        _schedule_combined_summary_refresh(session_id)
     return _build_session_response(session_id)
 
 
@@ -1906,16 +1926,14 @@ async def resummarize_session(
     rec_targets = [
         r for r in recordings
         if r.get("transcript_text")
-        and r.get("enabled", True)
         and (target_src_id is None)
-        and (target_rec_id is None or r["id"] == target_rec_id)
+        and (r["id"] == target_rec_id if target_rec_id is not None else r.get("enabled", True))
     ]
     src_targets = [
         s for s in sources
         if s.get("extracted_text")
-        and s.get("enabled", True)
         and (target_rec_id is None)
-        and (target_src_id is None or s["id"] == target_src_id)
+        and (s["id"] == target_src_id if target_src_id is not None else s.get("enabled", True))
     ]
     if not rec_targets and not src_targets:
         raise HTTPException(status_code=400, detail="No hay fuentes ni transcripciones activas para resumir.")
@@ -1924,7 +1942,7 @@ async def resummarize_session(
         for rec in rec_targets:
             msgs = build_recording_summary_messages(
                 filename=rec["filename"],
-                transcript_text=rec["transcript_text"],
+                transcript_text=format_transcript_for_llm(rec),
                 duration_sec=float(rec.get("duration_sec") or 0.0),
                 max_input_chars=max(8000, int(num_ctx * 2.2)),
             )
@@ -1954,7 +1972,8 @@ async def resummarize_session(
             )
             db.update_source_summary(src["id"], summary_text)
 
-        await regenerate_combined_summary_if_needed(session_id)
+        if payload is None or payload.update_combined:
+            await regenerate_combined_summary_if_needed(session_id)
     except (asyncio.CancelledError, GenerationAbortedError) as exc:
         raise HTTPException(
             status_code=499,

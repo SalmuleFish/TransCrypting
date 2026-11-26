@@ -388,7 +388,7 @@ def build_recording_summary_messages(
     max_input_chars: int = 18000,
 ) -> list[dict[str, str]]:
     """Build prompt messages to summarize a single audio transcript."""
-    clean_text = transcript_text.strip()
+    clean_text = _compact_llm_whitespace(transcript_text or "")
     truncated_note = ""
     if len(clean_text) > max_input_chars:
         half = max_input_chars // 2
@@ -400,22 +400,29 @@ def build_recording_summary_messages(
         truncated_note = "Nota: la transcripción es extensa y fue condensada a sus secciones principales.\n"
 
     duration_str = format_timestamp(duration_sec) if duration_sec > 0 else "desconocida"
-    max_words = max(100, min(400, len(clean_text) // 40))
+    max_words = max(120, min(420, len(clean_text) // 35))
+    has_timestamps = bool(re.search(r"\[\d{1,2}:\d{2}(?::\d{2})?\]", clean_text))
+    ts_rule = (
+        " Cuando el texto incluya marcas de tiempo como [MM:SS], cita los momentos relevantes exactamente en formato [MM:SS] y atribuye intervenciones clave a sus hablantes si aparecen identificados."
+        if has_timestamps
+        else ""
+    )
     system_prompt = (
         "Eres un asistente experto en análisis de grabaciones de audio y clases. "
         "Responde siempre en español claro y estructurado. "
         "Basa tu resumen EXCLUSIVAMENTE en la transcripción proporcionada; "
         "no inventes datos, cifras ni nombres que no aparezcan en el texto."
+        f"{ts_rule}"
     )
     user_prompt = (
         f"Archivo de audio: {filename} (duración: {duration_str})\n"
         f"{truncated_note}\n"
-        f"Resume en un máximo de {max_words} palabras. Evita repetir información entre secciones.\n"
+        f"Resume este audio de forma individual en un máximo de {max_words} palabras. Evita repetir información entre secciones.\n"
         "Usa estas secciones en Markdown:\n"
         "### Resumen general\n"
-        "Párrafo breve explicando de qué trata la grabación.\n\n"
+        "Párrafo breve explicando de qué trata esta grabación específica.\n\n"
         "### Puntos clave\n"
-        "- Lista con las ideas, hechos, fechas o datos más relevantes.\n\n"
+        "- Lista con las ideas, hechos, fechas o datos más relevantes (citando [MM:SS] cuando ayude a ubicarlo en el audio).\n\n"
         "### Acuerdos, tareas o conclusiones (si aplica)\n"
         "- Lista de acciones o decisiones mencionadas (omite esta sección si no hay ninguna).\n\n"
         f"Transcripción:\n\"\"\"\n{clean_text}\n\"\"\""

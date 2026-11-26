@@ -743,6 +743,28 @@ class Database:
             conn.commit()
         return self.get_recording(rec_id)
 
+    def rename_recording(self, rec_id: str, filename: str) -> dict[str, Any] | None:
+        clean = " ".join((filename or "").split()).strip()[:160]
+        if not clean:
+            return None
+        now = _utc_now()
+        with self._lock:
+            conn = self._get_conn()
+            rec = self.get_recording(rec_id)
+            if not rec:
+                return None
+            conn.execute("UPDATE recordings SET filename = ? WHERE id = ?", (clean, rec_id))
+            conn.execute(
+                "UPDATE source_chunks SET filename = ? WHERE item_kind = 'recording' AND item_id = ?",
+                (clean, rec_id),
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (now, rec["session_id"]),
+            )
+            conn.commit()
+        return self.get_recording(rec_id)
+
     def delete_recording(self, rec_id: str) -> dict[str, Any] | None:
         with self._lock:
             rec = self.get_recording(rec_id)
@@ -956,6 +978,28 @@ class Database:
             if not src:
                 return None
             conn.execute("UPDATE sources SET enabled = ? WHERE id = ?", (val, source_id))
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (now, src["session_id"]),
+            )
+            conn.commit()
+        return self.get_source(source_id)
+
+    def rename_source(self, source_id: str, filename: str) -> dict[str, Any] | None:
+        clean = " ".join((filename or "").split()).strip()[:160]
+        if not clean:
+            return None
+        now = _utc_now()
+        with self._lock:
+            conn = self._get_conn()
+            src = self.get_source(source_id)
+            if not src:
+                return None
+            conn.execute("UPDATE sources SET filename = ? WHERE id = ?", (clean, source_id))
+            conn.execute(
+                "UPDATE source_chunks SET filename = ? WHERE item_kind = 'source' AND item_id = ?",
+                (clean, source_id),
+            )
             conn.execute(
                 "UPDATE sessions SET updated_at = ? WHERE id = ?",
                 (now, src["session_id"]),
