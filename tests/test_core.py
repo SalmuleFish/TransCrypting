@@ -193,8 +193,13 @@ def test_resource_manager_unloads_ollama_before_whisper_and_frees_whisper() -> N
 def test_stop_active_operation_keeps_waiting_generation_and_rejects_stale_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    assert app_module._auto_summaries_enabled({}) is True
+    assert app_module._auto_summaries_enabled({"eco_mode": True}) is False
+
     manager = ResourceManager()
+    abort_mock = AsyncMock(return_value=1)
     monkeypatch.setattr(app_module, "resource_manager", manager)
+    monkeypatch.setattr(app_module.ollama_service, "abort_active", abort_mock)
     monkeypatch.setattr("backend.resource_manager.db.get_settings", lambda: {})
 
     async def run() -> None:
@@ -220,6 +225,7 @@ def test_stop_active_operation_keeps_waiting_generation_and_rejects_stale_id(
         await asyncio.sleep(0)
         assert not second_started.is_set()
         assert await app_module.system_stop_active(operation["id"]) == {"stopped": True}
+        assert abort_mock.await_count == 1
         with pytest.raises(asyncio.CancelledError):
             await first
 

@@ -158,7 +158,7 @@ class QuizGradeRequest(BaseModel):
 
 
 def _auto_summaries_enabled(settings: dict[str, Any]) -> bool:
-    return settings["auto_summarize"] and not settings["eco_mode"]
+    return bool(settings.get("auto_summarize", True)) and not bool(settings.get("eco_mode", False))
 
 
 class ProcessingPipeline:
@@ -372,7 +372,7 @@ class ProcessingPipeline:
                 summary_text=(rec_indexed or {}).get("summary_text", ""),
                 status="ready",
                 progress=1.0,
-                stage="Indexado (Modo Eco)" if settings["eco_mode"] else "Transcripción lista",
+                stage="Indexado (Modo Eco)" if settings.get("eco_mode", False) else "Transcripción lista",
             )
             return
 
@@ -603,7 +603,7 @@ class ProcessingPipeline:
                 summary_text=indexed_src.get("summary_text", ""),
                 status="ready",
                 progress=1.0,
-                stage="Indexado (Modo Eco)" if settings["eco_mode"] else "Indexado y listo",
+                stage="Indexado (Modo Eco)" if settings.get("eco_mode", False) else "Indexado y listo",
             )
             return
 
@@ -916,7 +916,14 @@ async def system_stop() -> dict[str, Any]:
 
 @app.post("/api/system/stop-active/{operation_id}")
 async def system_stop_active(operation_id: str) -> dict[str, bool]:
-    return {"stopped": resource_manager.stop_operation(operation_id)}
+    op_info = resource_manager.get_state().get("active_operation")
+    stopped = resource_manager.stop_operation(operation_id)
+    if stopped and op_info and op_info.get("id") == operation_id and op_info.get("kind") in ("text", "podcast"):
+        try:
+            await ollama_service.abort_active()
+        except Exception:
+            pass
+    return {"stopped": stopped}
 
 
 @app.get("/api/settings")

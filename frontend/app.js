@@ -624,16 +624,44 @@ function isAbortError(err) {
   return /abort|detenid|cancel/i.test(msg);
 }
 
+function isAnyAIWorkActive() {
+  if (state.isStreaming || state.isResummarizing || state.podcastBusy) return true;
+  const res = state.systemStatus?.resources;
+  if (res?.active_operation) return true;
+  if (res?.phase && ["llm", "whisper", "podcast"].includes(res.phase)) return true;
+
+  if (state.activeSessionId) {
+    const qs = sessionQuizzes.get(state.activeSessionId);
+    if (qs) {
+      if (qs.loading || qs.submittingExam) return true;
+      if (Object.values(qs.answers || {}).some((a) => a && a.grading)) return true;
+    }
+  }
+
+  const sess = state.activeSession;
+  if (sess) {
+    const workingRec = (sess.recordings || []).some((r) =>
+      ["queued", "preparing", "transcribing", "summarizing"].includes(r.status)
+    );
+    const workingSrc = (sess.sources || []).some((s) =>
+      ["queued", "extracting", "indexing", "summarizing"].includes(s.status)
+    );
+    if (workingRec || workingSrc) return true;
+  }
+  return false;
+}
+
 function syncGlobalStopButton() {
   const btn = document.getElementById("btn-stop-ai");
   if (!btn) return;
   const operation = state.systemStatus?.resources?.active_operation;
+  const active = isAnyAIWorkActive();
   const task = {
     audio: "transcripción de audio",
     text: "generación de texto",
     podcast: "generación del podcast",
   }[operation?.kind];
-  btn.classList.toggle("hidden", !operation);
+  btn.classList.toggle("hidden", !active);
   btn.disabled = Boolean(state.stoppingAI || operation?.stopping);
   btn.title = task ? `Detener ${task}` : "Detener la tarea activa";
   btn.setAttribute("aria-label", btn.title);
@@ -641,12 +669,22 @@ function syncGlobalStopButton() {
 
 async function stopActiveAIOperation() {
   const operation = state.systemStatus?.resources?.active_operation;
-  if (!operation || operation.stopping || state.stoppingAI) return;
+  if (operation?.stopping || state.stoppingAI || !isAnyAIWorkActive()) return;
   state.stoppingAI = true;
   syncGlobalStopButton();
   try {
-    const result = await api(`/api/system/stop-active/${operation.id}`, { method: "POST" });
-    showToast(result.stopped ? "Deteniendo la tarea activa…" : "Esa tarea ya terminó.");
+    if (state.chatAbortController) state.chatAbortController.abort();
+    if (state.resummarizeAbortController) state.resummarizeAbortController.abort();
+    if (state.quizAbortController) state.quizAbortController.abort();
+    if (state.quizGradeAbortController) state.quizGradeAbortController.abort();
+
+    if (operation) {
+      const result = await api(`/api/system/stop-active/${operation.id}`, { method: "POST" });
+      showToast(result.stopped ? "Deteniendo la tarea activa…" : "Esa tarea ya terminó.");
+    } else {
+      await stopBackendAIGeneration();
+      showToast("Deteniendo la tarea activa…");
+    }
     schedulePollingIfProcessing();
   } catch (err) {
     showToast(err.message, true);
