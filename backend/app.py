@@ -39,10 +39,12 @@ from backend.config import (
     list_available_whisper_models,
 )
 from backend.context_manager import (
+    QUIZ_GRADE_JSON_SCHEMA,
     build_chat_messages,
     build_combined_summary_messages,
     build_open_answer_grading_messages,
     build_quiz_generation_messages,
+    build_quiz_json_schema,
     build_quiz_rebalance_messages,
     build_recording_summary_messages,
     build_source_summary_messages,
@@ -1268,6 +1270,12 @@ async def generate_session_quiz(
         limit=14,
         enabled_only=(req.recording_ids is None and req.source_ids is None),
     )
+    if req.recording_ids is not None or req.source_ids is not None:
+        indexed_hits = [
+            c for c in indexed_hits
+            if (c.get("item_kind") == "recording" and c.get("item_id") in rec_filter)
+            or (c.get("item_kind") == "source" and c.get("item_id") in src_filter)
+        ]
 
     msgs = build_quiz_generation_messages(
         recordings=ready_recs,
@@ -1282,12 +1290,16 @@ async def generate_session_quiz(
         focus_prompt=focus_prompt,
         include_hints=include_hints,
     )
+    quiz_schema = build_quiz_json_schema(mode)
+    quiz_num_predict = min(max(1800, num_questions * 320), max(1200, num_ctx // 2))
     try:
         raw = await resource_manager.summarize_exclusive(
             messages=msgs,
             model_name=ollama_model,
             num_ctx=num_ctx,
             idle_unload_sec=idle_unload_sec,
+            num_predict=quiz_num_predict,
+            response_format=quiz_schema,
         )
     except (asyncio.CancelledError, GenerationAbortedError) as exc:
         raise HTTPException(
@@ -1303,6 +1315,8 @@ async def generate_session_quiz(
                 model_name=ollama_model,
                 num_ctx=num_ctx,
                 idle_unload_sec=idle_unload_sec,
+                num_predict=quiz_num_predict,
+                response_format=quiz_schema,
             )
             rebalanced_questions = parse_quiz_json(rebalanced_raw, mode=mode)
             if rebalanced_questions and len(rebalanced_questions) >= len(questions) // 2:
@@ -1330,6 +1344,14 @@ async def generate_session_quiz(
         questions = shuffle_quiz_mcq_options(questions)
 
     if not questions:
+        _logger.warning(
+            "Quiz parse vacío (%s, mode=%s, num_ctx=%s, raw_len=%d): %r",
+            ollama_model,
+            mode,
+            num_ctx,
+            len(raw),
+            raw[:300],
+        )
         raise HTTPException(
             status_code=502,
             detail="El modelo no devolvió preguntas válidas. Intenta generar de nuevo.",
@@ -1400,6 +1422,7 @@ async def grade_session_quiz_answer(
             model_name=ollama_model,
             num_ctx=min(num_ctx, 8192),
             idle_unload_sec=idle_unload_sec,
+            response_format=QUIZ_GRADE_JSON_SCHEMA,
         )
     except (asyncio.CancelledError, GenerationAbortedError) as exc:
         raise HTTPException(

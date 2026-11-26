@@ -435,7 +435,7 @@ def test_quiz_parsers_and_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     )
     test_db.update_recording_summary(rec["id"], "Resumen")
 
-    async def fake_summarize(messages, model_name, num_ctx, idle_unload_sec):
+    async def fake_summarize(messages, model_name, num_ctx, idle_unload_sec, **_kwargs):
         content = messages[-1]["content"]
         if "Respuesta del estudiante" in content:
             return '{"verdict": "correct", "score": 90, "feedback": "Exacto.", "missing_points": "", "timestamp": "05:01"}'
@@ -2097,3 +2097,90 @@ def test_asr_model_status_and_modular_endpoints(tmp_path: Path, monkeypatch: pyt
     assert res_rm.status_code == 200
     assert res_rm.json()["deleted"] is True
     assert ("rm", "small") in calls
+
+
+def test_quiz_json_schema_and_hardened_parser(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi.testclient import TestClient
+    import backend.app as app_mod
+    from backend.context_manager import build_quiz_json_schema, parse_quiz_json
+
+    for mode, expected_enum in [
+        ("mixed", ["mcq", "true_false", "open"]),
+        ("mcq", ["mcq"]),
+        ("true_false", ["true_false"]),
+        ("open", ["open"]),
+    ]:
+        schema = build_quiz_json_schema(mode)
+        assert schema["properties"]["questions"]["items"]["properties"]["type"]["enum"] == expected_enum
+
+    fenced_with_prose = (
+        "Aquí tienes el examen [00:12]:\n"
+        "```json\n"
+        '{"preguntas": [{"pregunta": "¿Qué es Molang?", "type": "open", "expected_answer": "Un lenguaje de expresiones.", "pista": "Motor matemático", "timestamp": "apuntes.pdf · p. 2"}]}\n'
+        "```\n"
+        "Espero que sea útil [01:30]."
+    )
+    parsed = parse_quiz_json(fenced_with_prose, mode="mixed")
+    assert len(parsed) == 1
+    assert parsed[0]["type"] == "open"
+    assert parsed[0]["hint"] == "Motor matemático"
+    assert parsed[0]["expected_answer"] == "Un lenguaje de expresiones."
+
+    test_db = Database(db_path=tmp_path / "quiz_schema.db", audio_dir=tmp_path / "audio")
+    test_db.init_db()
+    sess = test_db.create_session("Animación")
+    rec = test_db.create_recording(sess["id"], "clase.wav", "clase.wav", "clase.wav")
+    test_db.update_recording_transcript(rec["id"], "Blockbench es un IDE 3D.", [{"start": 1.0, "end": 4.0, "text": "Blockbench es un IDE 3D."}], "es", 4.0, "large-v3-turbo")
+    test_db.update_recording_summary(rec["id"], "Resumen")
+
+    seen_formats = []
+
+    async def fake_summarize(messages, model_name, num_ctx, idle_unload_sec, **kwargs):
+        seen_formats.append(kwargs.get("response_format"))
+        return '{"questions": [{"id": 1, "type": "mcq", "question": "¿Qué es Blockbench?", "options": ["Un IDE", "Un codec", "Una GPU", "Un navegador"], "correct_index": 0, "explanation": "IDE 3D.", "hint": "Herramienta", "timestamp": "00:01"}]}'
+
+    monkeypatch.setattr(app_mod, "db", test_db)
+    monkeypatch.setattr(app_mod.resource_manager, "summarize_exclusive", fake_summarize)
+    client = TestClient(app_mod.app)
+    res = client.post(f"/api/sessions/{sess['id']}/quiz/generate", json={"num_questions": 3, "mode": "mcq"})
+    assert res.status_code == 200
+    assert seen_formats and isinstance(seen_formats[0], dict)
+    assert seen_formats[0]["properties"]["questions"]["items"]["properties"]["type"]["enum"] == ["mcq"]
+    test_db.close()
+
+
+def test_quiz_pdf_whitespace_compaction_budget_and_truncated_salvage() -> None:
+    from backend.context_manager import _compact_llm_whitespace, build_quiz_generation_messages, parse_quiz_json
+
+    fragmented = "Hola\n \nmundo\n \nde\n \npruebas\n \ncon\n \nmuchas\n \nlineas\n \nrotas"
+    compacted = _compact_llm_whitespace(fragmented)
+    assert "\n \n" not in compacted
+    assert compacted == "Hola mundo de pruebas con muchas lineas rotas"
+
+    huge_chunks = [
+        {"filename": "guia.pdf", "locator": f"p. {i}", "content": ("palabra\n \n" * 110)}
+        for i in range(1, 15)
+    ]
+    srcs = [{"id": "s1", "filename": "guia.pdf", "source_type": "pdf", "status": "ready", "extracted_text": "palabra " * 5000}]
+    msgs = build_quiz_generation_messages(
+        recordings=[],
+        combined_summary="Resumen " * 600,
+        num_questions=10,
+        mode="mixed",
+        num_ctx=8192,
+        sources=srcs,
+        indexed_chunks=huge_chunks,
+    )
+    # Prompt must stay compact enough to leave >= 3500 tokens of output headroom in num_ctx=8192
+    assert len(msgs[-1]["content"]) < 11000
+
+    truncated_json = (
+        '{"questions": ['
+        '{"id": 1, "type": "mcq", "question": "¿Qué es IK?", "options": ["Cinemática Inversa", "Keyframes", "Shader", "Vértice"], "correct_index": 0, "explanation": "Cinemática Inversa.", "hint": "IK", "timestamp": "p. 1"},'
+        '{"id": 2, "type": "true_false", "question": "Molang solo corre en CPU.", "options": ["Verdadero", "Falso"], "correct_index": 1, "explanation": "Tiene aceleración.", "hint": "Molang", "timestamp": "p. 2"},'
+        '{"id": 3, "type": "open", "question": "Pregunta cortada'
+    )
+    salvaged = parse_quiz_json(truncated_json, mode="mixed")
+    assert len(salvaged) == 2
+    assert salvaged[0]["question"] == "¿Qué es IK?"
+    assert salvaged[1]["correct_index"] == 1

@@ -218,6 +218,7 @@ class OllamaService:
         eco_mode: bool = False,
         eco_cpu_threads: int = 2,
         num_predict: int | None = None,
+        response_format: str | dict[str, Any] | None = None,
     ) -> AsyncIterator[tuple[str, str]]:
         """Stream ('thinking', text) and ('token', text) tuples from local Ollama /api/chat."""
         await self.ensure_running()
@@ -244,6 +245,8 @@ class OllamaService:
             "options": options,
             "keep_alive": keep_alive,
         }
+        if response_format is not None:
+            payload["format"] = response_format
 
         timeout = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
         client = httpx.AsyncClient(timeout=timeout)
@@ -253,8 +256,12 @@ class OllamaService:
                 async with client.stream("POST", f"{self.base_url}/api/chat", json=payload) as resp:
                     if resp.status_code >= 400:
                         err_body = (await resp.aread()).decode("utf-8", errors="ignore")
-                        if resp.status_code == 400 and "think" in payload and not has_images:
+                        if resp.status_code == 400 and not has_images and ("think" in payload or "format" in payload):
                             payload.pop("think", None)
+                            if isinstance(payload.get("format"), dict):
+                                payload["format"] = "json"
+                            else:
+                                payload.pop("format", None)
                             async with client.stream(
                                 "POST", f"{self.base_url}/api/chat", json=payload
                             ) as retry_resp:
@@ -329,6 +336,7 @@ class OllamaService:
         eco_mode: bool = False,
         eco_cpu_threads: int = 2,
         num_predict: int | None = None,
+        response_format: str | dict[str, Any] | None = None,
     ) -> str:
         """Run chat completion and return full text, falling back to thinking if content is empty."""
         parts: list[str] = []
@@ -342,6 +350,7 @@ class OllamaService:
             eco_mode=eco_mode,
             eco_cpu_threads=eco_cpu_threads,
             num_predict=num_predict,
+            response_format=response_format,
         ):
             if not text:
                 continue

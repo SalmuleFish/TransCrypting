@@ -180,6 +180,7 @@ class ResourceManager:
         idle_unload_sec: int,
         num_predict: int | None = None,
         operation_label: str = "",
+        response_format: str | dict[str, Any] | None = None,
     ) -> str:
         """Ensure Whisper is unloaded, then run Ollama summary generation."""
         task = self._register_current_task()
@@ -197,8 +198,11 @@ class ResourceManager:
                     settings = db.get_settings()
                     eco_mode = bool(settings.get("eco_mode", False))
                     eco_cpu_threads = int(settings.get("eco_cpu_threads") or 2)
-                    if eco_mode and num_predict is not None:
-                        num_predict = min(768, num_predict)
+                    if eco_mode:
+                        if response_format is not None:
+                            num_predict = min(2600, num_predict) if num_predict is not None else 1800
+                        elif num_predict is not None:
+                            num_predict = min(768, num_predict)
                     text = await ollama_service.generate_complete(
                         model=model_name,
                         messages=messages,
@@ -207,6 +211,7 @@ class ResourceManager:
                         eco_mode=eco_mode,
                         eco_cpu_threads=eco_cpu_threads,
                         num_predict=num_predict,
+                        response_format=response_format,
                     )
                     self.touch_activity()
                     return text

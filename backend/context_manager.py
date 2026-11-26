@@ -829,6 +829,19 @@ def _extract_timestamp(raw_ts: Any) -> str:
     return raw.strip("[]")[:80]
 
 
+def _compact_llm_whitespace(text: str) -> str:
+    """Collapse fragmented single-word-per-line PDF extraction whitespace cleanly."""
+    clean = (text or "").replace("\r\n", "\n").strip()
+    if not clean:
+        return ""
+    if clean.count("\n") > max(8, len(clean) // 25):
+        return re.sub(r"\s+", " ", clean).strip()
+    clean = re.sub(r"[ \t]+\n[ \t]*", "\n", clean)
+    clean = re.sub(r"\n{3,}", "\n\n", clean)
+    clean = re.sub(r"[ \t]{2,}", " ", clean)
+    return clean.strip()
+
+
 def build_quiz_generation_messages(
     recordings: list[dict[str, Any]],
     combined_summary: str = "",
@@ -851,18 +864,23 @@ def build_quiz_generation_messages(
         s for s in (sources or [])
         if s.get("status") == "ready" and s.get("extracted_text")
     ]
-    budget = max(4500, int(num_ctx * 1.9))
+    clean_count = max(2, min(15, int(num_questions)))
+    output_reserve = min(int(num_ctx * 0.45), max(1600, clean_count * 260))
+    input_tokens_avail = max(1000, int(num_ctx) - output_reserve - 750)
+    budget = max(2600, min(int(input_tokens_avail * 2.1), 8500))
 
     full_blocks = []
     total_chars = 0
     for idx, rec in enumerate(ready_recs, start=1):
-        block = f"=== Grabación {idx}: {rec['filename']} ===\n{format_transcript_for_llm(rec)}"
+        rec_body = _compact_llm_whitespace(format_transcript_for_llm(rec))
+        block = f"=== Grabación {idx}: {rec['filename']} ===\n{rec_body}"
         full_blocks.append(block)
         total_chars += len(block)
 
     for idx, src in enumerate(ready_srcs, start=1):
         kind = str(src.get("source_type") or "documento").upper()
-        block = f"=== Fuente {idx} ({kind}): {src['filename']} ===\n{_format_source_for_llm(src)}"
+        src_body = _compact_llm_whitespace(_format_source_for_llm(src))
+        block = f"=== Fuente {idx} ({kind}): {src['filename']} ===\n{src_body}"
         full_blocks.append(block)
         total_chars += len(block)
 
@@ -870,29 +888,37 @@ def build_quiz_generation_messages(
         context = "\n\n".join(full_blocks)
     else:
         parts = []
+        summary_cap = min(1400, budget // 4)
         if combined_summary.strip():
-            parts.append(f"Resumen integrado:\n{combined_summary.strip()[:2200]}")
+            parts.append(f"Resumen integrado:\n{_compact_llm_whitespace(combined_summary)[:summary_cap]}")
+        summary_used = sum(len(p) for p in parts)
         if indexed_chunks:
-            picked = _select_chunks_within_budget(indexed_chunks, max_chars=max(2000, budget - 2200))
+            compacted_chunks = [
+                {**c, "content": _compact_llm_whitespace(str(c.get("content") or ""))}
+                for c in indexed_chunks
+            ]
+            picked = _select_chunks_within_budget(
+                compacted_chunks,
+                max_chars=max(1600, budget - summary_used),
+            )
             parts.extend(f"{_format_indexed_chunk_header(c)}\n{c['content']}" for c in picked)
         else:
             count = max(1, len(ready_recs) + len(ready_srcs))
-            per_item = max(1000, (budget - 2200) // count)
+            per_item = max(800, (budget - summary_used) // count)
             for idx, rec in enumerate(ready_recs, start=1):
-                text = format_transcript_for_llm(rec)
+                text = _compact_llm_whitespace(format_transcript_for_llm(rec))
                 if len(text) > per_item:
                     half = per_item // 2
                     text = text[:half] + "\n[...]\n" + text[-half:]
                 parts.append(f"=== Grabación {idx}: {rec['filename']} ===\n{text}")
             for idx, src in enumerate(ready_srcs, start=1):
-                text = _format_source_for_llm(src)
+                text = _compact_llm_whitespace(_format_source_for_llm(src))
                 if len(text) > per_item:
                     half = per_item // 2
                     text = text[:half] + "\n[...]\n" + text[-half:]
                 parts.append(f"=== Fuente {idx}: {src['filename']} ===\n{text}")
         context = "\n\n".join(parts)
 
-    clean_count = max(2, min(15, int(num_questions)))
     if mode == "mcq":
         mode_rule = (
             f"TODAS las {clean_count} preguntas deben ser de tipo \"mcq\" (opción múltiple con 4 opciones).\n"
@@ -948,7 +974,7 @@ def build_quiz_generation_messages(
 
     system_prompt = (
         "Eres un profesor creando un examen interactivo de repaso basado EXCLUSIVAMENTE en las fuentes cargadas (audios, PDFs, diapositivas, apuntes o imágenes).\n"
-        "Devuelve ÚNICAMENTE un arreglo JSON válido sin texto ni explicaciones fuera del JSON."
+        'Devuelve ÚNICAMENTE un objeto JSON válido con la clave `"questions"` (`{"questions": [...]}`) sin texto ni explicaciones fuera del JSON.'
     )
     user_prompt = (
         f"Genera exactamente {clean_count} preguntas de estudio en español basadas únicamente en las fuentes seleccionadas.\n"
@@ -956,7 +982,7 @@ def build_quiz_generation_messages(
         f"{diff_rule}\n"
         f"{style_rule}\n"
         f"{focus_rule}"
-        "Reglas de formato JSON estricto:\n"
+        "Reglas de formato JSON estricto (`{\"questions\": [...]}`):\n"
         "- Para \"mcq\": {\"id\": 1, \"type\": \"mcq\", \"question\": \"...\", \"options\": [\"op1\", \"op2\", \"op3\", \"op4\"], \"correct_index\": 2, \"explanation\": \"breve explicación\", \"hint\": \"pista corta\", \"timestamp\": \"MM:SS o fuente.pdf · p. X\"}\n"
         "- Para \"true_false\": {\"id\": 2, \"type\": \"true_false\", \"question\": \"Afirmación clara...\", \"options\": [\"Verdadero\", \"Falso\"], \"correct_index\": 0 o 1, \"explanation\": \"breve explicación\", \"hint\": \"pista corta\", \"timestamp\": \"MM:SS o fuente.pdf · p. X\"} (usa 0 cuando la afirmación sea Verdadera y 1 cuando sea Falsa)\n"
         "- Para \"open\": {\"id\": 3, \"type\": \"open\", \"question\": \"...\", \"expected_answer\": \"respuesta modelo breve\", \"hint\": \"pista corta\", \"timestamp\": \"MM:SS o fuente.pdf · p. X\"}\n"
@@ -964,12 +990,109 @@ def build_quiz_generation_messages(
         f"{hint_rule}"
         "- Incluye en \"timestamp\" la marca [MM:SS] si proviene de audio, o \"archivo.pdf · p. X\" / \"imagen.png\" si proviene de documento/imagen.\n"
         "- No inventes datos que no estén en las fuentes.\n\n"
-        f"CONTENIDO DE ESTUDIO:\n{context}"
+        f"CONTENIDO DE ESTUDIO:\n{context}\n\n"
+        f'RECORDATORIO FINAL OBLIGATORIO: Responde ÚNICAMENTE con JSON válido `{{"questions": [...]}}` conteniendo exactamente {clean_count} preguntas en español siguiendo los tipos indicados arriba.'
     )
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
+
+
+QUIZ_GRADE_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["correct", "partial", "incorrect"]},
+        "score": {"type": "integer"},
+        "feedback": {"type": "string"},
+        "missing_points": {"type": "string"},
+        "timestamp": {"type": "string"},
+    },
+    "required": ["verdict", "score", "feedback", "timestamp"],
+}
+
+
+def build_quiz_json_schema(mode: str = "mixed") -> dict[str, Any]:
+    """Return an Ollama JSON Schema guaranteeing structured quiz output."""
+    if mode == "mcq":
+        types = ["mcq"]
+        required = ["id", "type", "question", "options", "correct_index", "explanation", "hint", "timestamp"]
+    elif mode == "true_false":
+        types = ["true_false"]
+        required = ["id", "type", "question", "options", "correct_index", "explanation", "hint", "timestamp"]
+    elif mode == "open":
+        types = ["open"]
+        required = ["id", "type", "question", "expected_answer", "hint", "timestamp"]
+    else:
+        types = ["mcq", "true_false", "open"]
+        required = ["id", "type", "question", "options", "correct_index", "explanation", "expected_answer", "hint", "timestamp"]
+
+    item_props: dict[str, Any] = {
+        "id": {"type": "integer"},
+        "type": {"type": "string", "enum": types},
+        "question": {"type": "string"},
+        "options": {"type": "array", "items": {"type": "string"}},
+        "correct_index": {"type": "integer", "enum": [0, 1]} if mode == "true_false" else {"type": "integer"},
+        "explanation": {"type": "string"},
+        "expected_answer": {"type": "string"},
+        "hint": {"type": "string"},
+        "timestamp": {"type": "string"},
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": item_props,
+                    "required": required,
+                },
+            }
+        },
+        "required": ["questions"],
+    }
+
+
+def _salvage_truncated_quiz_objects(raw_text: str) -> list[Any]:
+    """Recover complete question dicts from a truncated JSON response."""
+    arr_start = raw_text.find("[")
+    if arr_start < 0:
+        return []
+    items: list[Any] = []
+    in_str = False
+    escape = False
+    depth = 0
+    obj_start = -1
+    for i in range(arr_start + 1, len(raw_text)):
+        ch = raw_text[i]
+        if escape:
+            escape = False
+            continue
+        if in_str:
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                obj_start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and obj_start >= 0:
+                    try:
+                        parsed = json.loads(raw_text[obj_start : i + 1])
+                        if isinstance(parsed, dict):
+                            items.append(parsed)
+                    except Exception:
+                        pass
+                    obj_start = -1
+    return items
 
 
 def parse_quiz_json(raw_text: str, mode: str = "mixed") -> list[dict[str, Any]]:
@@ -978,13 +1101,15 @@ def parse_quiz_json(raw_text: str, mode: str = "mixed") -> list[dict[str, Any]]:
     questions: list[dict[str, Any]] = []
 
     parsed_list: list[Any] | None = None
-    candidates = [cleaned]
-    arr_m = re.search(r"\[[\s\S]*\]", cleaned)
-    if arr_m:
-        candidates.append(arr_m.group(0))
+    candidates: list[str] = [cleaned]
+    for fenced in re.findall(r"```(?:json)?\s*([\s\S]*?)```", cleaned, flags=re.IGNORECASE):
+        candidates.insert(0, fenced.strip())
     obj_m = re.search(r"\{[\s\S]*\}", cleaned)
     if obj_m:
         candidates.append(obj_m.group(0))
+    arr_m = re.search(r"\[[\s\S]*\]", cleaned)
+    if arr_m:
+        candidates.append(arr_m.group(0))
 
     for cand in candidates:
         try:
@@ -995,22 +1120,28 @@ def parse_quiz_json(raw_text: str, mode: str = "mixed") -> list[dict[str, Any]]:
             parsed_list = obj
             break
         if isinstance(obj, dict):
-            for key in ("questions", "quiz", "items"):
+            for key in ("questions", "quiz", "items", "preguntas", "examen"):
                 if isinstance(obj.get(key), list):
                     parsed_list = obj[key]
                     break
             if parsed_list is not None:
                 break
 
+    if parsed_list is None and cleaned:
+        salvaged = _salvage_truncated_quiz_objects(cleaned)
+        if salvaged:
+            parsed_list = salvaged
+
     if isinstance(parsed_list, list):
         for item in parsed_list:
             if not isinstance(item, dict):
                 continue
-            q_text = str(item.get("question") or "").strip()
+            q_text = str(item.get("question") or item.get("pregunta") or item.get("enunciado") or "").strip()
             if not q_text:
                 continue
             raw_type = str(item.get("type") or "").strip().lower()
-            raw_opts = item.get("options") if isinstance(item.get("options"), list) else []
+            raw_opts_val = item.get("options") if isinstance(item.get("options"), list) else item.get("opciones")
+            raw_opts = raw_opts_val if isinstance(raw_opts_val, list) else []
 
             if mode in ("mcq", "true_false", "open"):
                 q_type = mode
@@ -1024,7 +1155,8 @@ def parse_quiz_json(raw_text: str, mode: str = "mixed") -> list[dict[str, Any]]:
                 q_type = "open"
 
             ts = _extract_timestamp(item.get("timestamp"))
-            hint = str(item.get("hint") or "").strip()
+            hint = str(item.get("hint") or item.get("pista") or "").strip()
+            explanation = str(item.get("explanation") or item.get("explicacion") or "").strip()
 
             if q_type == "true_false":
                 c_idx = 0
@@ -1064,7 +1196,7 @@ def parse_quiz_json(raw_text: str, mode: str = "mixed") -> list[dict[str, Any]]:
                         "question": q_text,
                         "options": ["Verdadero", "Falso"],
                         "correct_index": c_idx,
-                        "explanation": str(item.get("explanation") or "").strip(),
+                        "explanation": explanation,
                         "hint": hint,
                         "timestamp": ts,
                     }
@@ -1091,7 +1223,7 @@ def parse_quiz_json(raw_text: str, mode: str = "mixed") -> list[dict[str, Any]]:
                             "question": q_text,
                             "options": opts,
                             "correct_index": c_idx,
-                            "explanation": str(item.get("explanation") or "").strip(),
+                            "explanation": explanation,
                             "hint": hint,
                             "timestamp": ts,
                         }
@@ -1104,7 +1236,7 @@ def parse_quiz_json(raw_text: str, mode: str = "mixed") -> list[dict[str, Any]]:
                     "type": "open",
                     "question": q_text,
                     "expected_answer": str(
-                        item.get("expected_answer") or item.get("explanation") or ""
+                        item.get("expected_answer") or explanation or ""
                     ).strip(),
                     "hint": hint,
                     "timestamp": ts,
