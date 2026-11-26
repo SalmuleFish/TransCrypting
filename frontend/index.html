@@ -32,9 +32,9 @@
       <div class="topbar-center">
         <div id="segmented-tabs" class="segmented-tabs" role="tablist">
           <div id="seg-indicator" class="seg-indicator" aria-hidden="true"></div>
-          <button class="seg-btn active" data-tab="summary" role="tab">Resumen</button>
+          <button class="seg-btn" data-tab="summary" role="tab">Resumen</button>
           <button class="seg-btn" data-tab="transcript" role="tab">Transcripción</button>
-          <button class="seg-btn" data-tab="chat" role="tab">
+          <button class="seg-btn active" data-tab="chat" role="tab">
             Chat <span id="chat-badge-count" class="tab-count hidden">0</span>
           </button>
           <button class="seg-btn" data-tab="quiz" role="tab">Examen</button>
@@ -189,7 +189,7 @@
             </div>
 
             <div class="ws-actions">
-              <div id="actions-summary" class="action-group">
+              <div id="actions-summary" class="action-group hidden">
                 <button id="btn-resummarize" class="pill-btn outline sm" title="Regenerar resumen general con el modelo actual">
                   Regenerar
                 </button>
@@ -203,7 +203,7 @@
                 <button id="btn-copy-transcript" class="pill-btn outline sm">Copiar todo</button>
               </div>
 
-              <div id="actions-chat" class="action-group hidden">
+              <div id="actions-chat" class="action-group">
                 <button
                   id="btn-clear-chat"
                   class="pill-btn danger-soft sm"
@@ -224,7 +224,7 @@
           </header>
 
           <div id="center-scroll" class="ws-scroll">
-            <div id="tab-summary" class="tab-pane"></div>
+            <div id="tab-summary" class="tab-pane hidden"></div>
             <div id="tab-transcript" class="tab-pane hidden">
               <section id="microphone-live-panel" class="content-card hidden" aria-labelledby="microphone-live-title">
                 <h2 id="microphone-live-title" class="content-card-header">Transcripción en vivo</h2>
@@ -233,7 +233,7 @@
               </section>
               <div id="transcript-content" class="tab-pane"></div>
             </div>
-            <div id="tab-chat" class="tab-pane hidden">
+            <div id="tab-chat" class="tab-pane">
               <div id="chat-messages" class="chat-messages"></div>
               <div id="quick-prompts" class="quick-prompts hidden"></div>
             </div>
@@ -241,7 +241,7 @@
             <div id="tab-podcast" class="tab-pane hidden"></div>
           </div>
 
-          <div id="composer-dock" class="composer-dock hidden">
+          <div id="composer-dock" class="composer-dock">
             <form id="chat-form" class="composer-pill">
               <button type="button" id="btn-quick-attach" class="circle-btn soft" title="Adjuntar otra fuente o audio a esta conversación">
                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
