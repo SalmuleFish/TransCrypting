@@ -456,10 +456,10 @@ html, body {
 }
 
 .studio-topbar {
-  display: grid;
-  grid-template-columns: minmax(190px, 1fr) auto minmax(220px, 1fr);
+  display: flex;
   align-items: center;
-  gap: 12px;
+  justify-content: space-between;
+  gap: 10px;
   padding: 7px 12px;
   background: var(--surface-white);
   border: 1px solid var(--border);
@@ -473,6 +473,7 @@ html, body {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex: 1 1 0;
   min-width: 0;
 }
 
@@ -505,6 +506,7 @@ html, body {
 .topbar-center {
   display: flex;
   justify-content: center;
+  flex: 0 0 auto;
 }
 
 .topbar-right {
@@ -512,6 +514,8 @@ html, body {
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
+  flex: 1 1 auto;
+  min-width: max-content;
 }
 
 .circle-btn.sm {
@@ -691,9 +695,20 @@ html, body {
   cursor: wait;
 }
 
+@media (max-width: 1320px) {
+  .topbar-brand-copy {
+    display: none;
+  }
+  .stop-ai-pill {
+    padding: 5px 10px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+}
+
 @media (max-width: 1080px) {
   .studio-topbar {
-    grid-template-columns: auto 1fr auto;
+    gap: 8px;
   }
   .topbar-brand-copy {
     display: none;
