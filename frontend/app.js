@@ -16,7 +16,7 @@ const state = {
   activeSession: null,
   activeRecordingId: null,
   systemStatus: null,
-  activeTab: "summary",
+  activeTab: "chat",
   isStreaming: false,
   isResummarizing: false,
   summarizingRecId: null,
@@ -6848,7 +6848,7 @@ async function initApp() {
 
   initAllCustomSelects();
   initEvents();
-  switchTab("summary");
+  switchTab(state.activeTab);
   await refreshSystemStatus();
   await loadSessions(true);
   setInterval(refreshSystemStatus, 3000);
