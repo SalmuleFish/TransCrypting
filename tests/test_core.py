@@ -2303,8 +2303,13 @@ def test_asr_model_status_and_modular_endpoints(tmp_path: Path, monkeypatch: pyt
     (qwen_dir / "config.json").write_text("{}", encoding="utf-8")
     (qwen_dir / "model.safetensors").write_bytes(b"weights")
 
+    direct_ct2 = models_dir / "medium"
+    direct_ct2.mkdir(parents=True)
+    (direct_ct2 / "model.bin").write_bytes(b"ct2")
+
     # Precise suffix check: large-v3-turbo must NOT mark large-v3 as installed
     assert cfg.is_asr_model_installed("large-v3-turbo", models_dir=models_dir, asr_dir=asr_dir, hf_cache_dir=hf_cache) is True
+    assert cfg.is_asr_model_installed("medium", models_dir=models_dir, asr_dir=asr_dir, hf_cache_dir=hf_cache) is True
     assert cfg.is_asr_model_installed("large-v3", models_dir=models_dir, asr_dir=asr_dir, hf_cache_dir=hf_cache) is False
     assert cfg.is_asr_model_installed(cfg.PARAKEET_MODEL_ID, models_dir=models_dir, asr_dir=asr_dir, hf_cache_dir=hf_cache) is True
     assert cfg.is_asr_model_installed(cfg.CANARY_MODEL_ID, models_dir=models_dir, asr_dir=asr_dir, hf_cache_dir=hf_cache) is False
@@ -2341,6 +2346,11 @@ def test_asr_model_status_and_modular_endpoints(tmp_path: Path, monkeypatch: pyt
     assert res_rm.status_code == 200
     assert res_rm.json()["deleted"] is True
     assert ("rm", "small") in calls
+
+    # Real delete_asr_model must also remove Windows direct CTranslate2 folders cleanly
+    from backend.whisper_service import delete_asr_model
+    assert delete_asr_model("medium", models_dir=models_dir, asr_dir=asr_dir, hf_cache_dir=hf_cache) is True
+    assert not direct_ct2.exists()
     test_db.close()
 
 

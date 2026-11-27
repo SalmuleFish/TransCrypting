@@ -196,6 +196,9 @@ def is_asr_model_installed(
         if any((models_dir / "ggml" / f"ggml-{variant}.bin").is_file() for variant in variants):
             return True
 
+    if (models_dir / mid / "model.bin").is_file():
+        return True
+
     if models_dir.is_dir():
         suffix = f"--faster-whisper-{mid.lower()}"
         for entry in models_dir.iterdir():

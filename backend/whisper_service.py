@@ -1363,6 +1363,11 @@ def delete_asr_model(
                 path.unlink()
                 removed = True
 
+    direct = models_dir / mid
+    if direct.is_dir() and (direct / "model.bin").is_file():
+        shutil.rmtree(direct, ignore_errors=True)
+        removed = True
+
     if models_dir.is_dir():
         suffix = f"--faster-whisper-{mid.lower()}"
         for entry in list(models_dir.iterdir()):
