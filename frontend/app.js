@@ -7,6 +7,7 @@ const SOURCE_EXTENSIONS = new Set([
   ".pdf", ".pptx", ".docx", ".txt", ".md", ".png", ".jpg", ".jpeg", ".webp", ".bmp",
 ]);
 const TAB_ORDER = ["summary", "transcript", "chat", "quiz", "podcast"];
+const WORKSPACE_VIEW_KEY = "transcrypting_workspace_view";
 const PARAKEET_MODEL_ID = "parakeet-tdt-0.6b-v3";
 const NEMOTRON_MODEL_ID = "nemotron-labs-unified-asr-0.6b";
 
@@ -18,6 +19,7 @@ const state = {
   systemStatus: null,
   activeTab: "chat",
   isStreaming: false,
+  updatingSources: false,
   isResummarizing: false,
   summarizingRecId: null,
   chatAbortController: null,
@@ -47,8 +49,10 @@ const state = {
   lastLockedPodId: null,
   transcriptRecFilter: null,
   transcriptSpeakerFilter: null,
+  sourceViewer: null,
   collapsedRecSummaries: new Set(),
   renameTarget: null,
+  identifyingSpeakers: new Set(),
   captureMode: "mic",
 };
 
@@ -112,7 +116,8 @@ function showToast(message, isError = false) {
 }
 
 function getActiveModelLabel() {
-  return state.systemStatus?.settings?.ollama_model || "Modelo local";
+  const settings = state.systemStatus?.settings;
+  return settings?.text_provider === "deepseek" ? "DeepSeek Flash" : settings?.ollama_model || "Modelo local";
 }
 
 function escapeHtml(str) {
@@ -234,7 +239,7 @@ function makeTimestampPillHtml(tsStr, rec = null) {
       displayText = `${shortStem} · ${clean}`;
     }
   }
-  return `<button type="button" class="chat-ts-pill"${recAttr} data-seconds="${seconds}" data-label="${escapeHtml(clean)}" title="${escapeHtml(titleText)}"><span class="ts-play-tri">▶</span>${escapeHtml(displayText)}</button>`;
+  return `<button type="button" class="chat-ts-pill"${recAttr} data-seconds="${seconds}" data-label="${escapeHtml(clean)}" title="${escapeHtml(titleText)}">${lucideIcon("play", 11, "ts-play-tri")}${escapeHtml(displayText)}</button>`;
 }
 
 function findMatchingSourceByRef(refText) {
@@ -259,7 +264,7 @@ function findMatchingSourceByRef(refText) {
 }
 
 function makeSourcePillHtml(source, label, locator = "") {
-  const icon = source?.source_type === "image" ? "🖼" : "📄";
+  const icon = source?.source_type === "image" ? lucideIcon("image", 14) : lucideIcon("file-text", 14);
   return `<button type="button" class="chat-src-pill" data-source-id="${escapeHtml(source?.id || "")}" data-locator="${escapeHtml(locator)}" title="Abrir fuente: ${escapeHtml(label)}"><span>${icon}</span><span>${escapeHtml(label)}</span></button>`;
 }
 
@@ -310,7 +315,7 @@ function makeCitationPillHtml(refValue) {
   if (source) {
     return makeSourcePillHtml(source, clean, locator);
   }
-  return `<span class="chat-src-pill" style="cursor:default;">📄 ${escapeHtml(clean)}</span>`;
+  return `<span class="chat-src-pill" style="cursor:default;">${lucideIcon("file-text", 14)} ${escapeHtml(clean)}</span>`;
 }
 
 function enhanceTimestampsInHtml(html) {
@@ -510,7 +515,7 @@ function renderMarkdown(raw, withTimestampPills = false) {
       const taskMatch = itemBody.match(/^\[(x|X| )\]\s+(.*)$/);
       if (taskMatch) {
         const checked = taskMatch[1].toLowerCase() === "x";
-        itemBody = `<span class="md-task-box ${checked ? "done" : ""}" aria-hidden="true">${checked ? "✓" : ""}</span><span>${formatInline(taskMatch[2])}</span>`;
+        itemBody = `<span class="md-task-box ${checked ? "done" : ""}" aria-hidden="true">${checked ? lucideIcon("check", 11) : ""}</span><span>${formatInline(taskMatch[2])}</span>`;
         out.push(`<li class="md-task-item">${itemBody}</li>`);
       } else {
         out.push(`<li>${formatInline(itemBody)}</li>`);
@@ -534,16 +539,21 @@ function renderMarkdown(raw, withTimestampPills = false) {
 
 // --- SVG Icons ---
 
-const ICON_PLAY = `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><polygon points="6 4 20 12 6 20 6 4"/></svg>`;
-const ICON_PAUSE = `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
-const ICON_TRASH = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>`;
-const ICON_RETRANSCRIBE = `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>`;
-const ICON_RENAME = `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>`;
-const ICON_CHEVRON = `<svg class="bento-select-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`;
-const ICON_CHECK = `<svg class="bento-select-check" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
-const ICON_SPARKLE = `<svg class="chip-sparkle" viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M12 2.5L14.4 9.6L21.5 12L14.4 14.4L12 21.5L9.6 14.4L2.5 12L9.6 9.6Z"/></svg>`;
-const ICON_SEND_ARROW = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>`;
-const ICON_STOP_SQUARE = `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2.5"/></svg>`;
+function lucideIcon(name, size = 16, className = "") {
+  const classes = className ? `lucide ${className}` : "lucide";
+  return `<svg class="${classes}" width="${size}" height="${size}" aria-hidden="true"><use href="/lucide.svg#${name}"/></svg>`;
+}
+
+const ICON_PLAY = lucideIcon("play", 13);
+const ICON_PAUSE = lucideIcon("pause", 13);
+const ICON_TRASH = lucideIcon("trash", 14);
+const ICON_RETRANSCRIBE = lucideIcon("rotate-cw", 12);
+const ICON_RENAME = lucideIcon("pencil-line", 12);
+const ICON_CHEVRON = lucideIcon("chevron-down", 16, "bento-select-chevron");
+const ICON_CHECK = lucideIcon("check", 15, "bento-select-check");
+const ICON_SPARKLE = lucideIcon("sparkles", 14, "chip-sparkle");
+const ICON_SEND_ARROW = lucideIcon("arrow-up", 16);
+const ICON_STOP_SQUARE = lucideIcon("square", 13);
 
 // --- Theme (Light / Soft Graphite Dark) ---
 
@@ -710,7 +720,7 @@ function closeActiveDropdown() {
   }
 }
 
-function initCustomSelect(selectEl) {
+function initCustomSelect(selectEl, { prefix, minMenuWidth = 0 } = {}) {
   if (!selectEl || customSelectControllers.has(selectEl.id)) return;
 
   selectEl.classList.add("native-select-hidden");
@@ -727,6 +737,11 @@ function initCustomSelect(selectEl) {
   const valueSpan = document.createElement("span");
   valueSpan.className = "bento-select-value";
 
+  if (prefix) {
+    valueSpan.id = `${selectEl.id}-value`;
+    trigger.setAttribute("aria-labelledby", `${selectEl.getAttribute("aria-labelledby")} ${valueSpan.id}`);
+    trigger.appendChild(prefix);
+  }
   trigger.appendChild(valueSpan);
   trigger.insertAdjacentHTML("beforeend", ICON_CHEVRON);
 
@@ -736,9 +751,13 @@ function initCustomSelect(selectEl) {
   const syncLabel = () => {
     const selectedOpt = selectEl.options[selectEl.selectedIndex];
     valueSpan.textContent = selectedOpt ? selectedOpt.textContent : "";
+    trigger.disabled = selectEl.disabled;
+    if (prefix) trigger.title = selectEl.title || valueSpan.textContent;
+    if (trigger.disabled && activeDropdownWrapper === wrapper) closeActiveDropdown();
   };
 
   const openOrToggleMenu = (e) => {
+    if (selectEl.disabled) return;
     e.stopPropagation();
     const isSame = activeDropdownWrapper === wrapper;
     closeActiveDropdown();
@@ -779,8 +798,9 @@ function initCustomSelect(selectEl) {
     const spaceBelow = window.innerHeight - rect.bottom - 12;
     const openUp = spaceBelow < Math.min(240, menuRect.height + 8) && rect.top > spaceBelow;
 
-    menu.style.width = `${rect.width}px`;
-    menu.style.left = `${rect.left}px`;
+    const width = Math.min(Math.max(rect.width, minMenuWidth), window.innerWidth - 20);
+    menu.style.width = `${width}px`;
+    menu.style.left = `${Math.min(rect.left, window.innerWidth - width - 10)}px`;
     if (openUp) {
       menu.style.top = `${Math.max(10, rect.top - menuRect.height - 6)}px`;
     } else {
@@ -804,7 +824,10 @@ function initCustomSelect(selectEl) {
 }
 
 function initAllCustomSelects() {
-  document.querySelectorAll("#settings-form select").forEach(initCustomSelect);
+  document.querySelectorAll("#settings-form select").forEach((select) => initCustomSelect(select));
+  document.querySelectorAll(".topbar-model select").forEach((select) => {
+    initCustomSelect(select, { prefix: select.previousElementSibling, minMenuWidth: 200 });
+  });
 }
 
 function refreshCustomSelect(selectId) {
@@ -1137,6 +1160,38 @@ async function refreshSystemStatus(options = {}) {
   } catch (_) {}
 }
 
+function syncTopbarSelect(id, options, value, busy) {
+  const select = document.getElementById(id);
+  if (select.dataset.saving) return;
+  if (select.length !== options.length || options.some(([key, label], index) =>
+    select.options[index].value !== key || select.options[index].text !== label
+  )) {
+    select.replaceChildren(...options.map(([key, label]) => new Option(label, key)));
+  }
+  if (select.value !== value) select.value = value;
+  select.disabled = busy || options.length === 0;
+  refreshCustomSelect(id);
+}
+
+function renderTopbarModelSelects(data) {
+  const settings = data.settings || {};
+  const res = data.resources || {};
+  const busy = Boolean(res.podcast_active || res.phase === "podcast");
+  const audio = (data.whisper_models || []).map(({ id, engine }) => [
+    id, engine === "Parakeet" ? "Parakeet v3" : engine || `Whisper ${id}`,
+  ]);
+  const audioId = audio.some(([id]) => id === settings.whisper_model)
+    ? settings.whisper_model : data.whisper_default_model || audio[0]?.[0] || "";
+  const localNames = (data.ollama_models || []).map(({ name }) => name);
+  const localModel = settings.ollama_model || localNames[0] || "";
+  const text = Array.from(new Set([...localNames, localModel]), (name) => [`ollama:${name}`, name || "Ollama local"]);
+  text.push(["deepseek", "DeepSeek Flash"]);
+  const textId = settings.text_provider === "deepseek" ? "deepseek" : `ollama:${localModel}`;
+
+  syncTopbarSelect("topbar-audio-model", audio, audioId, busy);
+  syncTopbarSelect("topbar-text-model", text, textId, busy);
+}
+
 function renderTelemetry(data) {
   const hw = data.hardware || {};
   const res = data.resources || {};
@@ -1168,7 +1223,17 @@ function renderTelemetry(data) {
 
   document.getElementById("ram-text").textContent = `${hw.ram_used_gb} / ${hw.ram_total_gb} GB`;
   document.getElementById("ram-bar").style.width = `${Math.min(100, hw.ram_percent || 0)}%`;
-  const activeLabel = getActiveModelLabel();
+  const audioModel = document.getElementById("topbar-audio-model");
+  const textModel = document.getElementById("topbar-text-model");
+  const audioRunning = res.active_operation?.kind === "audio" || res.phase === "whisper";
+  const textRunning = res.phase === "llm";
+  const remoteText = textRunning ? res.active_device === "api/deepseek" : settings.text_provider === "deepseek";
+  audioModel.closest(".topbar-model").classList.toggle("is-running", audioRunning);
+  textModel.closest(".topbar-model").classList.toggle("is-running", textRunning);
+  audioModel.title = audioRunning && res.active_model ? `En uso · ${res.active_model}` : "";
+  textModel.title = textRunning && res.active_model ? `En uso · ${res.active_model}` : "";
+  renderTopbarModelSelects(data);
+  document.getElementById("text-provider-mode").textContent = remoteText ? "Texto por API" : "Texto local";
   document.getElementById("active-model-name").textContent = res.active_model || runningOllama[0]?.name || "—";
 
   const pill = document.getElementById("model-state-pill");
@@ -1181,13 +1246,12 @@ function renderTelemetry(data) {
     vramChip.textContent = hw.gpu_available ? `VRAM ${vramPct}%` : hasMetal ? "Metal" : "CPU";
   }
 
-  if (res.active_operation?.kind === "audio" || res.phase === "whisper") {
+  if (audioRunning) {
     pill.className = "mini-status active";
-    const engine = data.whisper_models?.find((model) => model.id === res.active_model)?.engine || "Whisper";
-    pillText.textContent = `Audio · ${engine}`;
-  } else if (res.phase === "llm") {
+    pillText.textContent = "Transcribiendo";
+  } else if (textRunning) {
     pill.className = "mini-status active";
-    pillText.textContent = `Texto · ${res.active_operation?.label || res.active_model || activeLabel}`;
+    pillText.textContent = res.active_operation?.label || "Generando texto";
   } else if (res.phase === "podcast" || res.podcast_active) {
     pill.className = "mini-status active";
     const podPct = Math.max(8, Math.round((res.podcast_progress || 0) * 100));
@@ -1200,7 +1264,7 @@ function renderTelemetry(data) {
     pillText.textContent = hasMetal ? "Modelo cargado" : "En VRAM";
   } else {
     pill.className = "mini-status idle";
-    pillText.textContent = hasMetal ? "Listo" : "VRAM libre";
+    pillText.textContent = "Listo";
   }
 
   if (telTrigger) {
@@ -1276,10 +1340,11 @@ function applyPodcastLockToDOM(isBusy) {
     telTrigger.classList.toggle("podcast-live", isBusy);
   }
 
-  document.querySelectorAll("#recordings-list .source-check, #recordings-list .retranscribe-btn, #recordings-list .rec-remove-btn").forEach((el) => {
+  document.querySelectorAll("#recordings-list .retranscribe-btn, #recordings-list .rec-remove-btn").forEach((el) => {
     el.disabled = isBusy;
     el.classList.toggle("is-podcast-locked", isBusy);
   });
+  syncSourceSelectionControls();
 }
 
 function updatePodcastElapsedDOM() {
@@ -1364,6 +1429,8 @@ function updateTabIndicator() {
   indicator.style.transform = `translateX(${activeBtn.offsetLeft}px)`;
 }
 
+const isCompactDrawerMode = () => window.innerWidth <= 1040;
+
 function switchTab(tabName, options = {}) {
   if (state.podcastBusy && !options.force && tabName !== "podcast") {
     showToast("Las pestañas están bloqueadas mientras se genera el podcast para evitar saturar el equipo.", true);
@@ -1376,6 +1443,7 @@ function switchTab(tabName, options = {}) {
   state.activeTab = tabName;
   document.querySelectorAll(".seg-btn").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.tab === tabName);
+    btn.setAttribute("aria-selected", String(btn.dataset.tab === tabName));
   });
 
   for (const name of TAB_ORDER) {
@@ -1405,11 +1473,10 @@ function switchTab(tabName, options = {}) {
   requestAnimationFrame(updateTabIndicator);
 
   if (tabName === "chat") {
-    const scroll = document.getElementById("center-scroll");
-    scroll.scrollTop = scroll.scrollHeight;
     if (state.activeSession) {
       ensureDynamicSuggestions(state.activeSession);
     }
+    scrollChatToLatest();
   } else if (tabName === "transcript" && transcriptPlayback) {
     syncTranscriptPlayback(audioPlayers.get(transcriptPlayback.recId), true);
   } else if (tabName === "quiz" && state.activeSession) {
@@ -1421,7 +1488,28 @@ function switchTab(tabName, options = {}) {
 
 // --- Sessions ---
 
-async function loadSessions(selectFirstIfNone = true) {
+function saveWorkspaceView() {
+  if (!state.activeSession || state.activeSession.id !== state.activeSessionId) return;
+  const view = {
+    sessionId: state.activeSessionId,
+    tab: state.activeTab,
+    transcriptId: state.transcriptRecFilter,
+    speaker: state.transcriptSpeakerFilter,
+    transcriptQuery: document.getElementById("transcript-search").value,
+    scrollTop: document.getElementById("center-scroll").scrollTop,
+  };
+  if (state.sourceViewer && isModalOpen("source-viewer-modal")) {
+    view.sourceViewer = {
+      ...state.sourceViewer,
+      scrollTop: document.getElementById("source-viewer-text").scrollTop,
+    };
+  }
+  try {
+    sessionStorage.setItem(WORKSPACE_VIEW_KEY, JSON.stringify(view));
+  } catch (_) {}
+}
+
+async function loadSessions(selectFirstIfNone = true, savedView = null) {
   state.sessions = await api("/api/sessions");
   renderSessionList();
 
@@ -1431,7 +1519,8 @@ async function loadSessions(selectFirstIfNone = true) {
   }
 
   if (!state.activeSessionId && selectFirstIfNone && state.sessions.length > 0) {
-    await selectSession(state.sessions[0].id);
+    const savedSession = state.sessions.find((session) => session.id === savedView?.sessionId);
+    await selectSession(savedSession?.id ?? state.sessions[0].id, savedSession ? savedView : null);
   } else if (!state.activeSessionId) {
     renderActiveSession(null);
   }
@@ -1548,7 +1637,7 @@ function stopAllOtherAudio(exceptId = null) {
   }
 }
 
-async function selectSession(sessionId) {
+async function selectSession(sessionId, savedView = null) {
   if (state.podcastBusy && state.activeSessionId && sessionId !== state.activeSessionId) {
     showToast("Espera a que termine el podcast actual antes de cambiar de conversación.", true);
     return;
@@ -1569,11 +1658,31 @@ async function selectSession(sessionId) {
   state.activeSessionId = sessionId;
   renderSessionList();
   const detail = await api(`/api/sessions/${sessionId}`);
+  if (state.activeSessionId !== sessionId) return;
   state.activeSession = detail;
   if (!state.activeRecordingId && detail.recordings?.length) {
     state.activeRecordingId = detail.recordings[0].id;
   }
+  if (savedView && TAB_ORDER.includes(savedView.tab) && !state.podcastBusy) {
+    state.transcriptRecFilter = savedView.transcriptId;
+    state.transcriptSpeakerFilter = savedView.speaker;
+    document.getElementById("transcript-search").value = savedView.transcriptQuery || "";
+    if (savedView.tab !== state.activeTab) switchTab(savedView.tab);
+  }
   renderActiveSession(detail);
+  if (savedView && savedView.tab === state.activeTab && state.activeTab !== "chat") {
+    if (state.activeTab !== "transcript" || state.transcriptRecFilter === savedView.transcriptId) {
+      document.getElementById("center-scroll").scrollTop = savedView.scrollTop;
+    }
+  }
+  if (savedView?.sourceViewer) {
+    const view = savedView.sourceViewer;
+    const source = (detail.sources || []).find((item) => item.id === view.id);
+    if (source) {
+      openSourceViewer(source, view.locator);
+      document.getElementById("source-viewer-text").scrollTop = view.scrollTop;
+    }
+  }
   schedulePollingIfProcessing();
 }
 
@@ -1602,6 +1711,11 @@ function schedulePollingIfProcessing() {
           (session.sources || []).filter((s) => s.status === "ready").length +
           (session.podcasts || []).filter((p) => p.status === "ready").length;
         const fresh = await api(`/api/sessions/${session.id}`);
+        if (state.activeSessionId !== session.id) return;
+        if (state.updatingSources || state.activeSession !== session) {
+          schedulePollingIfProcessing();
+          return;
+        }
         state.activeSession = fresh;
         renderRecordings(fresh.recordings || [], fresh.sources || []);
         renderStatsTiles(fresh.recordings || [], fresh.sources || []);
@@ -1635,7 +1749,7 @@ function schedulePollingIfProcessing() {
   }
 }
 
-function renderActiveSession(session) {
+function renderActiveSession(session, { preserveChat = false } = {}) {
   const emptyEl = document.getElementById("empty-session-state");
   const activeEl = document.getElementById("active-session-view");
 
@@ -1663,8 +1777,9 @@ function renderActiveSession(session) {
   renderQuizTab(session);
   renderPodcastTab(session);
   renderWorkspaceSubtitle(session);
-  renderChatMessages(session.messages || []);
+  if (!preserveChat) renderChatMessages(session.messages || []);
   updateChatControls(session);
+  if (!preserveChat && state.activeTab === "chat") scrollChatToLatest();
   syncGlobalStopButton();
   requestAnimationFrame(updateTabIndicator);
 }
@@ -1684,25 +1799,24 @@ function renderStatsTiles(recordings, sources = []) {
 
 function renderWorkspaceSubtitle(session) {
   const sub = document.getElementById("session-subtitle");
-  const recs = session.recordings || [];
-  const srcs = session.sources || [];
-  const activeRecs = recs.filter((r) => r.status === "ready" && r.enabled !== false).length;
-  const activeSrcs = srcs.filter((s) => s.status === "ready" && s.enabled !== false).length;
-  const totalCount = recs.length + srcs.length;
+  const sources = [...(session.recordings || []), ...(session.sources || [])];
+  const activeSources = sources.filter((s) => s.status === "ready" && s.enabled !== false);
   const modelName = getActiveModelLabel();
   const mode = session.context_metrics?.mode || state.lastContextMode;
   const modeLabel = mode === "retrieval" ? "RAG Protegido (FTS5)" : "Contexto completo";
 
-  if (totalCount === 0) {
+  if (sources.length === 0) {
     sub.textContent = "Adjunta audios, PDFs, diapositivas o imágenes para comenzar";
-  } else if (activeRecs + activeSrcs === 0) {
-    const anyReady =
-      recs.some((r) => r.status === "ready") || srcs.some((s) => s.status === "ready");
+  } else if (activeSources.length === 0) {
+    const anyReady = sources.some((s) => s.status === "ready");
     sub.textContent = anyReady
       ? "Todas las fuentes están desactivadas · Activa al menos una en Fuentes"
-      : `Procesando ${totalCount} fuente(s)...`;
+      : `Procesando ${sources.length} fuente(s)...`;
   } else {
-    sub.textContent = `${modelName} · ${activeRecs + activeSrcs} fuente(s) activa(s) · ${modeLabel}`;
+    const selection = activeSources.length === 1
+      ? activeSources[0].filename
+      : `${activeSources.length} fuentes activas`;
+    sub.textContent = `${modelName} · ${selection} · ${modeLabel}`;
   }
 }
 
@@ -1822,22 +1936,46 @@ function showRecordingTranscript(recId) {
   }
 }
 
-async function setSourceEnabledState(kind, itemId, enabled) {
-  if (!state.activeSessionId) return;
-  const endpoint =
-    kind === "source"
-      ? `/api/sessions/${state.activeSessionId}/sources/${itemId}`
-      : `/api/sessions/${state.activeSessionId}/recordings/${itemId}`;
+function syncSourceSelectionControls(recordings = state.activeSession?.recordings || [], sources = state.activeSession?.sources || []) {
+  const items = [...recordings, ...sources];
+  const locked = state.updatingSources || state.podcastBusy;
+  document.getElementById("source-selection").classList.toggle("hidden", !items.length);
+  document.getElementById("btn-select-all-sources").disabled = locked || items.every((item) => item.enabled !== false);
+  document.getElementById("btn-deselect-all-sources").disabled = locked || items.every((item) => item.enabled === false);
+  document.querySelectorAll("#recordings-list .source-check, #recordings-list .rec-chat-btn").forEach((el) => {
+    el.disabled = locked;
+  });
+}
+
+async function updateSourceSelection(path, payload, { openChat = false, checkbox } = {}) {
+  const sessionId = state.activeSessionId;
+  if (!sessionId || state.activeSession?.id !== sessionId || state.updatingSources || state.podcastBusy) {
+    if (checkbox) checkbox.checked = !payload.enabled;
+    return;
+  }
+  state.updatingSources = true;
+  syncSourceSelectionControls();
   try {
-    const fresh = await api(endpoint, {
+    const fresh = await api(`/api/sessions/${sessionId}/${path}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
+      body: JSON.stringify(payload),
     });
+    if (state.activeSessionId !== sessionId) return;
     state.activeSession = fresh;
-    renderActiveSession(fresh);
+    renderActiveSession(fresh, { preserveChat: state.isStreaming });
+    schedulePollingIfProcessing();
+    if (openChat) {
+      switchTab("chat");
+      if (isCompactDrawerMode()) document.getElementById("drawer-backdrop").click();
+      document.getElementById("chat-input").focus();
+    }
   } catch (err) {
+    if (checkbox) checkbox.checked = !payload.enabled;
     showToast(err.message, true);
+  } finally {
+    state.updatingSources = false;
+    syncSourceSelectionControls();
   }
 }
 
@@ -1878,6 +2016,7 @@ function openSourceViewer(src, locator = "") {
 
   const renderPageContent = (idx) => {
     const page = pages[idx] || pages[0];
+    state.sourceViewer = { id: src.id, locator: page.locator || page.label || "" };
     bodyEl.textContent = page?.text || src.extracted_text || "Sin contenido disponible.";
     bodyEl.scrollTop = 0;
     pagesBar.querySelectorAll(".source-page-pill").forEach((btn, i) => {
@@ -1917,7 +2056,7 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     state.activeSessionId || "",
     state.activeRecordingId || "",
     (recordings || [])
-      .map((r) => `${r.id}:${r.filename}:${r.status}:${r.enabled !== false}:${r.duration_sec || 0}:${r.language || ""}:${r.error_message || ""}`)
+      .map((r) => `${r.id}:${r.filename}:${r.status}:${r.enabled !== false}:${r.duration_sec || 0}:${r.language || ""}:${r.error_message || ""}:${Boolean(r.transcript_text?.trim())}`)
       .join(","),
     (sources || [])
       .map((s) => `${s.id}:${s.filename}:${s.status}:${s.enabled !== false}:${s.page_count || 0}:${s.error_message || ""}`)
@@ -1958,9 +2097,12 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
         if (fill) fill.style.width = `${Math.max(8, Math.round((src.progress || 0) * 100))}%`;
       }
     }
+    syncSourceSelectionControls(recordings, sources);
     return;
   }
 
+  const scrollTop = list.scrollTop;
+  const cards = [];
   list.innerHTML = "";
 
   if (!hasRecs && !hasSrcs) {
@@ -1968,6 +2110,7 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     empty.className = "rec-empty";
     empty.textContent = "Aún no hay fuentes en esta conversación.";
     list.appendChild(empty);
+    syncSourceSelectionControls(recordings, sources);
     return;
   }
 
@@ -1976,6 +2119,7 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     const isActive = rec.id === state.activeRecordingId;
     const isEnabled = rec.enabled !== false;
     const isWorking = ["queued", "preparing", "transcribing", "summarizing"].includes(rec.status);
+    const canAsk = rec.status === "ready" && Boolean(rec.transcript_text?.trim());
 
     const card = document.createElement("div");
     card.className = `rec-card ${isActive ? "active" : ""} ${!isEnabled ? "is-disabled" : ""}`;
@@ -1983,7 +2127,9 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     card.dataset.durationSec = String(rec.duration_sec || 0);
 
     card.onclick = () => {
-      if (state.activeRecordingId !== rec.id) {
+      if (canAsk) {
+        updateSourceSelection("active-sources", { mode: "recording", recording_id: rec.id }, { openChat: true });
+      } else if (state.activeRecordingId !== rec.id) {
         state.activeRecordingId = rec.id;
         renderRecordings(recordings, sources);
       }
@@ -1998,7 +2144,7 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     chk.checked = isEnabled;
     chk.title = isEnabled ? "Incluida en el contexto (clic para desactivar)" : "Desactivada del contexto (clic para activar)";
     chk.onclick = (e) => e.stopPropagation();
-    chk.onchange = () => setSourceEnabledState("recording", rec.id, chk.checked);
+    chk.onchange = () => updateSourceSelection(`recordings/${rec.id}`, { enabled: chk.checked }, { checkbox: chk });
 
     const playBtn = document.createElement("button");
     playBtn.type = "button";
@@ -2023,11 +2169,22 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     const nameRow = document.createElement("div");
     nameRow.className = "rec-name-row";
 
-    const name = document.createElement("div");
+    const name = document.createElement("span");
     name.className = "rec-name";
-    name.title = rec.filename;
     name.textContent = rec.filename;
-    nameRow.appendChild(name);
+    if (canAsk) {
+      const ask = document.createElement("button");
+      ask.type = "button";
+      ask.className = "rec-chat-btn";
+      ask.title = `Preguntar sobre ${rec.filename}`;
+      ask.setAttribute("aria-label", ask.title);
+      ask.append(name);
+      ask.insertAdjacentHTML("beforeend", '<svg class="lucide" aria-hidden="true" width="14" height="14"><use href="/lucide.svg#message-circle"/></svg>');
+      nameRow.appendChild(ask);
+    } else {
+      name.title = rec.filename;
+      nameRow.appendChild(name);
+    }
 
     if (isActive && !isWorking) {
       const eq = document.createElement("span");
@@ -2136,7 +2293,7 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     removeBtn.type = "button";
     removeBtn.className = "rec-remove-btn";
     removeBtn.title = "Quitar grabación";
-    removeBtn.textContent = "✕";
+    removeBtn.innerHTML = lucideIcon("x", 14);
     removeBtn.onclick = (e) => {
       e.stopPropagation();
       openConfirm(
@@ -2233,7 +2390,7 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
       card.appendChild(scrubWrap);
     }
 
-    list.appendChild(card);
+    cards.push({ card, createdAt: rec.created_at || "" });
   }
 
   // Document & Image Sources (PDF, PPTX, DOCX, TXT/MD, Images)
@@ -2256,7 +2413,7 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     chk.checked = isEnabled;
     chk.title = isEnabled ? "Fuente activa en el contexto (clic para desactivar)" : "Fuente desactivada (clic para activar)";
     chk.onclick = (e) => e.stopPropagation();
-    chk.onchange = () => setSourceEnabledState("source", src.id, chk.checked);
+    chk.onchange = () => updateSourceSelection(`sources/${src.id}`, { enabled: chk.checked }, { checkbox: chk });
 
     let iconEl;
     if (kind === "image") {
@@ -2363,7 +2520,7 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
     removeBtn.type = "button";
     removeBtn.className = "rec-remove-btn";
     removeBtn.title = "Quitar fuente";
-    removeBtn.textContent = "✕";
+    removeBtn.innerHTML = lucideIcon("x", 14);
     removeBtn.onclick = (e) => {
       e.stopPropagation();
       openConfirm(
@@ -2429,9 +2586,13 @@ function renderRecordings(recordings, sources = state.activeSession?.sources || 
       card.appendChild(err);
     }
 
-    list.appendChild(card);
+    cards.push({ card, createdAt: src.created_at || "" });
   }
 
+  cards.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  list.append(...cards.map(({ card }) => card));
+  list.scrollTop = scrollTop;
+  syncSourceSelectionControls(recordings, sources);
   if (state.podcastBusy) {
     applyPodcastLockToDOM(true);
   }
@@ -2605,9 +2766,9 @@ function renderSummaryTab(session, animateReveal = false) {
   }
 
   const chipsHtml = [
-    ...readyRecs.map((r) => `<span class="summary-src-tag">🎙 ${escapeHtml(r.filename)}</span>`),
+    ...readyRecs.map((r) => `<span class="summary-src-tag">${lucideIcon("mic", 15)} ${escapeHtml(r.filename)}</span>`),
     ...readySrcs.map((s) => {
-      const ico = s.source_type === "image" ? "🖼" : "📄";
+      const ico = s.source_type === "image" ? lucideIcon("image", 14) : lucideIcon("file-text", 14);
       return `<button type="button" class="chat-src-pill" data-source-id="${escapeHtml(s.id)}" data-locator="" title="Abrir fuente">${ico} ${escapeHtml(s.filename)}</button>`;
     }),
   ].join("");
@@ -2624,7 +2785,7 @@ function renderSummaryTab(session, animateReveal = false) {
     ? `content-card combined ai-summary-glow ${revealClass}`
     : `content-card combined ${revealClass}`;
   const headerTitle = summaryMarkdown
-    ? `<span class="ai-summary-title-group"><span class="ai-sparkle-badge" aria-hidden="true">✦ IA</span><span>Resumen general de la sesión</span></span>`
+    ? `<span class="ai-summary-title-group"><span class="ai-sparkle-badge" aria-hidden="true">${ICON_SPARKLE} IA</span><span>Resumen general de la sesión</span></span>`
     : `<span>Resumen general de la sesión</span>`;
 
   pane.innerHTML = `
@@ -2650,6 +2811,35 @@ function getSpeakerToneClass(speaker, orderedSpeakers) {
   const idx = others.indexOf(speaker);
   const slot = (idx >= 0 ? idx : 0) % 6 + 1;
   return `spk-${slot}`;
+}
+
+function splitNemotronSegments(segments) {
+  return segments.flatMap((segment) => {
+    const { text, words } = segment;
+    const parts = Array.from((text || "").matchAll(/\S+/g));
+    if (!words?.length || parts.length !== words.length) return [segment];
+
+    const rows = [];
+    let from = 0;
+    for (let i = 1; i <= words.length; i++) {
+      const last = words[i - 1];
+      const next = words[i];
+      const elapsed = last.end - words[from].start;
+      const sentenceEnd = /[.!?…]$/.test(parts[i - 1][0]);
+      if (!next || next.end - words[from].start > 12 || i - from >= 24 ||
+          next.start - last.end >= 1 || (elapsed >= 3 && sentenceEnd)) {
+        rows.push({
+          ...segment,
+          start: words[from].start,
+          end: last.end,
+          text: text.slice(parts[from].index, parts[i]?.index ?? text.length).trimEnd(),
+          words: words.slice(from, i),
+        });
+        from = i;
+      }
+    }
+    return rows;
+  });
 }
 
 function renderTranscriptTab(session) {
@@ -2685,6 +2875,7 @@ function renderTranscriptTab(session) {
     activeRec?.status || "",
     state.summarizingRecId || "",
     state.podcastBusy ? "1" : "0",
+    state.identifyingSpeakers.has(activeRec?.id),
     activeSpkList.join(","),
     recordings.map((r) => `${r.id}:${r.filename}:${r.status || ""}:${(r.transcript_text || "").length}:${(r.segments || []).length}:${(r.summary_text || "").length}:${r.whisper_model || ""}`).join(","),
     sources.map((s) => `${s.id}:${s.filename}`).join(","),
@@ -2696,7 +2887,7 @@ function renderTranscriptTab(session) {
     if (sources.length > 0) {
       const srcPills = sources
         .map((s) => {
-          const ico = s.source_type === "image" ? "🖼" : "📄";
+          const ico = s.source_type === "image" ? lucideIcon("image", 14) : lucideIcon("file-text", 14);
           return `<button type="button" class="chat-src-pill" data-source-id="${escapeHtml(s.id)}" data-locator="">${ico} ${escapeHtml(s.filename)}</button>`;
         })
         .join("");
@@ -2773,7 +2964,7 @@ function renderTranscriptTab(session) {
       titleWrap.className = "transcript-card-title-wrap";
       const ico = document.createElement("span");
       ico.className = "transcript-card-icon";
-      ico.textContent = "🎙";
+      ico.innerHTML = lucideIcon("mic", 20);
       const titleEl = document.createElement("span");
       titleEl.className = "transcript-card-title";
       titleEl.title = rec.filename;
@@ -2825,7 +3016,7 @@ function renderTranscriptTab(session) {
       } else if (hasSummary) {
         const sumBadge = document.createElement("span");
         sumBadge.className = "transcript-summary-badge";
-        sumBadge.textContent = "✦ Resumen IA";
+        sumBadge.innerHTML = `${ICON_SPARKLE} Resumen IA`;
         meta.appendChild(sumBadge);
       }
 
@@ -2845,7 +3036,7 @@ function renderTranscriptTab(session) {
       const foot = document.createElement("div");
       foot.className = "transcript-card-foot";
       const footLabel = hasSummary ? "Ver resumen y transcripción" : "Abrir transcripción completa";
-      foot.innerHTML = `<span>${footLabel}</span><span>→</span>`;
+      foot.innerHTML = `<span>${footLabel}</span>${lucideIcon("arrow-right", 14)}`;
       card.appendChild(foot);
 
       const openDetail = () => {
@@ -2880,7 +3071,7 @@ function renderTranscriptTab(session) {
   const backBtn = document.createElement("button");
   backBtn.type = "button";
   backBtn.className = "pill-btn outline sm transcript-back-btn";
-  backBtn.textContent = "← Todos los audios";
+  backBtn.innerHTML = `${lucideIcon("arrow-left", 14)} Todos los audios`;
   backBtn.onclick = () => {
     state.transcriptRecFilter = null;
     state.transcriptSpeakerFilter = null;
@@ -2895,7 +3086,7 @@ function renderTranscriptTab(session) {
       const pillBtn = document.createElement("button");
       pillBtn.type = "button";
       pillBtn.className = `quiz-choice-pill ${r.id === activeRec.id ? "active" : ""}`;
-      pillBtn.textContent = `🎙 ${r.filename}`;
+      pillBtn.innerHTML = `${lucideIcon("mic", 15)} ${escapeHtml(r.filename)}`;
       pillBtn.onclick = () => {
         state.transcriptRecFilter = r.id;
         state.transcriptSpeakerFilter = null;
@@ -2912,13 +3103,28 @@ function renderTranscriptTab(session) {
 
   const header = document.createElement("div");
   header.className = "content-card-header";
+  const canIdentifySpeakers = activeRec.status === "ready" &&
+    activeRec.segments?.length > 0 && !activeRec.segments.some((s) => s.speaker_key === "me");
+  const identifyingSpeakers = state.identifyingSpeakers.has(activeRec.id);
+  const identifyLabel = activeSpkList.length ? "Volver a identificar" : "Identificar hablantes";
   header.innerHTML = `
-    <span>🎙 ${escapeHtml(activeRec.filename)}</span>
+    <span>${lucideIcon("mic", 15)} ${escapeHtml(activeRec.filename)}</span>
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
       <button type="button" class="pill-btn outline xs transcript-detail-rename-btn" title="Renombrar audio">Renombrar</button>
-      <button type="button" class="pill-btn outline xs transcript-detail-play-btn" title="Reproducir este audio">▶ Escuchar</button>
+      <button type="button" class="pill-btn outline xs transcript-detail-play-btn" title="Reproducir este audio">${ICON_PLAY} Escuchar</button>
+      ${canIdentifySpeakers ? `
+        <form class="transcript-speaker-controls">
+          <label>Voces
+            <input type="number" class="pill-input sm" name="count" min="1" max="32"
+              placeholder="${activeSpkList.length ? "Cantidad" : "Auto"}" ${activeSpkList.length ? "required" : ""}
+              title="Número de personas que hablan" />
+          </label>
+          <button type="submit" class="pill-btn outline xs transcript-identify-speakers"
+            ${activeSpkList.length ? 'title="Reemplaza las etiquetas de hablante de este audio"' : ""}
+            ${identifyingSpeakers ? 'disabled aria-busy="true"' : ""}>${identifyingSpeakers ? "Identificando hablantes…" : identifyLabel}</button>
+        </form>` : ""}
       ${activeRec.whisper_model && activeRec.transcript_text ? `<span class="card-badge">${escapeHtml(activeRec.whisper_model)}</span>` : ""}
-      <span class="card-badge">${formatDuration(activeRec.duration_sec)}${activeRec.segments?.length ? " · Pulsa una frase para escucharla" : ""}</span>
+      <span class="card-badge">${formatDuration(activeRec.duration_sec)}${activeRec.segments?.length ? " · Pulsa una palabra para escucharla" : ""}</span>
     </div>
   `;
   header.querySelector(".transcript-detail-rename-btn").onclick = () => {
@@ -2927,6 +3133,33 @@ function renderTranscriptTab(session) {
   header.querySelector(".transcript-detail-play-btn").onclick = () => {
     seekRecording(activeRec.id, 0, { pulse: true });
   };
+  const identifyForm = header.querySelector(".transcript-speaker-controls");
+  if (identifyForm) {
+    const identifyBtn = identifyForm.querySelector(".transcript-identify-speakers");
+    identifyForm.onsubmit = async (event) => {
+      event.preventDefault();
+      if (state.identifyingSpeakers.has(activeRec.id)) return;
+      const count = identifyForm.elements.count.valueAsNumber;
+      const countQuery = Number.isInteger(count) ? `?count=${count}` : "";
+      state.identifyingSpeakers.add(activeRec.id);
+      identifyBtn.disabled = true;
+      identifyBtn.setAttribute("aria-busy", "true");
+      identifyBtn.textContent = "Identificando hablantes…";
+      try {
+        await api(`/api/sessions/${session.id}/recordings/${activeRec.id}/speakers${countQuery}`, { method: "POST" });
+        if (state.activeSessionId === session.id) await selectSession(session.id);
+        showToast("Hablantes identificados.");
+      } catch (err) {
+        showToast(err.message, true);
+      } finally {
+        state.identifyingSpeakers.delete(activeRec.id);
+        identifyBtn.disabled = false;
+        identifyBtn.removeAttribute("aria-busy");
+        identifyBtn.textContent = identifyLabel;
+        if (state.activeSessionId === session.id) renderTranscriptTab(state.activeSession);
+      }
+    };
+  }
   card.appendChild(header);
 
   if (!activeRec.transcript_text) {
@@ -2950,16 +3183,17 @@ function renderTranscriptTab(session) {
 
   if (isRecSummarizing) {
     const stopScope = state.summarizingRecId === activeRec.id ? "rec-summary" : "";
+    const modelName = stopScope ? getActiveModelLabel() : state.systemStatus?.settings?.ollama_model || "Modelo local";
     summaryBox.classList.add("ai-summary-glow", "is-generating");
     summaryBox.innerHTML = `
       <div class="transcript-rec-summary-head">
         <span class="ai-summary-title-group">
-          <span class="ai-sparkle-badge" aria-hidden="true">✦ IA</span>
+          <span class="ai-sparkle-badge" aria-hidden="true">${ICON_SPARKLE} IA</span>
           <span class="transcript-rec-summary-title">Resumen de este audio</span>
         </span>
       </div>
       <div class="transcript-rec-summary-body">
-        ${buildSkeletonHtml(`${getActiveModelLabel()} está resumiendo este audio...`, true, stopScope)}
+        ${buildSkeletonHtml(`${modelName} está resumiendo este audio...`, true, stopScope)}
       </div>
     `;
   } else if (recSummaryText) {
@@ -2970,8 +3204,8 @@ function renderTranscriptTab(session) {
     summaryBox.innerHTML = `
       <div class="transcript-rec-summary-head">
         <button type="button" class="transcript-rec-summary-toggle" aria-expanded="${!isCollapsed}">
-          <svg class="transcript-rec-summary-chevron" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
-          <span class="ai-sparkle-badge" aria-hidden="true">✦ IA</span>
+          ${lucideIcon("chevron-down", 15, "transcript-rec-summary-chevron")}
+          <span class="ai-sparkle-badge" aria-hidden="true">${ICON_SPARKLE} IA</span>
           <span>Resumen de este audio</span>
         </button>
         <div class="transcript-rec-summary-actions">
@@ -2998,7 +3232,7 @@ function renderTranscriptTab(session) {
       if (!navigator.clipboard?.writeText) return;
       await navigator.clipboard.writeText(recSummaryText);
       const prev = copySumBtn.textContent;
-      copySumBtn.textContent = "✓ Copiado";
+      copySumBtn.textContent = "Copiado";
       copySumBtn.classList.add("is-confirmed");
       showToast("Resumen del audio copiado.");
       setTimeout(() => {
@@ -3028,7 +3262,10 @@ function renderTranscriptTab(session) {
 
   card.appendChild(summaryBox);
 
-  const segs = activeRec.segments || [];
+  const savedSegments = activeRec.segments || [];
+  const segs = activeRec.whisper_model === NEMOTRON_MODEL_ID
+    ? splitNemotronSegments(savedSegments)
+    : savedSegments;
   const speakerCounts = new Map();
   for (const s of segs) {
     const spk = (s.speaker || "").trim();
@@ -3170,8 +3407,14 @@ function renderTranscriptTab(session) {
       textEl.className = "segment-text";
       const words = document.createElement("span");
       words.className = "segment-words";
-      words.onclick = () => {
-        if (window.getSelection()?.isCollapsed !== false) playSegment();
+      words.onclick = (event) => {
+        if (window.getSelection()?.isCollapsed === false) return;
+        const wordStart = event.target.closest(".segment-word")?.dataset.seekTime;
+        if (wordStart === undefined) {
+          playSegment();
+        } else {
+          seekRecording(activeRec.id, Number(wordStart), { pulse: true });
+        }
       };
       const start = Number(seg.start);
       const end = Number(seg.end);
@@ -3208,6 +3451,7 @@ function renderTranscriptTab(session) {
 
         const wordStart = timings?.[i].start ?? start + (end - start) * i / parts.length;
         const wordEnd = timings?.[i].end ?? start + (end - start) * (i + 1) / parts.length;
+        if (Number.isFinite(wordStart)) word.dataset.seekTime = String(wordStart);
         return { start: wordStart, end: wordEnd, element: word };
       });
       words.append(text.slice(offset));
@@ -3310,7 +3554,7 @@ function startQuizTimer(session, qs) {
       if (qs.timeLimitMin > 0) {
         const totalSec = qs.timeLimitMin * 60;
         const rem = Math.max(0, totalSec - qs.elapsedSec);
-        badge.textContent = `⏱ ${formatDuration(rem)}`;
+        badge.innerHTML = `${lucideIcon("timer", 14)} ${formatDuration(rem)}`;
         badge.classList.toggle("urgent", rem <= 60);
         if (rem === 0 && qs.examMode && !qs.examSubmitted && !qs.submittingExam) {
           stopQuizTimer(qs);
@@ -3320,7 +3564,7 @@ function startQuizTimer(session, qs) {
           stopQuizTimer(qs);
         }
       } else {
-        badge.textContent = `⏱ ${formatDuration(qs.elapsedSec)}`;
+        badge.innerHTML = `${lucideIcon("timer", 14)} ${formatDuration(qs.elapsedSec)}`;
       }
     }
   }, 1000);
@@ -3477,7 +3721,7 @@ function buildQuizQuestionCard(session, q, idx, total, animate = true) {
     const hintBtn = document.createElement("button");
     hintBtn.type = "button";
     hintBtn.className = "quiz-hint-btn";
-    hintBtn.textContent = isHintOpen ? "Ocultar pista" : "💡 Ver pista";
+    hintBtn.innerHTML = isHintOpen ? "Ocultar pista" : `${lucideIcon("lightbulb", 14)} Ver pista`;
     hintBtn.onclick = () => {
       qs.revealedHints[q.id] = !qs.revealedHints[q.id];
       updateSingleQuizCard(session, q);
@@ -3528,7 +3772,7 @@ function buildQuizQuestionCard(session, q, idx, total, animate = true) {
       fb.className = "quiz-feedback";
       const tsPill = q.timestamp ? ` ${makeCitationPillHtml(q.timestamp)}` : "";
       const verdictHead = ans
-        ? (ans.isCorrect ? "✓ Correcto" : "✕ Incorrecto")
+        ? (ans.isCorrect ? `${lucideIcon("check", 14)} Correcto` : `${lucideIcon("x", 14)} Incorrecto`)
         : "— Sin responder";
       const correctLabel = optsList[q.correct_index] || "";
       const expl = q.explanation ? escapeHtml(q.explanation) : `La respuesta correcta es: ${escapeHtml(correctLabel)}.`;
@@ -3657,12 +3901,12 @@ function buildQuizSummaryNode(session, qs, stats) {
   sumCard.className = "quiz-summary-card";
   sumCard.innerHTML = `
     <div>
-      <div style="font-size:12.5px; opacity:0.8;">Examen completado · ⏱ ${formatDuration(qs.elapsedSec || 0)}</div>
+      <div style="font-size:12.5px; opacity:0.8;">Examen completado · ${lucideIcon("timer", 14)} ${formatDuration(qs.elapsedSec || 0)}</div>
       <div style="font-size:21px; font-weight:800;">Calificación final: ${stats.avgScore} / 100</div>
       <div class="quiz-summary-breakdown">
-        <span>✓ ${stats.correctCount} correctas</span>
+        <span>${lucideIcon("check", 14)} ${stats.correctCount} correctas</span>
         ${stats.partialCount > 0 ? `<span>· ~ ${stats.partialCount} parciales</span>` : ""}
-        <span>· ✕ ${stats.wrongCount + Math.max(0, stats.total - stats.correctCount - stats.partialCount - stats.wrongCount)} por repasar</span>
+        <span>· ${lucideIcon("x", 14)} ${stats.wrongCount + Math.max(0, stats.total - stats.correctCount - stats.partialCount - stats.wrongCount)} por repasar</span>
       </div>
     </div>
     <div class="quiz-summary-actions">
@@ -3877,20 +4121,20 @@ async function submitFullExam(session) {
 }
 
 const STUDIO_ICONS = {
-  mic: `<svg aria-hidden="true" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M9 22h6"/></svg>`,
-  doc: `<svg aria-hidden="true" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg>`,
-  image: `<svg aria-hidden="true" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`,
-  check: `<svg aria-hidden="true" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`,
-  mixed: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M14 17.5h7M17.5 14v7"/></svg>`,
-  mcq: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="7" r="2.2"/><path d="M11 7h9"/><circle cx="6" cy="12" r="2.2" fill="currentColor"/><path d="M11 12h9"/><circle cx="6" cy="17" r="2.2"/><path d="M11 17h9"/></svg>`,
-  true_false: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 8 7 11 11 6"/><path d="M14 9h6"/><path d="M5 15l4 4M9 15l-4 4"/><path d="M14 17h6"/></svg>`,
-  open: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>`,
-  immediate: `<svg aria-hidden="true" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`,
-  exam: `<svg aria-hidden="true" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 1.5"/><path d="M9 2h6"/></svg>`,
-  conversation: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>`,
-  exam_review: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg>`,
-  debate: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M20 7H9"/><path d="M8 21l-4-4 4-4"/><path d="M4 17h11"/></svg>`,
-  step_by_step: `<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18h6v-4h5v-4h5V6"/></svg>`,
+  mic: lucideIcon("mic", 15),
+  doc: lucideIcon("file-text", 15),
+  image: lucideIcon("image", 15),
+  check: lucideIcon("check", 13),
+  mixed: lucideIcon("layout-grid", 18),
+  mcq: lucideIcon("list-filter", 18),
+  true_false: lucideIcon("list-checks", 18),
+  open: lucideIcon("pencil-line", 18),
+  immediate: lucideIcon("zap", 17),
+  exam: lucideIcon("timer", 17),
+  conversation: lucideIcon("message-circle", 18),
+  exam_review: lucideIcon("target", 18),
+  debate: lucideIcon("arrow-left-right", 18),
+  step_by_step: lucideIcon("list-ordered", 18),
 };
 
 const QUIZ_MODE_LABELS = {
@@ -4049,7 +4293,7 @@ function renderQuizTab(session) {
 
   if (qs.loading) {
     if (resetBtn) resetBtn.classList.add("hidden");
-    const modelName = getActiveModelLabel();
+    const modelName = state.systemStatus?.settings?.ollama_model || "Modelo local";
     pane.innerHTML = buildSkeletonHtml(
       `${modelName} está diseñando tu examen personalizado...`,
       true,
@@ -4203,7 +4447,7 @@ function renderQuizTab(session) {
           <p class="deck-warning hidden" data-deck-warn>Selecciona al menos una fuente para habilitar la generación.</p>
           <button type="button" id="btn-generate-quiz" class="quiz-start-btn">
             <span>Generar examen</span>
-            <span class="cta-circle" aria-hidden="true">→</span>
+            <span class="cta-circle" aria-hidden="true">${lucideIcon("arrow-right", 16)}</span>
           </button>
         </aside>
       </div>
@@ -4278,8 +4522,8 @@ function renderQuizTab(session) {
   pane.innerHTML = "";
 
   const timerText = qs.timeLimitMin > 0
-    ? `⏱ ${formatDuration(Math.max(0, qs.timeLimitMin * 60 - (qs.elapsedSec || 0)))}`
-    : `⏱ ${formatDuration(qs.elapsedSec || 0)}`;
+    ? `${lucideIcon("timer", 14)} ${formatDuration(Math.max(0, qs.timeLimitMin * 60 - (qs.elapsedSec || 0)))}`
+    : `${lucideIcon("timer", 14)} ${formatDuration(qs.elapsedSec || 0)}`;
 
   const progCard = document.createElement("div");
   progCard.className = "quiz-progress-card";
@@ -4642,7 +4886,7 @@ async function cancelActivePodcast(sessionId, podcastId, btnEl) {
     showToast(err.message, true);
     if (btnEl) {
       btnEl.disabled = false;
-      btnEl.textContent = "✕ Cancelar";
+      btnEl.innerHTML = `${lucideIcon("x", 14)} Cancelar`;
     }
   } finally {
     state.cancellingPodcastId = null;
@@ -4836,7 +5080,7 @@ function renderPodcastTab(session) {
     modeBar.className = "podcast-mode-bar";
     modeBar.innerHTML = `
       <div class="podcast-mode-tabs" role="tablist" aria-label="Vista de podcast">
-        <button type="button" class="podcast-mode-tab ${effectiveViewMode === "listen" ? "active" : ""}" data-pod-view="listen">🎧 Escuchar (${readyPods.length})</button>
+        <button type="button" class="podcast-mode-tab ${effectiveViewMode === "listen" ? "active" : ""}" data-pod-view="listen">${lucideIcon("headphones", 14)} Escuchar (${readyPods.length})</button>
         <button type="button" class="podcast-mode-tab ${effectiveViewMode === "studio" ? "active" : ""}" data-pod-view="studio" ${readyRecs.length === 0 && readySrcs.length === 0 ? "disabled" : ""}>+ Nuevo episodio</button>
       </div>
     `;
@@ -4872,7 +5116,7 @@ function renderPodcastTab(session) {
         <div class="podcast-live-metrics">
           <span class="podcast-elapsed">${elapsedText}</span>
           <span class="podcast-live-pct">${pctNum}%</span>
-          ${canCancelNow ? `<button type="button" class="pod-cancel-btn" ${isCancelling ? "disabled" : ""}>${isCancelling ? "Cancelando..." : "✕ Cancelar"}</button>` : ""}
+          ${canCancelNow ? `<button type="button" class="pod-cancel-btn" ${isCancelling ? "disabled" : ""}>${isCancelling ? "Cancelando..." : `${lucideIcon("x", 14)} Cancelar`}</button>` : ""}
         </div>
       </div>
       <div class="podcast-live-hero">
@@ -4893,7 +5137,7 @@ function renderPodcastTab(session) {
         <span class="podcast-stage-step ${stepIdx === 2 ? "active" : ""}">3/3 Voces Kokoro-82M</span>
       </div>
       <div class="podcast-live-lock-note">
-        🔒 Las demás pestañas, chats, exámenes y cargas están bloqueadas temporalmente para dedicar toda la CPU/GPU al podcast. Pulsa <strong>Cancelar</strong> si deseas detenerlo al instante.
+        ${lucideIcon("lock", 14)} Las demás pestañas, chats, exámenes y cargas están bloqueadas temporalmente para dedicar toda la CPU/GPU al podcast. Pulsa <strong>Cancelar</strong> si deseas detenerlo al instante.
       </div>
     `;
 
@@ -5026,7 +5270,7 @@ function renderPodcastTab(session) {
 
           <button type="button" class="quiz-start-btn pod-start-btn">
             <span>Grabar podcast local</span>
-            <span class="cta-circle" aria-hidden="true">→</span>
+            <span class="cta-circle" aria-hidden="true">${lucideIcon("arrow-right", 16)}</span>
           </button>
         </aside>
       </div>
@@ -5229,7 +5473,7 @@ function renderPodcastTab(session) {
         const on = Boolean(state.podcastAutoScroll);
         followBtn.classList.toggle("active", on);
         followBtn.setAttribute("aria-pressed", String(on));
-        followBtn.textContent = on ? "✓ Siguiendo texto" : "Seguir texto";
+        followBtn.textContent = on ? "Siguiendo texto" : "Seguir texto";
       };
       syncFollowBtn();
       followBtn.onclick = () => {
@@ -5245,7 +5489,7 @@ function renderPodcastTab(session) {
           .join("\n\n");
         await navigator.clipboard.writeText(plain);
         const prev = copyBtn.textContent;
-        copyBtn.textContent = "✓ Copiado";
+        copyBtn.textContent = "Copiado";
         copyBtn.classList.add("is-confirmed");
         showToast("Guion copiado.");
         setTimeout(() => {
@@ -5990,6 +6234,8 @@ async function ensureDynamicSuggestions(session) {
 
 function renderQuickPrompts(session) {
   const quick = document.getElementById("quick-prompts");
+  const scroll = document.getElementById("center-scroll");
+  const wasAtBottom = state.activeTab === "chat" && scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop <= 1;
   const readyCount =
     (session?.recordings || []).filter((r) => r.status === "ready" && r.enabled !== false).length +
     (session?.sources || []).filter((s) => s.status === "ready" && s.enabled !== false).length;
@@ -6010,6 +6256,7 @@ function renderQuickPrompts(session) {
       <div class="prompt-chip-skel"></div>
       <div class="prompt-chip-skel"></div>
     `;
+    if (wasAtBottom) scrollChatToLatest();
     return;
   }
 
@@ -6047,6 +6294,7 @@ function renderQuickPrompts(session) {
     btn.onclick = () => sendChatQuestion(item.prompt);
     quick.appendChild(btn);
   });
+  if (wasAtBottom) scrollChatToLatest();
 }
 
 // --- Chat & Clear History ---
@@ -6085,6 +6333,9 @@ function renderChatMessages(messages) {
   for (const msg of messages) {
     appendChatBubble(msg.role, msg.content);
   }
+}
+
+function scrollChatToLatest() {
   const scroll = document.getElementById("center-scroll");
   scroll.scrollTop = scroll.scrollHeight;
 }
@@ -6113,9 +6364,6 @@ function appendChatBubble(role, content, isThinkingPlaceholder = false) {
     bubble.textContent = content;
   }
   container.appendChild(bubble);
-
-  const scroll = document.getElementById("center-scroll");
-  scroll.scrollTop = scroll.scrollHeight;
   return bubble;
 }
 
@@ -6181,7 +6429,7 @@ async function sendChatQuestion(questionText) {
     showToast("El chat está bloqueado mientras se genera el podcast.", true);
     return;
   }
-  if (state.isStreaming || !state.activeSessionId) return;
+  if (state.updatingSources || state.isStreaming || !state.activeSessionId) return;
   const question = (questionText || "").trim();
   if (!question) return;
 
@@ -6202,6 +6450,7 @@ async function sendChatQuestion(questionText) {
   const assistantBubble = appendChatBubble("assistant", "", true);
   const ecoProgress = createEcoProgressController(assistantBubble, "Leyendo fuentes");
   const scroll = document.getElementById("center-scroll");
+  scrollChatToLatest();
 
   let accumulated = "";
   let thinkingAccum = "";
@@ -6320,11 +6569,14 @@ async function sendChatQuestion(questionText) {
       answerContainerEl.innerHTML = renderMarkdown(accumulated, true);
     }
 
+    const previousSession = state.activeSession;
     const fresh = await api(`/api/sessions/${state.activeSessionId}`);
-    state.activeSession = fresh;
-    renderContextMetrics(fresh.context_metrics);
-    updateChatControls(fresh);
-    renderWorkspaceSubtitle(fresh);
+    if (state.activeSession === previousSession && !state.updatingSources) {
+      state.activeSession = fresh;
+      renderContextMetrics(fresh.context_metrics);
+      updateChatControls(fresh);
+      renderWorkspaceSubtitle(fresh);
+    }
     await loadSessions(false);
   } catch (err) {
     ecoProgress?.stop();
@@ -6426,6 +6678,13 @@ async function exportActiveSessionMarkdown() {
 
 function populateSettingsFromStatus(status) {
   const settings = status?.settings || {};
+  const providerSelect = document.getElementById("set-text-provider");
+  if (!providerSelect.dataset.edited) {
+    providerSelect.value = settings.text_provider || "ollama";
+  }
+  syncDeepSeekSettings(status?.deepseek_key_configured);
+  document.getElementById("set-theme").value = state.theme;
+
   const ollamaModels = status?.ollama_models || [];
   const whisperModels = status?.whisper_models || [
     { id: "tiny", label: "Whisper Tiny (~0.3 GB VRAM, ultra rápido)" },
@@ -6458,12 +6717,15 @@ function populateSettingsFromStatus(status) {
   for (const w of whisperModels) {
     const opt = document.createElement("option");
     opt.value = w.id;
-    const prefix = w.installed ? "✓ " : "↓ ";
+    const installStatus = w.installed ? " · Descargado" : " · Sin descargar";
     const sizeText = !w.installed && w.size_hint && !w.label.includes(w.size_hint) ? ` · ${w.size_hint}` : "";
-    opt.textContent = `${prefix}${w.label}${sizeText}`;
+    const defaultLabel = w.id === status?.whisper_default_model ? " · Predeterminado" : "";
+    opt.textContent = `${w.label}${sizeText}${installStatus}${defaultLabel}`;
     whisperSelect.appendChild(opt);
   }
-  whisperSelect.value = settings.whisper_model || whisperSelect.options[0]?.value || "large-v3-turbo";
+  whisperSelect.value = whisperModels.some((model) => model.id === settings.whisper_model)
+    ? settings.whisper_model
+    : status?.whisper_default_model || whisperSelect.options[0]?.value || "";
 
   const syncAsrModelActionUI = () => {
     const cur = whisperModels.find((m) => m.id === whisperSelect.value);
@@ -6487,14 +6749,16 @@ function populateSettingsFromStatus(status) {
     btn.disabled = false;
     if (cur.installed) {
       pill.className = "asr-model-status-pill installed";
-      pill.textContent = "✓ Descargado en disco";
+      const selected = cur.id === settings.whisper_model;
+      pill.textContent = selected ? "Descargado · modelo actual" : "Descargado en disco";
       btn.classList.toggle("hidden", !cur.can_delete);
+      btn.disabled = selected;
       btn.textContent = "Eliminar pesos";
       btn.dataset.asrAction = "delete";
     } else {
       pill.className = "asr-model-status-pill remote";
       const hint = cur.size_hint ? ` (${cur.size_hint})` : "";
-      pill.textContent = `↓ Sin descargar${hint} · baja solo si lo eliges`;
+      pill.textContent = `Sin descargar${hint} · baja solo si lo eliges`;
       btn.classList.toggle("hidden", !cur.can_download);
       btn.textContent = "Descargar ahora";
       btn.dataset.asrAction = "download";
@@ -6504,11 +6768,25 @@ function populateSettingsFromStatus(status) {
   const langSelect = document.getElementById("set-whisper-lang");
   const autoLangOpt = langSelect.querySelector('option[value="auto"]');
   langSelect.value = settings.whisper_language || "auto";
-  whisperSelect.onchange = () => {
+  const deviceSelect = document.getElementById("set-whisper-device");
+  document.getElementById("transcription-platform").textContent = status?.transcription_platform || "";
+  const syncAsrSettings = (preferredDevice) => {
+    const model = whisperModels.find((item) => item.id === whisperSelect.value);
+    const devices = model?.devices || ["auto", "cpu"];
+    const automatic = devices.includes("metal") ? "GPU Metal" : devices.includes("cuda") ? "GPU CUDA" : "";
+    const labels = {
+      auto: automatic ? `Automático (${automatic} con respaldo CPU)` : "Automático (CPU)",
+      metal: "Solo GPU Metal",
+      cuda: "Solo GPU CUDA",
+      cpu: "Solo CPU",
+    };
+    deviceSelect.replaceChildren(...devices.map((device) => new Option(labels[device], device)));
+    deviceSelect.value = devices.includes(preferredDevice) ? preferredDevice : "auto";
+    refreshCustomSelect(deviceSelect.id);
     document.getElementById("parakeet-language-hint").classList.toggle(
       "hidden", whisperSelect.value !== PARAKEET_MODEL_ID
     );
-    const requiresLanguage = Boolean(whisperModels.find((model) => model.id === whisperSelect.value)?.requires_language);
+    const requiresLanguage = Boolean(model?.requires_language);
     document.getElementById("nemotron-language-hint").classList.toggle("hidden", !requiresLanguage);
     autoLangOpt.disabled = requiresLanguage;
     if (requiresLanguage && langSelect.value === "auto") {
@@ -6517,23 +6795,8 @@ function populateSettingsFromStatus(status) {
     }
     syncAsrModelActionUI();
   };
-  whisperSelect.onchange();
-
-  const whisperDeviceSelect = document.getElementById("set-whisper-device");
-  const hasCuda = Boolean(status?.hardware?.gpu_available);
-  const autoOpt = whisperDeviceSelect.querySelector('option[value="auto"]');
-  const cudaOpt = whisperDeviceSelect.querySelector('option[value="cuda"]');
-  if (autoOpt) {
-    const gpuBackend = status?.whisper_metal_supported ? "Metal" : hasCuda ? "CUDA" : "";
-    autoOpt.textContent = gpuBackend
-      ? `Automático (GPU ${gpuBackend} con respaldo CPU)`
-      : "Automático (solo CPU en este equipo)";
-  }
-  if (cudaOpt) {
-    cudaOpt.disabled = !hasCuda;
-  }
-  const desiredDevice = settings.whisper_device || "auto";
-  whisperDeviceSelect.value = !hasCuda && desiredDevice === "cuda" ? "cpu" : desiredDevice;
+  whisperSelect.onchange = () => syncAsrSettings(deviceSelect.value);
+  syncAsrSettings(settings.whisper_device);
   document.getElementById("set-num-ctx").value = String(settings.num_ctx || 8192);
   document.getElementById("set-idle-unload").value = String(settings.idle_unload_sec || 180);
   document.getElementById("set-classroom-enhance").checked = settings.classroom_audio_enhance !== false;
@@ -6553,6 +6816,8 @@ function populateSettingsFromStatus(status) {
   );
 
   [
+    "set-theme",
+    "set-text-provider",
     "set-ollama-model",
     "set-whisper-model",
     "set-whisper-device",
@@ -6560,6 +6825,14 @@ function populateSettingsFromStatus(status) {
     "set-num-ctx",
     "set-idle-unload",
   ].forEach(refreshCustomSelect);
+}
+
+function syncDeepSeekSettings(keyConfigured) {
+  const useDeepSeek = document.getElementById("set-text-provider").value === "deepseek";
+  document.getElementById("deepseek-settings").classList.toggle("hidden", !useDeepSeek);
+  document.getElementById("deepseek-key-status").textContent = keyConfigured
+    ? "Clave guardada. Pega otra para cambiarla."
+    : "Pega la clave de tu cuenta de DeepSeek.";
 }
 
 function syncEcoThreadsUI(cpuCountOverride = null) {
@@ -6580,10 +6853,15 @@ function openSettingsModal() {
     showToast("Ajustes bloqueados mientras se genera el podcast en modo exclusivo.", true);
     return;
   }
-  state.appearancePreviewBackup = { accentColor: state.accentColor, fontScale: state.fontScale };
+  state.appearancePreviewBackup = {
+    accentColor: state.accentColor,
+    fontScale: state.fontScale,
+    theme: state.theme,
+  };
   populateSettingsFromStatus(state.systemStatus || {});
   document.getElementById("btn-open-settings").classList.add("active");
   openModal("settings-modal");
+  document.querySelector('.settings-nav [aria-pressed="true"]').focus();
   refreshSystemStatus({ syncSettingsModal: true });
 }
 
@@ -6591,15 +6869,79 @@ function closeSettingsModal(restoreBackup = true) {
   closeActiveDropdown();
   if (restoreBackup && state.appearancePreviewBackup) {
     applyAppearance(state.appearancePreviewBackup, true);
+    applyTheme(state.appearancePreviewBackup.theme);
   }
   state.appearancePreviewBackup = null;
-  document.getElementById("btn-open-settings").classList.remove("active");
+  delete document.getElementById("set-text-provider").dataset.edited;
+  document.getElementById("set-deepseek-api-key").value = "";
+  const trigger = document.getElementById("btn-open-settings");
+  trigger.classList.remove("active");
   closeModal("settings-modal");
+  trigger.focus();
+}
+
+function persistSettings(payload) {
+  return api("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+async function changeTopbarModel(event) {
+  const select = event.currentTarget;
+  const status = state.systemStatus;
+  if (!status || state.podcastBusy || select.dataset.saving) return;
+
+  const isAudio = select.id === "topbar-audio-model";
+  const modelId = select.value;
+  let payload;
+  if (isAudio) {
+    payload = { whisper_model: modelId };
+    const model = status.whisper_models?.find(({ id }) => id === modelId);
+    if (model?.requires_language && (!status.settings.whisper_language || status.settings.whisper_language === "auto")) {
+      payload.whisper_language = "es";
+    }
+  } else if (modelId === "deepseek") {
+    if (!status.deepseek_key_configured) {
+      renderTopbarModelSelects(status);
+      openSettingsModal();
+      document.querySelector('[data-settings-section="text"]').click();
+      const provider = document.getElementById("set-text-provider");
+      provider.value = "deepseek";
+      provider.dispatchEvent(new Event("change"));
+      document.getElementById("set-deepseek-api-key").focus();
+      return;
+    }
+    payload = { text_provider: "deepseek" };
+  } else {
+    payload = { text_provider: "ollama", ollama_model: modelId.slice("ollama:".length) };
+  }
+
+  select.dataset.saving = "true";
+  select.disabled = true;
+  refreshCustomSelect(select.id);
+  try {
+    const settings = await persistSettings(payload);
+    state.systemStatus.settings = settings;
+    await refreshSystemStatus();
+    if (!isAudio && state.activeSession) {
+      renderWorkspaceSubtitle(state.activeSession);
+      const chatHeading = document.querySelector("#chat-messages .chat-placeholder h3");
+      if (chatHeading) chatHeading.textContent = `Pregunta a ${getActiveModelLabel()}`;
+    }
+  } catch (err) {
+    showToast(err.message, true);
+  } finally {
+    delete select.dataset.saving;
+    renderTopbarModelSelects(state.systemStatus);
+  }
 }
 
 async function saveSettings(e) {
   e.preventDefault();
   const payload = {
+    text_provider: document.getElementById("set-text-provider").value,
     ollama_model: document.getElementById("set-ollama-model").value,
     whisper_model: document.getElementById("set-whisper-model").value,
     whisper_device: document.getElementById("set-whisper-device").value,
@@ -6612,16 +6954,19 @@ async function saveSettings(e) {
     eco_mode: document.getElementById("set-eco-mode").checked,
     auto_summarize: document.getElementById("set-auto-summarize").checked,
     eco_cpu_threads: Number(document.getElementById("set-eco-cpu-threads").value || 2),
+    theme: state.theme,
     accent_color: state.accentColor,
     font_scale: state.fontScale,
   };
-  await api("/api/settings", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+  const key = document.getElementById("set-deepseek-api-key").value.trim();
+  if (payload.text_provider === "deepseek" && key) {
+    payload.deepseek_api_key = key;
+  }
+  await persistSettings(payload);
   state.appearancePreviewBackup = null;
   applyAppearance({ accentColor: state.accentColor, fontScale: state.fontScale }, true);
+  state.themeSyncedFromServer = true;
+  applyTheme(state.theme, false, true);
   closeSettingsModal(false);
   await refreshSystemStatus();
   if (state.activeSessionId) {
@@ -6629,6 +6974,9 @@ async function saveSettings(e) {
     state.activeSession = fresh;
     renderContextMetrics(fresh.context_metrics);
     renderWorkspaceSubtitle(fresh);
+    if (!state.chatAbortController && !fresh.messages?.length) {
+      renderChatMessages([]);
+    }
   }
   showToast("Configuración guardada.");
 }
@@ -6641,7 +6989,7 @@ async function triggerUnloadVram() {
   try {
     await api("/api/system/unload", { method: "POST" });
     await refreshSystemStatus();
-    btn.textContent = "✓ Libre";
+    btn.textContent = "Libre";
     btn.classList.add("is-confirmed");
     showToast("Memoria VRAM y RAM liberada.");
     setTimeout(() => {
@@ -6666,10 +7014,26 @@ function initEvents() {
     applyTheme(next, true, true);
   };
 
+  const settingsNav = document.querySelector(".settings-nav");
+  const settingsContent = document.querySelector(".settings-content");
+  settingsNav.addEventListener("click", (event) => {
+    const selected = event.target.closest("[data-settings-section]");
+    if (!selected || selected.getAttribute("aria-pressed") === "true") return;
+    closeActiveDropdown();
+    for (const button of settingsNav.querySelectorAll("[data-settings-section]")) {
+      button.setAttribute("aria-pressed", String(button === selected));
+      document.getElementById(button.getAttribute("aria-controls")).classList.toggle("hidden", button !== selected);
+    }
+    settingsContent.scrollTop = 0;
+  });
+  document.getElementById("set-theme").addEventListener("change", (event) => applyTheme(event.target.value));
+  document.getElementById("set-text-provider").addEventListener("change", (event) => {
+    event.target.dataset.edited = "true";
+    syncDeepSeekSettings(state.systemStatus?.deepseek_key_configured);
+  });
+
   const studioBody = document.getElementById("studio-body");
   const drawerBackdrop = document.getElementById("drawer-backdrop");
-  const isCompactDrawerMode = () => window.innerWidth <= 1040;
-
   const syncDrawerBackdrop = () => {
     if (!drawerBackdrop) return;
     const anyDrawerOpen = isCompactDrawerMode() && (
@@ -6716,6 +7080,8 @@ function initEvents() {
     syncDrawerBackdrop();
     setTimeout(updateTabIndicator, 250);
   };
+  document.getElementById("btn-select-all-sources").onclick = () => updateSourceSelection("active-sources", { mode: "all" });
+  document.getElementById("btn-deselect-all-sources").onclick = () => updateSourceSelection("active-sources", { mode: "none" });
   drawerBackdrop?.addEventListener("click", () => {
     studioBody.classList.add("left-collapsed", "right-collapsed");
     syncDrawerBackdrop();
@@ -6787,10 +7153,16 @@ function initEvents() {
 
   const telPopover = document.getElementById("telemetry-popover");
   const telBtn = document.getElementById("btn-telemetry-popover");
+  const setTelemetryOpen = (open) => {
+    telPopover.classList.toggle("hidden", !open);
+    telBtn.setAttribute("aria-expanded", String(open));
+  };
   telBtn.onclick = (e) => {
     e.stopPropagation();
-    telPopover.classList.toggle("hidden");
+    setTelemetryOpen(telPopover.classList.contains("hidden"));
   };
+  document.getElementById("topbar-audio-model").onchange = changeTopbarModel;
+  document.getElementById("topbar-text-model").onchange = changeTopbarModel;
 
   document.getElementById("btn-new-session").onclick = createNewSession;
   document.getElementById("btn-empty-new").onclick = createNewSession;
@@ -6903,11 +7275,32 @@ function initEvents() {
     }
   });
 
-  document.querySelectorAll(".seg-btn").forEach((btn) => {
-    btn.onclick = () => switchTab(btn.dataset.tab);
-  });
-
   const tabsContainer = document.getElementById("segmented-tabs");
+  const mobileTabs = document.getElementById("btn-mobile-tabs");
+  const setMobileTabsOpen = (open) => {
+    mobileTabs.setAttribute("aria-expanded", String(open));
+    tabsContainer.classList.toggle("is-open", open);
+  };
+  mobileTabs.onclick = () => {
+    const open = mobileTabs.getAttribute("aria-expanded") !== "true";
+    setMobileTabsOpen(open);
+    if (open) {
+      const selectedTab = tabsContainer.querySelector(".seg-btn.active:not(:disabled)");
+      (selectedTab || tabsContainer.querySelector(".seg-btn:not(:disabled)"))?.focus();
+    }
+  };
+  tabsContainer.querySelectorAll(".seg-btn").forEach((btn) => {
+    btn.onclick = () => {
+      switchTab(btn.dataset.tab);
+      if (mobileTabs.getAttribute("aria-expanded") === "true") {
+        setMobileTabsOpen(false);
+        mobileTabs.focus();
+      }
+    };
+  });
+  document.addEventListener("click", (e) => {
+    if (!mobileTabs.contains(e.target) && !tabsContainer.contains(e.target)) setMobileTabsOpen(false);
+  });
   if (window.ResizeObserver && tabsContainer) {
     new ResizeObserver(() => updateTabIndicator()).observe(tabsContainer);
   }
@@ -6965,7 +7358,7 @@ function initEvents() {
       const codeEl = copyCodeBtn.closest(".md-code-block")?.querySelector("pre code");
       if (codeEl && navigator.clipboard?.writeText) {
         navigator.clipboard.writeText(codeEl.textContent || "").then(() => {
-          copyCodeBtn.textContent = "✓ Copiado";
+          copyCodeBtn.textContent = "Copiado";
           copyCodeBtn.classList.add("copied");
           setTimeout(() => {
             copyCodeBtn.textContent = "Copiar";
@@ -6993,7 +7386,7 @@ function initEvents() {
     await navigator.clipboard.writeText(text);
     const btn = document.getElementById("btn-copy-transcript");
     const prev = btn.textContent;
-    btn.textContent = "✓ Copiado";
+    btn.textContent = "Copiado";
     btn.classList.add("is-confirmed");
     showToast("Transcripción copiada al portapapeles.");
     setTimeout(() => {
@@ -7142,7 +7535,7 @@ function initEvents() {
       state.systemStatus = fresh;
       renderTelemetry(fresh);
       populateSettingsFromStatus(fresh);
-      btn.textContent = "✓ Actualizado";
+      btn.textContent = "Actualizado";
       btn.classList.add("is-confirmed");
       setTimeout(() => {
         btn.classList.remove("is-confirmed");
@@ -7172,7 +7565,7 @@ function initEvents() {
     if (!cmd) return;
     await navigator.clipboard.writeText(cmd);
     const prev = copyBtn.textContent;
-    copyBtn.textContent = "✓ Copiado";
+    copyBtn.textContent = "Copiado";
     copyBtn.classList.add("is-confirmed");
     setTimeout(() => {
       copyBtn.classList.remove("is-confirmed");
@@ -7198,9 +7591,8 @@ function initEvents() {
     if (activeDropdownMenu && !e.target.closest(".bento-select") && !e.target.closest(".bento-select-menu")) {
       closeActiveDropdown();
     }
-    const telPopoverEl = document.getElementById("telemetry-popover");
-    if (telPopoverEl && !telPopoverEl.classList.contains("hidden") && !e.target.closest(".telemetry-anchor")) {
-      telPopoverEl.classList.add("hidden");
+    if (!telPopover.classList.contains("hidden") && !e.target.closest("#telemetry-popover")) {
+      setTelemetryOpen(false);
     }
   });
 
@@ -7218,9 +7610,12 @@ function initEvents() {
 
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
-      const telPopoverEl = document.getElementById("telemetry-popover");
-      if (telPopoverEl && !telPopoverEl.classList.contains("hidden")) {
-        telPopoverEl.classList.add("hidden");
+      if (mobileTabs.getAttribute("aria-expanded") === "true") {
+        setMobileTabsOpen(false);
+        mobileTabs.focus();
+      } else if (!telPopover.classList.contains("hidden")) {
+        setTelemetryOpen(false);
+        telBtn.focus();
       } else if (activeDropdownMenu) {
         closeActiveDropdown();
       } else if (isModalOpen("source-viewer-modal")) {
@@ -7241,6 +7636,12 @@ function initEvents() {
 // --- Bootstrap ---
 
 async function initApp() {
+  let savedView = null;
+  try {
+    savedView = JSON.parse(sessionStorage.getItem(WORKSPACE_VIEW_KEY));
+  } catch (_) {}
+  window.addEventListener("pagehide", saveWorkspaceView);
+
   const savedTheme = (() => {
     try {
       return localStorage.getItem("transcript_theme");
@@ -7266,7 +7667,7 @@ async function initApp() {
   initEvents();
   switchTab(state.activeTab);
   await refreshSystemStatus();
-  await loadSessions(true);
+  await loadSessions(true, savedView);
   setInterval(refreshSystemStatus, 3000);
 }
 

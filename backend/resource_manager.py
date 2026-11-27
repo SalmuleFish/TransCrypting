@@ -181,24 +181,25 @@ class ResourceManager:
         num_predict: int | None = None,
         operation_label: str = "",
         response_format: str | dict[str, Any] | None = None,
+        deepseek_api_key: str = "",
     ) -> str:
-        """Ensure Whisper is unloaded, then run Ollama summary generation."""
+        """Run summary generation with the selected provider."""
         task = self._register_current_task()
         try:
             async with self._run_operation("text", label=operation_label):
                 try:
-                    if whisper_service.is_loaded:
+                    if whisper_service.is_loaded and not deepseek_api_key:
                         self.phase = "unloading"
                         whisper_service.unload()
 
                     self.phase = "llm"
                     self.active_model = model_name
-                    self.active_device = "gpu/ollama"
+                    self.active_device = "api/deepseek" if deepseek_api_key else "gpu/ollama"
                     keep_alive = f"{max(30, int(idle_unload_sec))}s"
                     settings = db.get_settings()
                     eco_mode = bool(settings.get("eco_mode", False))
                     eco_cpu_threads = int(settings.get("eco_cpu_threads") or 2)
-                    if eco_mode:
+                    if eco_mode and not deepseek_api_key:
                         if response_format is not None:
                             num_predict = min(2600, num_predict) if num_predict is not None else 1800
                         elif num_predict is not None:
@@ -212,6 +213,7 @@ class ResourceManager:
                         eco_cpu_threads=eco_cpu_threads,
                         num_predict=num_predict,
                         response_format=response_format,
+                        deepseek_api_key=deepseek_api_key,
                     )
                     self.touch_activity()
                     return text
@@ -229,19 +231,20 @@ class ResourceManager:
         num_ctx: int,
         idle_unload_sec: int,
         think: bool = False,
+        deepseek_api_key: str = "",
     ) -> AsyncIterator[tuple[str, str]]:
-        """Acquire GPU lock, ensure Whisper is unloaded, and stream ('thinking'|'token', text)."""
+        """Stream ('thinking'|'token', text) with the selected provider."""
         task = self._register_current_task()
         try:
             async with self._run_operation("text", label="Chat"):
                 try:
-                    if whisper_service.is_loaded:
+                    if whisper_service.is_loaded and not deepseek_api_key:
                         self.phase = "unloading"
                         whisper_service.unload()
 
                     self.phase = "llm"
                     self.active_model = model_name
-                    self.active_device = "gpu/ollama"
+                    self.active_device = "api/deepseek" if deepseek_api_key else "gpu/ollama"
                     keep_alive = f"{max(30, int(idle_unload_sec))}s"
                     settings = db.get_settings()
                     eco_mode = bool(settings.get("eco_mode", False))
@@ -255,6 +258,7 @@ class ResourceManager:
                         think=think,
                         eco_mode=eco_mode,
                         eco_cpu_threads=eco_cpu_threads,
+                        deepseek_api_key=deepseek_api_key,
                     ):
                         self.touch_activity()
                         yield (kind, text)

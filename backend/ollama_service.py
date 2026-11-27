@@ -14,6 +14,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from backend.config import OLLAMA_BASE_URL
+from backend.deepseek_service import stream_events as stream_deepseek_events
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -49,7 +50,7 @@ class OllamaService:
         self._aborted_clients: set[httpx.AsyncClient] = set()
 
     async def abort_active(self) -> int:
-        """Close any active Ollama streaming HTTP clients so token generation stops immediately."""
+        """Close active streaming HTTP clients."""
         clients = list(self._active_clients)
         closed = 0
         for client in clients:
@@ -219,10 +220,12 @@ class OllamaService:
         eco_cpu_threads: int = 2,
         num_predict: int | None = None,
         response_format: str | dict[str, Any] | None = None,
+        deepseek_api_key: str = "",
     ) -> AsyncIterator[tuple[str, str]]:
-        """Stream ('thinking', text) and ('token', text) tuples from local Ollama /api/chat."""
-        await self.ensure_running()
-        self._last_model = model
+        """Stream ('thinking', text) and ('token', text) tuples."""
+        if not deepseek_api_key:
+            await self.ensure_running()
+            self._last_model = model
         has_images = any(bool(m.get("images")) for m in messages)
 
         options: dict[str, Any] = {
@@ -253,6 +256,10 @@ class OllamaService:
         self._active_clients.add(client)
         try:
             async with client:
+                if deepseek_api_key:
+                    async for evt in stream_deepseek_events(client, deepseek_api_key, messages, think, num_predict):
+                        yield evt
+                    return
                 async with client.stream("POST", f"{self.base_url}/api/chat", json=payload) as resp:
                     if resp.status_code >= 400:
                         err_body = (await resp.aread()).decode("utf-8", errors="ignore")
@@ -337,6 +344,7 @@ class OllamaService:
         eco_cpu_threads: int = 2,
         num_predict: int | None = None,
         response_format: str | dict[str, Any] | None = None,
+        deepseek_api_key: str = "",
     ) -> str:
         """Run chat completion and return full text, falling back to thinking if content is empty."""
         parts: list[str] = []
@@ -351,6 +359,7 @@ class OllamaService:
             eco_cpu_threads=eco_cpu_threads,
             num_predict=num_predict,
             response_format=response_format,
+            deepseek_api_key=deepseek_api_key,
         ):
             if not text:
                 continue

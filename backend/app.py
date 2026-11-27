@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import re
 import subprocess
 import tempfile
@@ -14,12 +15,12 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 
 from backend.config import (
     AUDIO_DIR,
@@ -60,6 +61,7 @@ from backend.context_manager import (
     shuffle_quiz_mcq_options,
 )
 from backend.database import db
+from backend import deepseek_service
 from backend.hardware import get_system_stats
 from backend.ollama_service import GenerationAbortedError, VisionUnsupportedError, ollama_service
 from backend.podcast_service import (
@@ -75,7 +77,6 @@ from backend.audio_capture import (
 )
 from backend.diarization_service import (
     assign_speakers_to_segments,
-    diarize_audio,
     diarize_audio_async,
     format_segments_plain_text,
     has_speech_energy,
@@ -101,6 +102,7 @@ from backend.whisper_service import (
     delete_asr_model,
     download_asr_model,
     prepare_audio_file,
+    transcription_options,
 )
 
 
@@ -108,6 +110,7 @@ RECORDING_SUMMARY_MAX_TOKENS = 960
 _logger = logging.getLogger(__name__)
 _model_download_lock = asyncio.Lock()
 _downloading_model_id: str | None = None
+_manual_diarization_lock = asyncio.Lock()
 
 
 class SessionCreateRequest(BaseModel):
@@ -120,6 +123,8 @@ class SessionUpdateRequest(BaseModel):
 
 class SettingsUpdateRequest(BaseModel):
     ollama_model: str | None = None
+    text_provider: Literal["ollama", "deepseek"] | None = None
+    deepseek_api_key: SecretStr | None = None
     whisper_model: str | None = None
     whisper_device: str | None = None
     whisper_language: str | None = None
@@ -149,6 +154,11 @@ class ResummarizeRequest(BaseModel):
 class EnableToggleRequest(BaseModel):
     enabled: bool | None = None
     filename: str | None = None
+
+
+class SourceSelectionRequest(BaseModel):
+    mode: Literal["all", "none", "recording"]
+    recording_id: str | None = None
 
 
 class SystemCaptureStartRequest(BaseModel):
@@ -203,6 +213,12 @@ class QuizGradeRequest(BaseModel):
 
 def _auto_summaries_enabled(settings: dict[str, Any]) -> bool:
     return bool(settings.get("auto_summarize", True)) and not bool(settings.get("eco_mode", False))
+
+
+def _diarization_threads(settings: dict[str, Any]) -> int:
+    if settings.get("eco_mode"):
+        return max(1, int(settings.get("eco_cpu_threads") or 2))
+    return min(4, max(2, (os.cpu_count() or 4) // 2))
 
 
 class ProcessingPipeline:
@@ -339,11 +355,7 @@ class ProcessingPipeline:
         whisper_lang = settings.get("whisper_language") or "auto"
         classroom_enhance = bool(settings.get("classroom_audio_enhance", True))
         enable_diarization = bool(settings.get("enable_diarization", True))
-        diar_threads = (
-            max(1, int(settings.get("eco_cpu_threads") or 2))
-            if settings.get("eco_mode")
-            else min(4, max(2, (os.cpu_count() or 4) // 2))
-        )
+        diar_threads = _diarization_threads(settings)
         num_ctx = int(settings.get("num_ctx") or 8192)
         idle_unload_sec = int(settings.get("idle_unload_sec") or 180)
 
@@ -445,7 +457,7 @@ class ProcessingPipeline:
                             "Identificando hablantes de la llamada...",
                         )
                         try:
-                            diar_turns = await asyncio.to_thread(diarize_audio, sys_wav, diar_threads)
+                            diar_turns = await diarize_audio_async(sys_wav, diar_threads)
                             sys_segments = assign_speakers_to_segments(sys_segments, diar_turns)
                         except Exception as diar_exc:
                             _logger.warning("Diarización de pista del sistema omitida: %s", diar_exc)
@@ -967,6 +979,8 @@ async def regenerate_combined_summary_if_needed(
     session_id: str,
     extra_rec_id: str | None = None,
     extra_source_id: str | None = None,
+    *,
+    deepseek_api_key: str = "",
 ) -> str:
     """Build or clear the integrated summary across enabled recordings and sources."""
     recordings = db.list_recordings(session_id)
@@ -994,19 +1008,30 @@ async def regenerate_combined_summary_if_needed(
     settings = db.get_settings()
     num_ctx = int(settings.get("num_ctx") or 8192)
     idle_unload_sec = int(settings.get("idle_unload_sec") or 180)
-    ollama_model = await ollama_service.resolve_default_model(settings.get("ollama_model", ""))
+    model = (
+        deepseek_service.DEEPSEEK_MODEL if deepseek_api_key
+        else await ollama_service.resolve_default_model(settings.get("ollama_model", ""))
+    )
 
     msgs = build_combined_summary_messages(
         ready_recs, sources=ready_srcs, max_input_chars=min(12000, num_ctx)
     )
     combined = await resource_manager.summarize_exclusive(
         messages=msgs,
-        model_name=ollama_model,
+        model_name=model,
         num_ctx=num_ctx,
         idle_unload_sec=idle_unload_sec,
         num_predict=1024,
         operation_label="Resumen integrado",
+        deepseek_api_key=deepseek_api_key,
     )
+    summarized_ids = {item["id"] for item in [*ready_recs, *ready_srcs]}
+    enabled_ids = {
+        item["id"] for item in [*db.list_recordings(session_id), *db.list_sources(session_id)]
+        if item.get("enabled", True)
+    }
+    if not summarized_ids <= enabled_ids:
+        return ""
     db.update_session_summary(session_id, combined)
     return combined
 
@@ -1061,11 +1086,14 @@ async def system_status(refresh_models: bool = False) -> dict[str, Any]:
         "ollama_running": ollama_ok,
         "ollama_models": ollama_models,
         "running_ollama_models": running_ollama,
-        "whisper_models": list_available_whisper_models(),
+        "whisper_models": await asyncio.to_thread(transcription_options),
+        "whisper_default_model": DEFAULT_WHISPER_MODEL,
+        "transcription_platform": "Apple Silicon" if WHISPER_METAL_SUPPORTED else f"{platform.system()} · {platform.machine()}",
         "downloading_whisper_model": _downloading_model_id,
         "whisper_metal_supported": WHISPER_METAL_SUPPORTED,
         "system_audio_available": await asyncio.to_thread(is_system_audio_available),
         "diarization_available": is_diarization_runtime_available(),
+        "deepseek_key_configured": bool(deepseek_service.get_api_key()),
         "settings": settings,
     }
 
@@ -1112,11 +1140,15 @@ async def api_delete_whisper_model(model_id: str) -> dict[str, Any]:
     _require_not_podcast_busy()
     if _model_download_lock.locked():
         raise HTTPException(status_code=409, detail="Hay una descarga de modelo en curso.")
-    await resource_manager.unload_everything()
-    try:
-        deleted = await asyncio.to_thread(delete_asr_model, model_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    model_id = model_id.strip()
+    if db.get_settings()["whisper_model"] == model_id:
+        raise HTTPException(status_code=409, detail="Guarda otro modelo de transcripción antes de borrar este.")
+    async with _model_download_lock:
+        await resource_manager.unload_everything()
+        try:
+            deleted = await asyncio.to_thread(delete_asr_model, model_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "status": "deleted",
         "deleted": deleted,
@@ -1178,14 +1210,41 @@ async def get_settings() -> dict[str, Any]:
 
 @app.put("/api/settings")
 async def update_settings(payload: SettingsUpdateRequest) -> dict[str, Any]:
-    updates = payload.model_dump(exclude_none=True)
+    updates = payload.model_dump(exclude_none=True, exclude={"deepseek_api_key"})
+    if "whisper_model" in updates or "whisper_device" in updates:
+        settings = db.get_settings()
+        selected = updates.get("whisper_model", settings["whisper_model"])
+        models = await asyncio.to_thread(transcription_options)
+        model = next((item for item in models if item["id"] == selected), None)
+        if model is None:
+            raise HTTPException(status_code=422, detail="El modelo de transcripción no está disponible en este equipo.")
+        if "whisper_device" in updates and updates["whisper_device"] not in model["devices"]:
+            raise HTTPException(status_code=422, detail="Ese dispositivo no es compatible con el modelo seleccionado.")
+        if "whisper_device" not in updates and settings["whisper_device"] not in model["devices"]:
+            updates["whisper_device"] = "auto"
     if "num_ctx" in updates:
         updates["num_ctx"] = max(2048, min(32768, int(updates["num_ctx"])))
     if "idle_unload_sec" in updates:
         updates["idle_unload_sec"] = max(30, min(3600, int(updates["idle_unload_sec"])))
     if "eco_cpu_threads" in updates:
         updates["eco_cpu_threads"] = max(1, min(os.cpu_count() or 16, int(updates["eco_cpu_threads"])))
+    if payload.deepseek_api_key is not None:
+        key = payload.deepseek_api_key.get_secret_value().strip()
+        if not re.fullmatch(r"[!-~]{1,512}", key):
+            raise HTTPException(status_code=422, detail="Escribe una clave API de DeepSeek válida.")
+        deepseek_service.save_api_key(key)
+    elif updates.get("text_provider") == "deepseek" and not deepseek_service.get_api_key():
+        raise HTTPException(status_code=422, detail="Ingresa tu clave API para activar DeepSeek Flash.")
     return db.update_settings(updates)
+
+
+async def _interactive_text_model(settings: dict[str, Any]) -> tuple[str, str]:
+    if settings.get("text_provider") == "deepseek":
+        key = deepseek_service.get_api_key()
+        if not key:
+            raise HTTPException(status_code=422, detail="Configura tu clave API de DeepSeek en Configuración → Texto.")
+        return deepseek_service.DEEPSEEK_MODEL, key
+    return await ollama_service.resolve_default_model(settings.get("ollama_model", "")), ""
 
 
 # --- Sessions ---
@@ -1219,6 +1278,26 @@ def _build_session_response(session_id: str) -> dict[str, Any]:
 
 @app.get("/api/sessions/{session_id}")
 async def get_session(session_id: str) -> dict[str, Any]:
+    return _build_session_response(session_id)
+
+
+@app.patch("/api/sessions/{session_id}/active-sources")
+async def update_active_sources(session_id: str, payload: SourceSelectionRequest) -> dict[str, Any]:
+    _require_not_podcast_busy()
+    if not db.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Conversación no encontrada.")
+
+    recording_id = None
+    if payload.mode == "recording":
+        recording = db.get_recording(payload.recording_id or "")
+        if not recording or recording["session_id"] != session_id:
+            raise HTTPException(status_code=404, detail="Grabación no encontrada.")
+        if recording["status"] != "ready" or not recording["transcript_text"].strip():
+            raise HTTPException(status_code=409, detail="La transcripción aún no está disponible.")
+        recording_id = recording["id"]
+
+    if db.set_session_sources_enabled(session_id, payload.mode == "all", recording_id):
+        _schedule_combined_summary_refresh(session_id)
     return _build_session_response(session_id)
 
 
@@ -1725,6 +1804,62 @@ async def toggle_recording_enabled(
     return _build_session_response(session_id)
 
 
+def _index_recording_speakers(rec: dict[str, Any]) -> None:
+    db.replace_item_chunks(
+        session_id=rec["session_id"],
+        item_kind="recording",
+        item_id=rec["id"],
+        filename=rec["filename"],
+        source_type="audio",
+        chunks=chunk_recording_for_index(rec),
+    )
+
+
+@app.post("/api/sessions/{session_id}/recordings/{rec_id}/speakers")
+async def identify_recording_speakers(
+    session_id: str,
+    rec_id: str,
+    count: int | None = Query(default=None, ge=1, le=32),
+) -> dict[str, Any]:
+    rec = db.get_recording(rec_id)
+    if not rec or rec["session_id"] != session_id:
+        raise HTTPException(status_code=404, detail="Grabación no encontrada.")
+    segments = rec["segments"]
+    if rec["status"] != "ready" or not segments:
+        raise HTTPException(status_code=409, detail="Espera a que termine la transcripción.")
+    if any(seg.get("speaker_key") == "me" for seg in segments):
+        raise HTTPException(status_code=409, detail="Esta grabación ya distingue tu micrófono del audio del equipo.")
+    if count is None and any(seg.get("speaker") for seg in segments):
+        raise HTTPException(status_code=409, detail="Indica cuántas voces hay para volver a identificar los hablantes.")
+    if not is_diarization_runtime_available():
+        raise HTTPException(status_code=503, detail="Para identificar hablantes instala el motor local sherpa-onnx.")
+    if _manual_diarization_lock.locked():
+        raise HTTPException(status_code=409, detail="Ya se están identificando hablantes en otro audio.")
+
+    async with _manual_diarization_lock:
+        try:
+            turns = await diarize_audio_async(
+                Path(rec["stored_path"]), _diarization_threads(db.get_settings()), num_speakers=count,
+            )
+            assigned = await asyncio.to_thread(assign_speakers_to_segments, segments, turns) if turns else []
+        except Exception as exc:
+            _logger.warning("No se pudieron identificar hablantes para %s: %s", rec_id, exc)
+            raise HTTPException(status_code=500, detail="No se pudieron identificar los hablantes de este audio.") from exc
+        if not assigned:
+            raise HTTPException(status_code=422, detail="No se detectaron voces en este audio.")
+        current = db.get_recording(rec_id)
+        if not current or current["status"] != "ready" or current["segments"] != segments:
+            raise HTTPException(status_code=409, detail="La grabación cambió durante el análisis.")
+        transcript_text = format_segments_plain_text(assigned)
+        db.update_recording_transcript(
+            rec_id, transcript_text, assigned,
+            current["language"], current["duration_sec"], current["whisper_model"],
+        )
+        updated = {**current, "transcript_text": transcript_text, "segments": assigned}
+        _index_recording_speakers(updated)
+        return updated
+
+
 @app.patch("/api/sessions/{session_id}/recordings/{rec_id}/speakers")
 async def rename_recording_speakers(
     session_id: str,
@@ -1736,15 +1871,7 @@ async def rename_recording_speakers(
         raise HTTPException(status_code=404, detail="Grabación no encontrada.")
     updated = db.update_recording_speakers(rec_id, req.mapping)
     if updated:
-        chunks = chunk_recording_for_index(updated)
-        db.replace_item_chunks(
-            session_id=session_id,
-            item_kind="recording",
-            item_id=rec_id,
-            filename=updated["filename"],
-            source_type="audio",
-            chunks=chunks,
-        )
+        _index_recording_speakers(updated)
     return updated or rec
 
 
@@ -1916,7 +2043,7 @@ async def resummarize_session(
     settings = db.get_settings()
     num_ctx = int(settings.get("num_ctx") or 8192)
     idle_unload_sec = int(settings.get("idle_unload_sec") or 180)
-    ollama_model = await ollama_service.resolve_default_model(settings.get("ollama_model", ""))
+    model, deepseek_api_key = await _interactive_text_model(settings)
 
     target_rec_id = payload.recording_id if payload else None
     target_src_id = payload.source_id if payload else None
@@ -1948,11 +2075,12 @@ async def resummarize_session(
             )
             summary_text = await resource_manager.summarize_exclusive(
                 messages=msgs,
-                model_name=ollama_model,
+                model_name=model,
                 num_ctx=num_ctx,
                 idle_unload_sec=idle_unload_sec,
                 num_predict=RECORDING_SUMMARY_MAX_TOKENS,
                 operation_label="Resumen del audio",
+                deepseek_api_key=deepseek_api_key,
             )
             db.update_recording_summary(rec["id"], summary_text)
 
@@ -1966,19 +2094,22 @@ async def resummarize_session(
             )
             summary_text = await resource_manager.summarize_exclusive(
                 messages=msgs,
-                model_name=ollama_model,
+                model_name=model,
                 num_ctx=num_ctx,
                 idle_unload_sec=idle_unload_sec,
+                deepseek_api_key=deepseek_api_key,
             )
             db.update_source_summary(src["id"], summary_text)
 
         if payload is None or payload.update_combined:
-            await regenerate_combined_summary_if_needed(session_id)
+            await regenerate_combined_summary_if_needed(session_id, deepseek_api_key=deepseek_api_key)
     except (asyncio.CancelledError, GenerationAbortedError) as exc:
         raise HTTPException(
             status_code=499,
             detail="Resumen detenido por el usuario.",
         ) from exc
+    except deepseek_service.DeepSeekError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return _build_session_response(session_id)
 
 
@@ -2018,10 +2149,9 @@ async def export_session_markdown(session_id: str) -> Response:
 
     messages = detail.get("messages", [])
     if messages:
-        active_model = db.get_settings().get("ollama_model") or "Asistente IA"
         lines.extend(["## Historial de preguntas y respuestas", ""])
         for msg in messages:
-            who = "Usuario" if msg["role"] == "user" else active_model
+            who = "Usuario" if msg["role"] == "user" else "Asistente IA"
             lines.extend([f"**{who}:**", "", msg["content"], ""])
 
     safe_title = re.sub(r"[^A-Za-z0-9áéíóúÁÉÍÓÚñÑ._\- ]+", "_", detail["title"]).strip() or "transcript"
@@ -2069,8 +2199,6 @@ async def chat_with_session(session_id: str, payload: ChatRequest) -> StreamingR
     num_ctx = int(settings.get("num_ctx") or 8192)
     idle_unload_sec = int(settings.get("idle_unload_sec") or 180)
     enable_thinking = bool(settings.get("enable_thinking", False))
-    ollama_model = await ollama_service.resolve_default_model(settings.get("ollama_model", ""))
-
     prior_messages = detail["messages"]
     recent_turns = " ".join(m["content"] for m in prior_messages[-4:] if m.get("role") == "user")
     fts_query = f"{question} {recent_turns}".strip()
@@ -2084,7 +2212,7 @@ async def chat_with_session(session_id: str, payload: ChatRequest) -> StreamingR
 
     llm_messages, context_mode = build_chat_messages(
         recordings=ready_recs,
-        combined_summary=detail.get("combined_summary", ""),
+        combined_summary=detail.get("combined_summary", "") if len(ready_recs) + len(ready_srcs) > 1 else "",
         chat_history=prior_messages,
         user_question=question,
         num_ctx=num_ctx,
@@ -2092,6 +2220,7 @@ async def chat_with_session(session_id: str, payload: ChatRequest) -> StreamingR
         indexed_chunks=indexed_hits,
     )
 
+    model, deepseek_api_key = await _interactive_text_model(settings)
     user_msg = db.add_message(session_id, "user", question)
 
     async def event_stream():
@@ -2099,7 +2228,7 @@ async def chat_with_session(session_id: str, payload: ChatRequest) -> StreamingR
             {
                 "type": "meta",
                 "context_mode": context_mode,
-                "model": ollama_model,
+                "model": model,
                 "recording_count": len(ready_recs),
                 "source_count": len(ready_srcs),
                 "user_message": user_msg,
@@ -2110,10 +2239,11 @@ async def chat_with_session(session_id: str, payload: ChatRequest) -> StreamingR
         try:
             async for kind, text in resource_manager.chat_events_exclusive(
                 messages=llm_messages,
-                model_name=ollama_model,
+                model_name=model,
                 num_ctx=num_ctx,
                 idle_unload_sec=idle_unload_sec,
                 think=enable_thinking,
+                deepseek_api_key=deepseek_api_key,
             ):
                 if kind == "thinking":
                     yield _sse({"type": "thinking", "text": text})
@@ -2123,7 +2253,7 @@ async def chat_with_session(session_id: str, payload: ChatRequest) -> StreamingR
 
             full_answer = "".join(chunks).strip()
             if not full_answer:
-                full_answer = "No obtuve una respuesta del modelo local."
+                full_answer = "No obtuve una respuesta del modelo."
             saved_assistant = db.add_message(session_id, "assistant", full_answer)
             yield _sse({"type": "done", "message": saved_assistant})
         except (asyncio.CancelledError, GenerationAbortedError):

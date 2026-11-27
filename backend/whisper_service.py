@@ -14,6 +14,7 @@ import sysconfig
 import tempfile
 import threading
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -39,6 +40,7 @@ from backend.config import (
     WHISPER_METAL_SUPPORTED,
     WHISPER_MODELS,
     _default_hf_cache_dir,
+    list_available_whisper_models,
 )
 
 logger = logging.getLogger(__name__)
@@ -220,6 +222,67 @@ _ONNX_WHISPER_MAP = {
     PARAKEET_MODEL_ID: "nemo-parakeet-tdt-0.6b-v3",
     CANARY_MODEL_ID: "nemo-canary-1b-v2",
 }
+
+
+@lru_cache(maxsize=1)
+def _cuda_available() -> bool:
+    if WHISPER_METAL_SUPPORTED or not FASTER_WHISPER_SUPPORTED:
+        return False
+    try:
+        register_cuda_dlls()
+        import ctranslate2
+
+        return ctranslate2.get_cuda_device_count() > 0 and (
+            "int8_float16" in ctranslate2.get_supported_compute_types("cuda")
+        )
+    except (ImportError, RuntimeError, OSError):
+        return False
+
+
+@lru_cache(maxsize=1)
+def _whisper_metal_available() -> bool:
+    if not WHISPER_METAL_SUPPORTED:
+        return False
+    try:
+        from pywhispercpp.model import Model
+
+        return "MTL :" in Model.system_info()
+    except (ImportError, RuntimeError, OSError):
+        return False
+
+
+@lru_cache(maxsize=1)
+def _torch_cuda_available() -> bool:
+    if not QWEN_TORCH_SUPPORTED:
+        return False
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except (ImportError, RuntimeError, OSError):
+        return False
+
+
+def transcription_options() -> list[dict]:
+    models = list_available_whisper_models()
+    for model in models:
+        model_id = model["id"]
+        devices = ["auto", "cpu"]
+        if model_id in MLX_ASR_MODELS and MLX_ASR_SUPPORTED:
+            devices.insert(1, "metal")
+        elif model_id in QWEN_TORCH_MODELS:
+            if _torch_cuda_available():
+                devices.insert(1, "cuda")
+        elif model_id == PARAKEET_MODEL_ID:
+            if PARAKEET_SUPPORTED:
+                devices.insert(1, "metal")
+        elif model_id != CANARY_MODEL_ID:
+            if not model_id.startswith("local:") and _whisper_metal_available():
+                devices.insert(1, "metal")
+            elif _cuda_available():
+                devices.insert(1, "cuda")
+        model["devices"] = devices
+    return models
 
 
 def _find_ffmpeg_exe() -> str:
@@ -563,13 +626,15 @@ class WhisperService:
             return self.active_device
 
         if (
-            pref == "auto"
+            pref in ("auto", "metal")
             and WHISPER_METAL_SUPPORTED
             and any(model["id"] == model_name for model in WHISPER_MODELS)
         ):
             try:
                 self._model = self._load_metal(model_name)
             except Exception as exc:
+                if pref == "metal":
+                    raise
                 logger.warning("No se pudo cargar Whisper con Metal. Usando CPU: %s", exc)
             else:
                 self._model_name = model_name
@@ -1292,10 +1357,11 @@ def delete_asr_model(
             shutil.rmtree(mlx_dir, ignore_errors=True)
             removed = True
 
-    direct = models_dir / mid
-    if direct.is_dir() and (direct / "model.bin").is_file():
-        shutil.rmtree(direct, ignore_errors=True)
-        removed = True
+    if any(model["id"] == mid for model in WHISPER_MODELS):
+        for path in (models_dir / "ggml").glob(f"ggml-{mid}*.bin"):
+            if path.stem.removeprefix(f"ggml-{mid}") in ("", "-q5_0", "-q5_1", "-q8_0"):
+                path.unlink()
+                removed = True
 
     if models_dir.is_dir():
         suffix = f"--faster-whisper-{mid.lower()}"

@@ -8,6 +8,7 @@ from importlib.util import find_spec
 import json
 import logging
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,7 @@ from backend.whisper_service import _find_ffmpeg_exe
 logger = logging.getLogger(__name__)
 
 _DOWNLOAD_LOCK = threading.Lock()
+_DIARIZATION_LOCK = asyncio.Lock()
 
 
 def is_diarization_runtime_available() -> bool:
@@ -170,6 +172,7 @@ def diarize_audio(
     audio_path: Path,
     num_threads: int = 2,
     threshold: float = 0.52,
+    num_speakers: int | None = None,
 ) -> list[dict[str, Any]]:
     """Run local sherpa-onnx diarization returning chronological speaker turns."""
     if not is_diarization_runtime_available():
@@ -200,7 +203,7 @@ def diarize_audio(
             provider="cpu",
         ),
         clustering=sherpa_onnx.FastClusteringConfig(
-            num_clusters=-1,
+            num_clusters=num_speakers if num_speakers is not None else -1,
             threshold=float(threshold),
         ),
         min_duration_on=0.3,
@@ -237,25 +240,31 @@ def diarize_audio(
     return turns
 
 
-async def diarize_audio_async(audio_path: Path, num_threads: int) -> list[dict[str, Any]]:
+async def diarize_audio_async(
+    audio_path: Path,
+    num_threads: int,
+    num_speakers: int | None = None,
+) -> list[dict[str, Any]]:
     # Sherpa holds the GIL during inference, including when called from a worker thread.
-    process = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "backend.diarization_service", str(audio_path.resolve()), str(num_threads),
-        cwd=Path(__file__).resolve().parents[1],
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    try:
-        stdout, stderr = await process.communicate()
-    except asyncio.CancelledError:
-        if process.returncode is None:
-            process.kill()
-        await process.wait()
-        raise
-    if process.returncode != 0:
-        raise RuntimeError(stderr.decode(errors="replace").strip() or f"El analizador terminó con código {process.returncode}.")
-    return json.loads(stdout)
+    async with _DIARIZATION_LOCK:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "backend.diarization_service",
+            str(audio_path.resolve()), str(num_threads), str(num_speakers or 0),
+            cwd=Path(__file__).resolve().parents[1],
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            stdout, stderr = await process.communicate()
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
+        if process.returncode != 0:
+            raise RuntimeError(stderr.decode(errors="replace").strip() or f"El analizador terminó con código {process.returncode}.")
+        return json.loads(stdout)
 
 
 def _best_speaker_for_span(
@@ -291,25 +300,25 @@ def _best_speaker_for_span(
 def _maybe_split_segment_by_words(
     seg: dict[str, Any],
     diar_turns: list[dict[str, Any]],
+    fallback_speaker: str,
 ) -> list[dict[str, Any]]:
-    """Split a long ASR segment at a clean speaker boundary when word timings exist."""
+    """Split an ASR segment at speaker changes using the original word timings."""
     words = seg.get("words")
-    text = (seg.get("text") or "").strip()
-    if not words or not isinstance(words, list) or len(words) < 6 or not text:
+    text = seg.get("text") or ""
+    if not isinstance(words, list) or len(words) < 2:
         return []
 
-    tokens = text.split()
+    tokens = list(re.finditer(r"\S+", text))
     if len(tokens) != len(words):
         return []
 
     tagged: list[str] = []
-    prev_spk: str | None = None
+    prev_spk = fallback_speaker
     for w in words:
         w_start = float(w.get("start", seg.get("start", 0.0)))
         w_end = float(w.get("end", w_start + 0.1))
-        spk = _best_speaker_for_span(w_start, w_end, diar_turns) or prev_spk or "Hablante 1"
-        tagged.append(spk)
-        prev_spk = spk
+        prev_spk = _best_speaker_for_span(w_start, w_end, diar_turns) or prev_spk
+        tagged.append(prev_spk)
 
     runs: list[tuple[str, int, int]] = []
     run_start = 0
@@ -319,22 +328,18 @@ def _maybe_split_segment_by_words(
             run_start = idx
     runs.append((tagged[run_start], run_start, len(tagged)))
 
-    if len(runs) <= 1 or len(runs) > 3:
+    if len(runs) <= 1:
         return []
 
-    # Verify every sub-run is substantial (>= 3 words and >= 1.0s) to avoid choppy fragmentation
     split_segments: list[dict[str, Any]] = []
     for spk, a, b in runs:
         sub_words = words[a:b]
-        s_start = round(float(sub_words[0].get("start", seg.get("start", 0.0))), 2)
-        s_end = round(float(sub_words[-1].get("end", seg.get("end", s_start))), 2)
-        if (b - a) < 3 or (s_end - s_start) < 1.0:
-            return []
         split_segments.append(
             {
-                "start": s_start,
-                "end": s_end,
-                "text": " ".join(tokens[a:b]),
+                **seg,
+                "start": float(sub_words[0].get("start", seg.get("start", 0.0))),
+                "end": float(sub_words[-1].get("end", seg.get("end", 0.0))),
+                "text": text[tokens[a].start():tokens[b - 1].end()],
                 "words": sub_words,
                 "speaker": spk,
             }
@@ -347,7 +352,7 @@ def assign_speakers_to_segments(
     diar_turns: list[dict[str, Any]],
     speaker_prefix: str = "Hablante",
 ) -> list[dict[str, Any]]:
-    """Attach speaker labels to ASR segments using overlap and word-level split when clean."""
+    """Attach speaker labels using overlap with diarization turns."""
     if not asr_segments:
         return []
     if not diar_turns:
@@ -357,19 +362,17 @@ def assign_speakers_to_segments(
     last_speaker = f"{speaker_prefix} 1"
 
     for seg in asr_segments:
-        split_out = _maybe_split_segment_by_words(seg, diar_turns)
+        start = float(seg.get("start", 0.0))
+        end = max(start + 0.05, float(seg.get("end", start + 0.05)))
+        speaker = _best_speaker_for_span(start, end, diar_turns) or last_speaker
+        split_out = _maybe_split_segment_by_words(seg, diar_turns, speaker)
         if split_out:
             last_speaker = split_out[-1]["speaker"]
             assigned.extend(split_out)
             continue
 
-        item = dict(seg)
-        start = float(item.get("start", 0.0))
-        end = max(start + 0.05, float(item.get("end", start + 0.05)))
-        spk = _best_speaker_for_span(start, end, diar_turns) or last_speaker
-        last_speaker = spk
-        item["speaker"] = spk
-        assigned.append(item)
+        last_speaker = speaker
+        assigned.append({**seg, "speaker": speaker})
 
     # Renormalize speaker numbers in chronological first-appearance order
     remap: dict[str, int] = {}
@@ -482,4 +485,5 @@ def format_segments_plain_text(segments: list[dict[str, Any]]) -> str:
 
 
 if __name__ == "__main__":
-    print(json.dumps(diarize_audio(Path(sys.argv[1]), int(sys.argv[2])), ensure_ascii=False))
+    audio_path, threads, count = sys.argv[1:]
+    print(json.dumps(diarize_audio(Path(audio_path), int(threads), num_speakers=int(count) or None)))
