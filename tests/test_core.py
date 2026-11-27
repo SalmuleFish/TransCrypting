@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from backend import app as app_module
+from backend import deepseek_service
 from backend.config import MLX_ASR_SUPPORTED, NEMOTRON_MODEL_ID, list_available_whisper_models
 from backend.context_manager import (
     build_chat_messages,
@@ -22,6 +25,128 @@ from backend.context_manager import (
 )
 from backend.database import Database
 from backend.resource_manager import ResourceManager
+
+
+def test_deepseek_settings_chat_and_manual_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    test_db = Database(db_path=tmp_path / "test.db", audio_dir=tmp_path / "audio")
+    test_db.init_db()
+    test_db.update_settings({"ollama_model": "test-local", "enable_thinking": True})
+    key_path = tmp_path / ".deepseek-api-key"
+    key = "fake-deepseek-key"
+    monkeypatch.setattr(deepseek_service, "_KEY_PATH", key_path)
+    monkeypatch.setattr(app_module, "db", test_db)
+    monkeypatch.setattr("backend.resource_manager.db", test_db)
+    monkeypatch.setattr(app_module, "resource_manager", ResourceManager())
+    ensure_ollama = AsyncMock(side_effect=AssertionError("DeepSeek should not start Ollama"))
+    monkeypatch.setattr(app_module.ollama_service, "ensure_running", ensure_ollama)
+
+    calls = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.deepseek.com/chat/completions"
+        assert request.headers["Authorization"] == f"Bearer {key}"
+        payload = json.loads(request.content)
+        assert payload["model"] == "deepseek-flash" and payload["stream"] is True
+        calls.append(payload)
+        return httpx.Response(200, text=(
+            'data: {"choices":[{"delta":{"content":"Respuesta de prueba"}}]}\n\n'
+            'data: [DONE]\n\n'
+        ))
+
+    async def mock_stream(_client, api_key, messages, think, max_tokens):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            async for event in deepseek_service.stream_events(client, api_key, messages, think, max_tokens):
+                yield event
+
+    monkeypatch.setattr("backend.ollama_service.stream_deepseek_events", mock_stream)
+    session_id = test_db.create_session("Prueba de DeepSeek")["id"]
+    for filename in ("notas-a.txt", "notas-b.txt"):
+        source_id = test_db.create_source(session_id, filename, "text", str(tmp_path / filename))["id"]
+        test_db.update_source_content(source_id, "Contenido de prueba", [])
+        test_db.update_source_summary(source_id, "")
+    path = f"/api/sessions/{session_id}"
+
+    client = TestClient(app_module.app)
+    try:
+        assert client.get("/api/settings").json()["text_provider"] == "ollama"
+        assert client.put("/api/settings", json={"text_provider": "deepseek"}).status_code == 422
+        saved = client.put("/api/settings", json={"text_provider": "deepseek", "deepseek_api_key": key})
+        assert saved.status_code == 200 and saved.json()["text_provider"] == "deepseek"
+        assert key_path.read_text() == key
+        assert key not in saved.text and key not in client.get("/api/settings").text
+
+        chat = client.post(f"{path}/chat", json={"question": "¿Qué dicen las notas?"})
+        assert chat.status_code == 200 and '"type": "done"' in chat.text
+        assert "Respuesta de prueba" in chat.text and key not in chat.text
+        assert calls[0]["thinking"] == {"type": "enabled"}
+        assert "Contenido de prueba" in calls[0]["messages"][0]["content"]
+
+        summary = client.post(f"{path}/resummarize")
+        assert summary.status_code == 200 and summary.json()["combined_summary"] == "Respuesta de prueba"
+        assert len(calls) == 4
+        assert all(call["thinking"] == {"type": "disabled"} for call in calls[1:])
+        ensure_ollama.assert_not_awaited()
+    finally:
+        client.close()
+        test_db.close()
+
+
+def test_selecting_a_recording_limits_chat_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    test_db = Database(db_path=tmp_path / "selection.db", audio_dir=tmp_path / "audio")
+    test_db.init_db()
+    test_db.update_settings({"auto_summarize": False})
+    session_id = test_db.create_session("Prueba de fuentes")["id"]
+    selected = test_db.create_recording(session_id, "uno.wav", "uno.wav", "uno.wav")["id"]
+    queued = test_db.create_recording(session_id, "dos.wav", "dos.wav", "dos.wav")["id"]
+    document = test_db.create_source(session_id, "notas.txt", "text", "notas.txt")["id"]
+    test_db.update_recording_transcript(selected, "Presupuesto aprobado", [], "es", 10, "parakeet")
+    test_db.update_recording_summary(selected, "")
+    test_db.update_source_content(document, "Presupuesto rechazado", [])
+    test_db.update_source_summary(document, "")
+    test_db.replace_item_chunks(
+        session_id=session_id, item_kind="source", item_id=document,
+        filename="notas.txt", source_type="text", chunks=[{"content": "Presupuesto rechazado"}],
+    )
+    test_db.update_session_summary(session_id, "Resumen de fuentes previas")
+    other_session = test_db.create_session("Otra conversación")["id"]
+    other_recording = test_db.create_recording(other_session, "otro.wav", "otro.wav", "otro.wav")["id"]
+    prompts = []
+
+    async def capture_chat(**kwargs):
+        prompts.extend(message["content"] for message in kwargs["messages"])
+        yield "token", "Aprobado."
+
+    monkeypatch.setattr(app_module, "db", test_db)
+    monkeypatch.setattr(app_module, "_interactive_text_model", AsyncMock(return_value=("test-model", "")))
+    monkeypatch.setattr(app_module.resource_manager, "chat_events_exclusive", capture_chat)
+    client = TestClient(app_module.app)
+    path = f"/api/sessions/{session_id}"
+    selection = f"{path}/active-sources"
+    try:
+        assert client.patch(selection, json={"mode": "recording", "recording_id": other_recording}).status_code == 404
+        assert client.patch(selection, json={"mode": "recording", "recording_id": queued}).status_code == 409
+        response = client.patch(selection, json={"mode": "recording", "recording_id": selected})
+        assert response.status_code == 200
+        fresh = client.get(path).json()
+        assert [item["id"] for item in fresh["recordings"] + fresh["sources"] if item["enabled"]] == [selected]
+        assert fresh["combined_summary"] == ""
+        hits = test_db.search_session_chunks(session_id, "presupuesto", enabled_only=True)
+        assert hits and all(hit["item_id"] == selected for hit in hits)
+
+        reply = client.post(f"{path}/chat", json={"question": "¿Qué pasó con el presupuesto?"})
+        assert reply.status_code == 200 and '"type": "done"' in reply.text
+        assert any("Presupuesto aprobado" in prompt for prompt in prompts)
+        assert all("Presupuesto rechazado" not in prompt for prompt in prompts)
+
+        none = client.patch(selection, json={"mode": "none"}).json()
+        assert not any(item["enabled"] for item in none["recordings"] + none["sources"])
+        assert client.post(f"{path}/chat", json={"question": "¿Presupuesto?"}).status_code == 400
+        all_sources = client.patch(selection, json={"mode": "all"}).json()
+        assert all(item["enabled"] for item in all_sources["recordings"] + all_sources["sources"])
+        assert test_db.get_recording(other_recording)["enabled"] is True
+    finally:
+        client.close()
+        test_db.close()
 
 
 def test_combined_summary_limits_large_inputs_and_keeps_each_active_source() -> None:
@@ -1953,7 +2078,7 @@ def test_diarization_assign_merge_bleed_and_format() -> None:
     )
     from backend.source_service import chunk_recording_for_index
 
-    # Word-level split when a single ASR block spans a clean speaker switch (>= 3 words, >= 1.0s each)
+    # Word-level split when a single ASR block spans a clean speaker switch
     asr_segs = [
         {
             "start": 0.0,
@@ -2008,6 +2133,56 @@ def test_diarization_assign_merge_bleed_and_format() -> None:
     assert "[00:08] Tú:" in llm_fmt or "[00:09] Tú:" in llm_fmt
     chunks = chunk_recording_for_index(rec_mock)
     assert any("Tú:" in c["content"] for c in chunks)
+
+
+def test_identify_speakers_on_saved_transcript_keeps_word_timings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi.testclient import TestClient
+    import backend.app as app_mod
+
+    test_db = Database(db_path=tmp_path / "speakers.db", audio_dir=tmp_path / "audio")
+    test_db.init_db()
+    session = test_db.create_session("Grabación")
+    audio = tmp_path / "grabacion.wav"
+    rec = test_db.create_recording(
+        session_id=session["id"], filename=audio.name, stored_path=str(audio), playable_path=str(audio),
+    )
+    text = "¿Listos? Sí. ¿Todos? Claro."
+    words = [{"start": i + 0.013, "end": i + 0.419} for i in range(4)]
+    segments = [{"start": 0.0, "end": 4.0, "text": text, "words": words}]
+    test_db.update_recording_transcript(rec["id"], text, segments, "es", 4.0, NEMOTRON_MODEL_ID)
+    test_db.update_recording_summary(rec["id"], "Resumen existente")
+    turns = [
+        {"start": i, "end": i + 0.5, "speaker": f"Voz {i % 2}"}
+        for i in range(4)
+    ]
+    monkeypatch.setattr(app_mod, "db", test_db)
+    monkeypatch.setattr(app_mod, "is_diarization_runtime_available", lambda: True)
+    calls = []
+
+    async def fake_diarize(path: Path, threads: int, *, num_speakers: int | None) -> list[dict]:
+        calls.append((path, num_speakers))
+        return turns
+
+    monkeypatch.setattr(app_mod, "diarize_audio_async", fake_diarize)
+    endpoint = f"/api/sessions/{session['id']}/recordings/{rec['id']}/speakers"
+    client = TestClient(app_mod.app)
+    response = client.post(endpoint)
+    assert response.status_code == 200
+    saved = test_db.get_recording(rec["id"])
+    assert saved["status"] == "ready"
+    assert saved["summary_text"] == "Resumen existente"
+    assert saved["whisper_model"] == NEMOTRON_MODEL_ID
+    labeled = saved["segments"]
+    assert [segment["text"] for segment in labeled] == text.split()
+    assert [segment["speaker"] for segment in labeled] == ["Hablante 1", "Hablante 2"] * 2
+    assert [word for segment in labeled for word in segment["words"]] == words
+    assert [segment["start"] for segment in labeled] == [word["start"] for word in words]
+    hits = test_db.search_session_chunks(session["id"], "Todos", limit=5)
+    assert hits and "Hablante 1: ¿Todos?" in hits[0]["content"]
+    assert client.post(endpoint).status_code == 409
+    assert client.post(endpoint, params={"count": 2}).status_code == 200
+    assert calls == [(audio, None), (audio, 2)]
+    test_db.close()
 
 
 def test_dual_track_split_and_speaker_rename_endpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2114,7 +2289,7 @@ def test_asr_model_status_and_modular_endpoints(tmp_path: Path, monkeypatch: pyt
     asr_dir = tmp_path / "asr"
     hf_cache = tmp_path / "hf_hub"
 
-    # Simulate ONLY small Whisper, Parakeet ONNX, and Qwen3 0.6B installed
+    monkeypatch.setattr(cfg, "MLX_ASR_SUPPORTED", False)
     turbo_snap = models_dir / "models--mobiuslabsgmbh--faster-whisper-large-v3-turbo" / "snapshots" / "rev1"
     turbo_snap.mkdir(parents=True)
     (turbo_snap / "model.bin").write_bytes(b"ok")
@@ -2150,7 +2325,13 @@ def test_asr_model_status_and_modular_endpoints(tmp_path: Path, monkeypatch: pyt
     monkeypatch.setattr(app_mod, "download_asr_model", lambda mid: (calls.append(("dl", mid)), {"id": mid, "installed": True})[1])
     monkeypatch.setattr(app_mod, "delete_asr_model", lambda mid: (calls.append(("rm", mid)), True)[1])
 
+    test_db = Database(db_path=tmp_path / "models.db", audio_dir=tmp_path / "audio")
+    test_db.init_db()
+    test_db.update_settings({"whisper_model": "large-v3-turbo"})
+    monkeypatch.setattr(app_mod, "db", test_db)
     client = TestClient(app_mod.app)
+    assert client.delete("/api/whisper/models/large-v3-turbo").status_code == 409
+    assert ("rm", "large-v3-turbo") not in calls
     res_dl = client.post("/api/whisper/models/small/download")
     assert res_dl.status_code == 200
     assert res_dl.json()["status"] == "downloaded"
@@ -2160,6 +2341,7 @@ def test_asr_model_status_and_modular_endpoints(tmp_path: Path, monkeypatch: pyt
     assert res_rm.status_code == 200
     assert res_rm.json()["deleted"] is True
     assert ("rm", "small") in calls
+    test_db.close()
 
 
 def test_quiz_json_schema_and_hardened_parser(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -126,6 +126,7 @@ def _utc_now() -> str:
 
 DEFAULT_SETTINGS: dict[str, str] = {
     "ollama_model": "",
+    "text_provider": "ollama",
     "whisper_model": DEFAULT_WHISPER_MODEL,
     "whisper_device": DEFAULT_WHISPER_DEVICE,
     "whisper_language": DEFAULT_WHISPER_LANGUAGE,
@@ -516,6 +517,30 @@ class Database:
                 session_id, enabled_only=True
             )
             return session
+
+    def set_session_sources_enabled(
+        self, session_id: str, enabled: bool, recording_id: str | None = None
+    ) -> bool:
+        with self._lock, self._get_conn() as conn:
+            recordings = conn.execute(
+                """
+                UPDATE recordings SET enabled = CASE WHEN id = ? THEN 1 ELSE ? END
+                WHERE session_id = ? AND enabled <> CASE WHEN id = ? THEN 1 ELSE ? END
+                """,
+                (recording_id, enabled, session_id, recording_id, enabled),
+            )
+            sources = conn.execute(
+                "UPDATE sources SET enabled = ? WHERE session_id = ? AND enabled <> ?",
+                (enabled, session_id, enabled),
+            )
+            if not (recordings.rowcount or sources.rowcount):
+                return False
+            conn.execute(
+                """UPDATE sessions SET combined_summary = '', suggested_prompts_json = '[]',
+                   updated_at = ? WHERE id = ?""",
+                (_utc_now(), session_id),
+            )
+            return True
 
     def update_session_suggestions(
         self, session_id: str, prompts: list[dict[str, str]]
@@ -1429,6 +1454,7 @@ class Database:
             language = DEFAULT_NEMOTRON_LANGUAGE
         return {
             "ollama_model": raw["ollama_model"],
+            "text_provider": raw["text_provider"],
             "whisper_model": raw["whisper_model"],
             "whisper_device": raw["whisper_device"],
             "whisper_language": language,

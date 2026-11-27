@@ -1,6 +1,6 @@
-# TransCrypting — 100% Local Multi-Source Study Workspace, Audio Transcription, Podcast Studio & Exam Prep
+# TransCrypting — Local Multi-Source Study Workspace, Audio Transcription, Podcast Studio & Exam Prep
 
-A privacy-first Windows desktop workspace built to run **100% offline on your own PC**. Neither your class recordings, PDFs, slides, images, nor AI conversations ever leave your machine. Ideal for organizing courses into local notebooks: transcribe lectures, index documents and whiteboard photos in a persistent local search index, chat with exact cross-source citations, generate two-host study podcasts, and practice with interactive exams.
+A desktop study workspace that runs locally by default. Organize courses into notebooks, transcribe lectures, index documents and whiteboard photos, chat with source citations, generate study podcasts, and practice with interactive exams.
 
 ---
 
@@ -101,10 +101,14 @@ Flexible compatibility with any Ollama LLM, Whisper / CTranslate2 model, and Kok
   - Headless API only: `.\.venv\Scripts\python.exe run.py --headless`
 
 ### Modular Models (Bring Your Own Models)
-Open **Settings** (gear icon) and click **`¿Cómo instalar modelos?`** for the built-in copyable command guide:
+Open **Configuración → Texto** and click **`¿Cómo instalar modelos?`** for the built-in copyable command guide.
 - **Ollama LLMs (Summaries / Chat / Exams / Podcast Scripts)**: pull any model with `ollama pull <model>` (`qwen2.5:1.5b`, `gemma4:e2b`, `llama3.2:3b`, `gemma4:e4b`, `qwen3:8b`, `qwen3.5:9b`, etc.) and click **Actualizar lista**. For image vision analysis, choose a vision-capable model such as `gemma4:e4b` or `gemma4:e2b`.
 - **Audio transcription.** New configurations on Apple Silicon use **Nemotron Labs Unified ASR 0.6B** with Spanish selected when MLX Audio is installed. Settings also offers **Qwen3-ASR 0.6B and 1.7B**, **Parakeet TDT 0.6B v3**, and **Whisper** presets. MLX models use the GPU in Automatic mode and download their weights on first use. To add a custom **CTranslate2** model, place its folder in `data/models/whisper/`.
 - **Kokoro-82M / Piper TTS Voices (Podcasts)**: **Kokoro-82M ONNX** weights (`kokoro-v1.0.onnx` and `voices-v1.0.bin`) are downloaded once on demand into `data/models/tts/kokoro/` (with Piper fallback in `data/models/tts/`).
+
+### DeepSeek Flash for text
+
+Select **DeepSeek Flash** under **Configuración → Texto**, enter your API key, and save. Chat and on-demand summaries send the required text context to DeepSeek. Audio transcription runs locally with the model selected under **Audio**.
 
 ---
 
@@ -114,7 +118,7 @@ Open **Settings** (gear icon) and click **`¿Cómo instalar modelos?`** for the 
 TransCrypting/
 ├── backend/                # FastAPI API, WASAPI capture, ONNX diarization, ASR, Ollama, FTS5 & Podcast TTS
 ├── docs/screenshots/       # README showcase screenshots (demo data only)
-├── frontend/               # 100% offline responsive Studio UI (HTML/CSS/JS + icon.ico)
+├── frontend/               # Responsive Studio UI (HTML/CSS/JS + Lucide icons)
 ├── launcher/               # C# source compiled into TransCrypting.exe
 ├── tests/                  # Automated pytest suite
 ├── data/                   # LOCAL ONLY (ignored by Git; only .gitkeep is tracked)
@@ -130,4 +134,6 @@ TransCrypting/
 └── run.py
 ```
 
-All user recordings, uploaded documents, images, generated podcasts, model caches, databases, and `.venv/` stay 100% on your machine and are excluded via `.gitignore`.
+User recordings, uploaded files, generated podcasts, model caches, databases, the saved API key, and `.venv/` are stored locally and excluded via `.gitignore`.
+
+The web interface uses [Lucide](https://lucide.dev/guide/) icons bundled in [frontend/lucide.svg](frontend/lucide.svg). Use `<use href="/lucide.svg#icon-name"/>` in HTML or `lucideIcon()` in JavaScript. The icon notices are in [LICENSE](LICENSE).

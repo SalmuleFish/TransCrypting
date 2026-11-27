@@ -191,8 +191,10 @@ def is_asr_model_installed(
         snap = hf_cache / repo_slug / "snapshots"
         return snap.is_dir() and any(snap.rglob("*.safetensors"))
 
-    if (models_dir / mid / "model.bin").is_file():
-        return True
+    if any(model["id"] == mid for model in WHISPER_MODELS):
+        variants = (mid, f"{mid}-q5_0", f"{mid}-q5_1", f"{mid}-q8_0")
+        if any((models_dir / "ggml" / f"ggml-{variant}.bin").is_file() for variant in variants):
+            return True
 
     if models_dir.is_dir():
         suffix = f"--faster-whisper-{mid.lower()}"
@@ -234,7 +236,7 @@ def list_available_whisper_models(
             {"id": model_id, **{key: value for key, value in model.items() if key != "repo"}}
             for model_id, model in QWEN_TORCH_MODELS.items()
         )
-    if models_dir.is_dir():
+    if FASTER_WHISPER_SUPPORTED and models_dir.is_dir():
         for entry in sorted(models_dir.iterdir(), key=lambda p: p.name.lower()):
             if not entry.is_dir():
                 continue
