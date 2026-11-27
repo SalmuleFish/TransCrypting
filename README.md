@@ -72,7 +72,7 @@ Flexible compatibility with any Ollama LLM, Whisper / CTranslate2 model, and Kok
 - **Python 3.11–3.13**
 - **Ollama** installed locally ([ollama.com](https://ollama.com)) with at least one local model pulled (e.g., `ollama pull gemma4:e4b`, `ollama pull qwen3:8b`, or `ollama pull qwen2.5:1.5b` for Eco/laptops)
 - **ffmpeg** available on system `PATH`
-- *(Optional)* NVIDIA CUDA-compatible GPU for accelerated Whisper and Ollama inference *(on `ARM64`, CUDA packages and `faster-whisper`/`av` are automatically skipped in `requirements.txt` while documents, OCR, FTS5 chat, exams, and TTS run natively)*
+- *(Optional)* NVIDIA CUDA-compatible GPU for accelerated Whisper, Qwen3-ASR, and Ollama inference *(on Windows `ARM64`, CUDA packages and `faster-whisper`/`av` are automatically skipped in `requirements.txt` while `onnx-asr` (`Whisper`, `Parakeet v3`, `Canary 1B`), `sherpa-onnx` diarization, documents, OCR, FTS5 chat, exams, and TTS run natively)*
 
 ---
 
