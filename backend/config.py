@@ -215,9 +215,7 @@ def list_available_whisper_models(
     hf_cache_dir: Path | None = None,
 ) -> list[dict]:
     """Return local transcription presets and custom CTranslate2 models with install status."""
-    models: list[dict] = []
-    if FASTER_WHISPER_SUPPORTED or WHISPER_METAL_SUPPORTED or not PARAKEET_ONNX_SUPPORTED:
-        models.extend(dict(m) for m in WHISPER_MODELS)
+    models: list[dict] = [dict(m) for m in WHISPER_MODELS]
     if PARAKEET_SUPPORTED:
         models.append({"id": PARAKEET_MODEL_ID, "label": "Parakeet TDT 0.6B v3 (MLX · 25 idiomas)", "engine": "Parakeet"})
     elif PARAKEET_ONNX_SUPPORTED:
@@ -239,7 +237,7 @@ def list_available_whisper_models(
             {"id": model_id, **{key: value for key, value in model.items() if key != "repo"}}
             for model_id, model in QWEN_TORCH_MODELS.items()
         )
-    if FASTER_WHISPER_SUPPORTED and models_dir.is_dir():
+    if models_dir.is_dir():
         for entry in sorted(models_dir.iterdir(), key=lambda p: p.name.lower()):
             if not entry.is_dir():
                 continue
